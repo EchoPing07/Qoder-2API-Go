@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # --- Build binaries for Windows / macOS / Linux (amd64 + arm64) ---
+  build-binaries:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - os: windows
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            ext: ".exe"
+          - os: darwin
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            ext: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/qoder2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} .
+          cp baseprompt.json dist/
+
+      - name: Create archive
+        run: |
+          cd dist
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            zip -r qoder2api-${{ matrix.os }}-${{ matrix.arch }}.zip qoder2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} baseprompt.json
+          else
+            tar -czf qoder2api-${{ matrix.os }}-${{ matrix.arch }}.tar.gz qoder2api-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} baseprompt.json
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder2api-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/qoder2api-${{ matrix.os }}-${{ matrix.arch }}.*
+
+  # --- Build and push Docker image ---
+  build-docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha
+
+      - name: Login to GHCR
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- Create GitHub Release ---
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}

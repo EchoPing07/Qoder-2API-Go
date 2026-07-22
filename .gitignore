@@ -1,0 +1,10 @@
+# Binaries
+*.exe
+dist/
+
+# Data files (runtime generated)
+data.json
+
+# OS files
+.DS_Store
+Thumbs.db

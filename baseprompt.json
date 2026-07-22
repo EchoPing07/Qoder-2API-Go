@@ -1,0 +1,42 @@
+{
+  "request_id": "{UUID1}",
+  "request_set_id": "{UUID2}",
+  "chat_record_id": "{UUID3}",
+  "stream": true,
+  "chat_task": "FREE_INPUT",
+  "chat_context": {
+    "extra": {
+      "modelConfig": {
+        "is_reasoning": false,
+        "key": "lite"
+      },
+      "originalContent": {
+        "type": "text",
+        "text": ""
+      }
+    },
+    "text": {
+      "type": "text",
+      "text": ""
+    }
+  },
+  "session_id": "{UUID4}",
+  "source": 1,
+  "version": "3",
+  "aliyun_user_type": "personal_standard",
+  "session_type": "qodercli",
+  "agent_id": "agent_common",
+  "task_id": "common",
+  "model_config": {
+    "key": "lite",
+    "is_vl": false,
+    "is_reasoning": false,
+    "source": "system"
+  },
+  "messages": [],
+  "business": {
+    "id": "{UUID5}",
+    "name": "hi",
+    "begin_at": "{TIME1}"
+  }
+}

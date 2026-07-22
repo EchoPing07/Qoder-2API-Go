@@ -1,0 +1,14 @@
+services:
+  qoder2api:
+    build: .
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    environment:
+      QODER_DATA_PATH: /app/data.json
+    volumes:
+      - qoder2api-data:/app/data
+
+volumes:
+  qoder2api-data:
