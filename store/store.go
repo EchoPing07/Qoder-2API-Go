@@ -10,6 +10,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"qoder2api/stats"
 )
 
 // APIKey represents a single API key entry.
@@ -22,18 +24,19 @@ type APIKey struct {
 
 // Config is the on-disk JSON structure.
 type Config struct {
-	Host     string   `json:"host"`
-	Port     int      `json:"port"`
-	PAT      string   `json:"pat"`
-	Password string   `json:"password"`
-	APIKeys  []APIKey `json:"api_keys"`
+	Host     string      `json:"host"`
+	Port     int         `json:"port"`
+	PAT      string      `json:"pat"`
+	Password string      `json:"password"`
+	APIKeys  []APIKey    `json:"api_keys"`
+	Stats    *stats.Data `json:"stats,omitempty"`
 }
 
 // DefaultHost is the default listen host.
 const DefaultHost = "0.0.0.0"
 
 // DefaultPort is the default listen port.
-const DefaultPort = 18080
+const DefaultPort = 10081
 
 // DefaultPassword is the default admin password.
 const DefaultPassword = "password"
@@ -171,6 +174,23 @@ func (s *Store) GetPAT() string {
 func (s *Store) SetPAT(pat string) error {
 	s.mu.Lock()
 	s.config.PAT = pat
+	s.mu.Unlock()
+	return s.save()
+}
+
+// --- Stats ---
+
+// LoadStats returns the persisted stats snapshot, or nil if none exists.
+func (s *Store) LoadStats() *stats.Data {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.Stats
+}
+
+// SaveStats persists the stats snapshot into the config file.
+func (s *Store) SaveStats(d *stats.Data) error {
+	s.mu.Lock()
+	s.config.Stats = d
 	s.mu.Unlock()
 	return s.save()
 }

@@ -18,6 +18,7 @@ import (
 
 	"qoder2api/auth"
 	"qoder2api/models"
+	"qoder2api/stats"
 	"qoder2api/transform"
 
 	"github.com/google/uuid"
@@ -496,6 +497,16 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	return b.handleSync(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled)
 }
 
+// StreamReportedError wraps an upstream stream error that has already been
+// delivered to the client as an SSE error chunk. Handlers must not write a
+// second error response when this error is returned.
+type StreamReportedError struct {
+	Err error
+}
+
+func (e *StreamReportedError) Error() string { return e.Err.Error() }
+func (e *StreamReportedError) Unwrap() error { return e.Err }
+
 func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -529,6 +540,7 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 		setError(errChunk, err.Error())
 		errBytes, _ := marshalNoEscape(errChunk)
 		w.Write([]byte("data: " + string(errBytes) + "\n\n"))
+		return &StreamReportedError{Err: err}
 	} else {
 		doneChunk := transform.MakeChunk(reqID, created, model)
 		writeFinishReason(doneChunk, acc.FinishReason())
@@ -665,7 +677,8 @@ func writeError(w http.ResponseWriter, statusCode int, errType, message string) 
 
 // MakeChatHandler creates the /v1/chat/completions handler.
 // The resolver validates the API key and returns the single bridge instance.
-func MakeChatHandler(resolver BridgeResolver) http.HandlerFunc {
+// rec records per-request statistics; it may be nil.
+func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
 		if token == "" {
@@ -687,20 +700,39 @@ func MakeChatHandler(resolver BridgeResolver) http.HandlerFunc {
 			return
 		}
 
+		// Only authenticated requests with a valid body are counted.
+		model := statsModelLabel(reqBody, b, r.Context())
+		stream, _ := reqBody["stream"].(bool)
+		record := func(ok bool) {
+			if rec != nil {
+				rec.Record(model, ok, stream)
+			}
+		}
+
 		err := b.HandleChat(r.Context(), w, reqBody)
 		if err != nil {
+			var repErr *StreamReportedError
+			if errors.As(err, &repErr) {
+				record(false)
+				return
+			}
 			var valErr *models.UnsupportedModelError
 			if errors.As(err, &valErr) {
 				writeError(w, 400, "invalid_request_error", valErr.Error())
+				record(false)
 				return
 			}
 			errMsg := err.Error()
 			if strings.Contains(errMsg, "Unsupported model") || strings.Contains(errMsg, "not supported") {
 				writeError(w, 400, "invalid_request_error", errMsg)
+				record(false)
 				return
 			}
 			writeError(w, 500, "qoder_error", errMsg)
+			record(false)
+			return
 		}
+		record(true)
 	}
 }
 
@@ -731,6 +763,29 @@ func MakeModelsHandler(resolver BridgeResolver) http.HandlerFunc {
 }
 
 // --- Helpers ---
+
+// statsModelLabel returns the model label used for request statistics.
+// The label is capped at 64 chars since the request body size is unbounded,
+// and an empty/invalid model falls back to the catalog default or "(default)".
+func statsModelLabel(reqBody map[string]interface{}, b *OpenAiBridge, ctx context.Context) string {
+	model, _ := reqBody["model"].(string)
+	if len(model) > 64 {
+		model = model[:64]
+	}
+	if model == "" {
+		if b != nil {
+			if catalog := b.GetCatalog(ctx); catalog != nil {
+				if name, _, err := models.ResolveModel("", catalog); err == nil {
+					model = name
+				}
+			}
+		}
+		if model == "" {
+			model = "(default)"
+		}
+	}
+	return model
+}
 
 func extractMessages(raw interface{}) []map[string]interface{} {
 	list, ok := raw.([]interface{})

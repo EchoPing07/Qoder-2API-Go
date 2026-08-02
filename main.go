@@ -12,9 +12,11 @@ import (
 	"qoder2api/auth"
 	"qoder2api/bridge"
 	"qoder2api/models"
+	"qoder2api/stats"
 	"qoder2api/store"
 
 	"sync"
+	"time"
 )
 
 // bridgeProvider manages a single OpenAiBridge for the current PAT.
@@ -83,6 +85,18 @@ func main() {
 
 	provider := newBridgeProvider(st)
 
+	// Request statistics recorder with periodic persistence (30s cadence)
+	rec := stats.NewRecorder(st)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := rec.Flush(); err != nil {
+				log.Printf("[stats] WARN flush failed: %v", err)
+			}
+		}
+	}()
+
 	// Model fetcher for admin UI
 	modelFetcher := func(ctx context.Context) []string {
 		b := provider.currentBridge()
@@ -94,10 +108,10 @@ func main() {
 	}
 
 	// Initialize admin
-	adminInst := admin.New(st, modelFetcher)
+	adminInst := admin.New(st, modelFetcher, rec)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge))
+	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec))
 	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
 
 	// Root redirect to admin UI

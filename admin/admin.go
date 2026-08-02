@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"qoder2api/models"
+	"qoder2api/stats"
 	"qoder2api/store"
 )
 
@@ -22,6 +23,7 @@ const sessionDuration = 24 * time.Hour
 type Admin struct {
 	store        *store.Store
 	modelFetcher ModelFetcher
+	stats        *stats.Recorder
 	sessions     map[string]time.Time
 	sessionMu    sync.Mutex
 }
@@ -29,11 +31,12 @@ type Admin struct {
 // ModelFetcher returns the current model catalog (dynamic or fallback).
 type ModelFetcher func(ctx context.Context) []string
 
-// New creates an Admin instance.
-func New(s *store.Store, mf ModelFetcher) *Admin {
+// New creates an Admin instance. rec may be nil.
+func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder) *Admin {
 	return &Admin{
 		store:        s,
 		modelFetcher: mf,
+		stats:        rec,
 		sessions:     make(map[string]time.Time),
 	}
 }
@@ -53,6 +56,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/keys", a.requireAuth(a.handleKeys))
 	mux.HandleFunc("/admin/api/pat", a.requireAuth(a.handlePAT))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
+	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/api/config", a.requireAuth(a.handleConfig))
 	mux.HandleFunc("/admin/api/password", a.requireAuth(a.handlePassword))
 }
@@ -333,6 +337,20 @@ func (a *Admin) handleModels(w http.ResponseWriter, r *http.Request) {
 		modelList = catalog.Keys()
 	}
 	writeJSON(w, 200, map[string]interface{}{"models": modelList})
+}
+
+// --- Stats endpoint ---
+
+func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if a.stats == nil {
+		writeJSON(w, 200, stats.Report{})
+		return
+	}
+	writeJSON(w, 200, a.stats.Report())
 }
 
 // --- WebUI ---

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"qoder2api/stats"
 )
 
 func tempStore(t *testing.T) *Store {
@@ -170,6 +172,42 @@ func TestPersistence(t *testing.T) {
 	}
 	if !s2.ValidateKey("sk-persist") {
 		t.Error("expected persisted key to be valid")
+	}
+}
+
+func TestStatsPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+
+	s1, err := New(path)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if s1.LoadStats() != nil {
+		t.Error("expected nil stats on fresh store")
+	}
+	d := &stats.Data{Total: 5, Success: 4, Failed: 1, Streams: 3, Syncs: 2}
+	d.ByModel = map[string]*stats.ModelStat{
+		"Qwen3.7-Max": {Model: "Qwen3.7-Max", Total: 5, Success: 4, Failed: 1},
+	}
+	if err := s1.SaveStats(d); err != nil {
+		t.Fatalf("SaveStats failed: %v", err)
+	}
+
+	s2, err := New(path)
+	if err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	got := s2.LoadStats()
+	if got == nil {
+		t.Fatal("expected restored stats")
+	}
+	if got.Total != 5 || got.Success != 4 || got.Failed != 1 || got.Streams != 3 || got.Syncs != 2 {
+		t.Errorf("unexpected restored totals: %+v", got)
+	}
+	m, ok := got.ByModel["Qwen3.7-Max"]
+	if !ok || m.Total != 5 {
+		t.Errorf("expected restored per-model stat, got %+v", got.ByModel)
 	}
 }
 

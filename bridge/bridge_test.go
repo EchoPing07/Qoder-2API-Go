@@ -1,13 +1,16 @@
 package bridge
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"qoder2api/stats"
 )
 
 func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
-	handler := MakeChatHandler(nil)
+	handler := MakeChatHandler(nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -24,7 +27,7 @@ func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
 
 func TestChatRouteRejectsInvalidApiKey(t *testing.T) {
 	resolver := func(apiKey string) *OpenAiBridge { return nil }
-	handler := MakeChatHandler(resolver)
+	handler := MakeChatHandler(resolver, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -70,6 +73,66 @@ func TestModelsRouteReturnsAllModels(t *testing.T) {
 	}
 	if !strings.Contains(body, "Qwen3.7-Plus") {
 		t.Error("response should contain Qwen3.7-Plus")
+	}
+}
+
+// Unauthorized requests (missing/invalid key) must not be counted.
+func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
+	rec := stats.NewRecorder(nil)
+	handler := MakeChatHandler(nil, rec)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != 401 {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+	if rec.Report().Total != 0 {
+		t.Error("unauthorized requests must not be counted")
+	}
+}
+
+// Malformed JSON with a valid key must be rejected and not counted.
+func TestChatRouteDoesNotRecordInvalidJSON(t *testing.T) {
+	rec := stats.NewRecorder(nil)
+	resolver := func(apiKey string) *OpenAiBridge { return &OpenAiBridge{} }
+	handler := MakeChatHandler(resolver, rec)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model": `))
+	req.Header.Set("Authorization", "Bearer sk-valid")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != 400 {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+	if rec.Report().Total != 0 {
+		t.Error("malformed JSON requests must not be counted")
+	}
+}
+
+// Model labels for stats must be capped and have sane fallbacks.
+func TestStatsModelLabel(t *testing.T) {
+	ctx := context.Background()
+	long := strings.Repeat("A", 5000)
+	got := statsModelLabel(map[string]interface{}{"model": long}, nil, ctx)
+	if len(got) != 64 {
+		t.Errorf("expected label capped to 64 chars, got %d", len(got))
+	}
+	got = statsModelLabel(map[string]interface{}{}, nil, ctx)
+	if got != "(default)" {
+		t.Errorf("expected fallback label '(default)', got %q", got)
+	}
+	got = statsModelLabel(map[string]interface{}{"model": 42}, nil, ctx)
+	if got != "(default)" {
+		t.Errorf("non-string model should fall back to '(default)', got %q", got)
+	}
+	got = statsModelLabel(map[string]interface{}{"model": "Qwen3.7-Max"}, nil, ctx)
+	if got != "Qwen3.7-Max" {
+		t.Errorf("expected model name preserved, got %q", got)
 	}
 }
 

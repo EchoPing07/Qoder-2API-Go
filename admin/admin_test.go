@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"qoder2api/models"
+	"qoder2api/stats"
 	"qoder2api/store"
 )
 
@@ -28,7 +29,7 @@ func newAdmin(t *testing.T) (*Admin, *store.Store) {
 	mf := func(ctx context.Context) []string {
 		return models.DefaultCatalog().Keys()
 	}
-	return New(s, mf), s
+	return New(s, mf, nil), s
 }
 
 func doRequest(t *testing.T, handler http.HandlerFunc, method, path string, body interface{}) *httptest.ResponseRecorder {
@@ -201,6 +202,73 @@ func TestConfigSetDefaults(t *testing.T) {
 	}
 	if int(resp["port"].(float64)) != store.DefaultPort {
 		t.Errorf("expected default port, got %v", resp["port"])
+	}
+}
+
+// -- Stats --
+
+func TestStatsEndpoint(t *testing.T) {
+	s := tempStore(t)
+	mf := func(ctx context.Context) []string {
+		return models.DefaultCatalog().Keys()
+	}
+	rec := stats.NewRecorder(nil)
+	rec.Record("Qwen3.7-Max", true, true)
+	rec.Record("Qwen3.7-Max", false, true)
+	rec.Record("DeepSeek-V4-Pro", true, false)
+	a := New(s, mf, rec)
+
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+	if w.Code != 200 {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Total   int64 `json:"total"`
+		Success int64 `json:"success"`
+		Failed  int64 `json:"failed"`
+		ByModel []struct {
+			Model string `json:"model"`
+			Total int64  `json:"total"`
+		} `json:"by_model"`
+		Hourly []struct {
+			Total int64 `json:"total"`
+		} `json:"hourly"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.Total != 3 || resp.Success != 2 || resp.Failed != 1 {
+		t.Errorf("unexpected totals: %+v", resp)
+	}
+	if len(resp.ByModel) != 2 {
+		t.Errorf("expected 2 model rows, got %d", len(resp.ByModel))
+	}
+	if resp.ByModel[0].Model != "Qwen3.7-Max" || resp.ByModel[0].Total != 2 {
+		t.Errorf("expected Qwen3.7-Max first (sorted by total desc), got %+v", resp.ByModel[0])
+	}
+	if len(resp.Hourly) != 24 {
+		t.Errorf("expected 24 hourly buckets, got %d", len(resp.Hourly))
+	}
+}
+
+func TestStatsEndpointNilRecorder(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+	if w.Code != 200 {
+		t.Errorf("expected 200 with nil recorder, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if v, ok := resp["total"].(float64); !ok || v != 0 {
+		t.Errorf("expected zero total, got %v", resp["total"])
+	}
+}
+
+func TestStatsEndpointMethodNotAllowed(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleStats, "POST", "/admin/api/stats", nil)
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
 	}
 }
 

@@ -11,7 +11,7 @@
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
-- **Web 管理面板** —— 浅色白绿配色中文界面，支持密码登录、API 密钥管理、PAT 配置、模型查看
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 按模型 / 近 24 小时趋势）
 - **单文件部署** —— 编译为单一二进制文件，零外部依赖
 
 ## 支持的模型
@@ -38,7 +38,7 @@
 # 编译
 go build -o qoder2api .
 
-# 运行（默认监听 0.0.0.0:18080）
+# 运行（默认监听 0.0.0.0:10081）
 ./qoder2api
 ```
 
@@ -50,7 +50,7 @@ docker-compose up -d
 
 # 或手动构建
 docker build -t qoder2api .
-docker run -d -p 18080:18080 -v qoder2api-data:/app/data qoder2api
+docker run -d -p 10081:10081 -v qoder2api-data:/app/data qoder2api
 ```
 
 ### 方式三：下载预编译二进制
@@ -64,10 +64,12 @@ docker run -d -p 18080:18080 -v qoder2api-data:/app/data qoder2api
 | 变量名 | 默认值 | 说明 |
 |-------|--------|------|
 | `QODER_HOST` | `0.0.0.0` | 监听地址 |
-| `QODER_PORT` | `18080` | 监听端口 |
+| `QODER_PORT` | `10081` | 监听端口 |
 | `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
 | `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
+
+> 请求统计（`stats` 字段）随 data.json 持久化，服务每 30 秒批量写入一次；仅统计通过密钥鉴权且请求体合法的调用。
 
 ### 配置文件 (data.json)
 
@@ -76,7 +78,7 @@ docker run -d -p 18080:18080 -v qoder2api-data:/app/data qoder2api
 ```json
 {
   "host": "0.0.0.0",
-  "port": 18080,
+  "port": 10081,
   "pat": "pt-xxxxxxxx",
   "password": "password",
   "api_keys": [
@@ -94,7 +96,7 @@ docker run -d -p 18080:18080 -v qoder2api-data:/app/data qoder2api
 
 ### 1. 配置 PAT
 
-启动服务后访问 `http://localhost:18080/admin`，输入默认密码 `password` 登录，在「令牌」标签页中填入你的 Qoder PAT。
+启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「令牌」标签页中填入你的 Qoder PAT。
 
 ### 2. 创建 API 密钥
 
@@ -103,7 +105,7 @@ docker run -d -p 18080:18080 -v qoder2api-data:/app/data qoder2api
 ### 3. 调用 API
 
 ```bash
-curl http://localhost:18080/v1/chat/completions \
+curl http://localhost:10081/v1/chat/completions \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -116,7 +118,7 @@ curl http://localhost:18080/v1/chat/completions \
 ### 4. 获取模型列表
 
 ```bash
-curl http://localhost:18080/v1/models \
+curl http://localhost:10081/v1/models \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx"
 ```
 
@@ -131,6 +133,7 @@ curl http://localhost:18080/v1/models \
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
 | `/admin/api/pat` | GET/POST | PAT 令牌管理 |
 | `/admin/api/models` | GET | 获取模型列表 |
+| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势） |
 | `/admin/api/config` | GET/POST | 服务器配置 |
 | `/admin/api/password` | POST | 修改管理密码 |
 

@@ -12,6 +12,6 @@ WORKDIR /app
 COPY --from=builder /build/qoder2api .
 COPY baseprompt.json .
 ENV QODER_HOST=0.0.0.0 \
-    QODER_PORT=18080
-EXPOSE 18080
+    QODER_PORT=10081
+EXPOSE 10081
 CMD ["./qoder2api"]

@@ -4,7 +4,7 @@ services:
     platform: linux/amd64
     restart: unless-stopped
     ports:
-      - "18080:18080"
+      - "10081:10081"
     environment:
       QODER_DATA_PATH: /app/data.json
     volumes:
