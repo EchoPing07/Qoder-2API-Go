@@ -50,7 +50,7 @@ docker-compose up -d
 
 # 或手动构建
 docker build -t qoder2api .
-docker run -d -p 10081:10081 -v qoder2api-data:/app/data qoder2api
+docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app/data/data.json qoder2api
 ```
 
 ### 方式三：下载预编译二进制

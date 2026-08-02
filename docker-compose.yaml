@@ -6,7 +6,7 @@ services:
     ports:
       - "10081:10081"
     environment:
-      QODER_DATA_PATH: /app/data.json
+      QODER_DATA_PATH: /app/data/data.json
     volumes:
       - qoder2api-data:/app/data
 
