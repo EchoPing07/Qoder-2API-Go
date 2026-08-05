@@ -244,3 +244,40 @@ func TestExtractLatestUserPrompt(t *testing.T) {
 		t.Errorf("expected 'second', got %q", prompt)
 	}
 }
+
+// A malformed negative or huge tool-call index must not panic or trigger
+// unbounded slice growth; it falls back to appending at the end.
+func TestToolCallAccumulatorRejectsBadIndex(t *testing.T) {
+	fn := func(name string) map[string]interface{} {
+		return map[string]interface{}{
+			"function": map[string]interface{}{"name": name, "arguments": "{}"},
+			"type":     "function",
+		}
+	}
+
+	// Negative index.
+	a := NewToolCallAccumulator()
+	a.Append([]map[string]interface{}{withIndex(fn("neg"), -1)})
+	if a.IsEmpty() {
+		t.Fatal("expected one call appended after negative index")
+	}
+	snap := a.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(snap))
+	}
+
+	// Huge index.
+	b := NewToolCallAccumulator()
+	b.Append([]map[string]interface{}{withIndex(fn("huge"), 1000000000)})
+	if b.IsEmpty() {
+		t.Fatal("expected one call appended after huge index")
+	}
+	if len(b.Snapshot()) != 1 {
+		t.Fatalf("expected 1 call after huge index, got %d", len(b.Snapshot()))
+	}
+}
+
+func withIndex(m map[string]interface{}, idx int) map[string]interface{} {
+	m["index"] = float64(idx)
+	return m
+}

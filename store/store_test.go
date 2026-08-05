@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,8 +213,14 @@ func TestStatsPersistence(t *testing.T) {
 }
 
 func TestGenerateAPIKey(t *testing.T) {
-	k1 := GenerateAPIKey()
-	k2 := GenerateAPIKey()
+	k1, err := GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("GenerateAPIKey failed: %v", err)
+	}
+	k2, err := GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("GenerateAPIKey failed: %v", err)
+	}
 	if k1 == k2 {
 		t.Error("expected different keys from two GenerateAPIKey calls")
 	}
@@ -238,5 +245,21 @@ func TestFilePermissions(t *testing.T) {
 		if info.Size() == 0 {
 			t.Error("expected non-empty data file")
 		}
+	}
+}
+
+// Adding the same key twice must be rejected with a sentinel error so the
+// HTTP layer can map it to a 409.
+func TestAddKeyDuplicate(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.AddKey("sk-dup", "first"); err != nil {
+		t.Fatalf("first AddKey failed: %v", err)
+	}
+	_, err := s.AddKey("sk-dup", "second")
+	if !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("expected ErrDuplicateKey, got %v", err)
+	}
+	if len(s.ListKeys()) != 1 {
+		t.Errorf("expected 1 key after duplicate rejection, got %d", len(s.ListKeys()))
 	}
 }

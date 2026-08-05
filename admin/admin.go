@@ -5,10 +5,14 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +23,9 @@ import (
 
 const sessionDuration = 24 * time.Hour
 
+// adminMaxBody caps JSON request bodies handled by the admin API.
+const adminMaxBody = 1 << 16 // 64 KiB
+
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
 	store        *store.Store
@@ -26,6 +33,7 @@ type Admin struct {
 	stats        *stats.Recorder
 	sessions     map[string]time.Time
 	sessionMu    sync.Mutex
+	limiter      *loginLimiter
 }
 
 // ModelFetcher returns the current model catalog (dynamic or fallback).
@@ -38,6 +46,7 @@ func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder) *Admin {
 		modelFetcher: mf,
 		stats:        rec,
 		sessions:     make(map[string]time.Time),
+		limiter:      newLoginLimiter(),
 	}
 }
 
@@ -63,14 +72,19 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 
 // --- Session & Auth ---
 
-func generateSessionToken() string {
+func generateSessionToken() (string, error) {
 	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
-func (a *Admin) createSession() string {
-	token := generateSessionToken()
+func (a *Admin) createSession() (string, error) {
+	token, err := generateSessionToken()
+	if err != nil {
+		return "", err
+	}
 	a.sessionMu.Lock()
 	a.sessions[token] = time.Now().Add(sessionDuration)
 	// Opportunistic cleanup: remove expired sessions
@@ -81,7 +95,7 @@ func (a *Admin) createSession() string {
 		}
 	}
 	a.sessionMu.Unlock()
-	return token
+	return token, nil
 }
 
 func (a *Admin) isValidSession(token string) bool {
@@ -111,6 +125,132 @@ func (a *Admin) getPassword() string {
 	return a.store.GetPassword()
 }
 
+// --- Login rate limiting (per client IP, exponential backoff) ---
+
+type loginAttempt struct {
+	failures    int
+	lockedUntil time.Time
+	lastFail    time.Time
+}
+
+type loginLimiter struct {
+	mu    sync.Mutex
+	state map[string]*loginAttempt
+}
+
+const (
+	loginMaxBackoff = 30 * time.Second
+	loginPruneAge   = time.Hour
+)
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{state: make(map[string]*loginAttempt)}
+}
+
+// check reports whether the IP is currently locked out and, if so, how long
+// until it may retry.
+func (l *loginLimiter) check(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pruneLocked()
+	st := l.state[ip]
+	if st == nil {
+		return false, 0
+	}
+	now := time.Now()
+	if now.Before(st.lockedUntil) {
+		return true, st.lockedUntil.Sub(now)
+	}
+	return false, 0
+}
+
+func (l *loginLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.state[ip]
+	if st == nil {
+		st = &loginAttempt{}
+		l.state[ip] = st
+	}
+	st.failures++
+	st.lastFail = time.Now()
+	backoff := time.Duration(1<<uint(st.failures-1)) * time.Second
+	if backoff > loginMaxBackoff {
+		backoff = loginMaxBackoff
+	}
+	st.lockedUntil = st.lastFail.Add(backoff)
+}
+
+func (l *loginLimiter) success(ip string) {
+	l.mu.Lock()
+	delete(l.state, ip)
+	l.mu.Unlock()
+}
+
+func (l *loginLimiter) pruneLocked() {
+	cutoff := time.Now().Add(-loginPruneAge)
+	for ip, st := range l.state {
+		if st.lastFail.Before(cutoff) {
+			delete(l.state, ip)
+		}
+	}
+}
+
+// --- Request helpers ---
+
+// readJSON decodes a JSON request body capped at adminMaxBody. The size cap
+// bounds memory use against oversized payloads.
+func readJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBody)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// passwordsEqual compares two secrets in constant time to avoid timing leaks.
+func passwordsEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i >= 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if xfp := r.Header.Get("X-Forwarded-Proto"); xfp == "https" {
+		return true
+	}
+	return false
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isHTTPS(r),
+		MaxAge:   int(sessionDuration.Seconds()),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isHTTPS(r),
+		MaxAge:   -1,
+	})
+}
+
 // requireAuth wraps a handler with session authentication.
 func (a *Admin) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -128,26 +268,31 @@ func (a *Admin) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 405, "方法不允许")
 		return
 	}
+	ip := clientIP(r)
+	if locked, retry := a.limiter.check(ip); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeJSONError(w, 429, "登录尝试过于频繁，请稍后再试")
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := readJSON(w, r, &body); err != nil {
 		writeJSONError(w, 400, "请求格式错误")
 		return
 	}
-	if body.Password != a.getPassword() {
+	if !passwordsEqual(body.Password, a.getPassword()) {
+		a.limiter.fail(ip)
 		writeJSONError(w, 401, "密码错误")
 		return
 	}
-	token := a.createSession()
-	http.SetCookie(w, &http.Cookie{
-		Name:     "admin_session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   int(sessionDuration.Seconds()),
-		SameSite: http.SameSiteLaxMode,
-	})
+	a.limiter.success(ip)
+	token, err := a.createSession()
+	if err != nil {
+		writeJSONError(w, 500, "无法创建会话")
+		return
+	}
+	setSessionCookie(w, r, token)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -159,13 +304,7 @@ func (a *Admin) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie("admin_session"); err == nil {
 		a.removeSession(cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "admin_session",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   -1,
-	})
+	clearSessionCookie(w, r)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -188,11 +327,11 @@ func (a *Admin) handlePassword(w http.ResponseWriter, r *http.Request) {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := readJSON(w, r, &body); err != nil {
 		writeJSONError(w, 400, "请求格式错误")
 		return
 	}
-	if body.CurrentPassword != a.getPassword() {
+	if !passwordsEqual(body.CurrentPassword, a.getPassword()) {
 		writeJSONError(w, 401, "当前密码错误")
 		return
 	}
@@ -231,13 +370,17 @@ func (a *Admin) handleKeys(w http.ResponseWriter, r *http.Request) {
 			Key  string `json:"key"`
 			Note string `json:"note"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}
 		entry, err := a.store.AddKey(body.Key, body.Note)
 		if err != nil {
-			writeJSONError(w, 500, err.Error())
+			if errors.Is(err, store.ErrDuplicateKey) {
+				writeJSONError(w, 409, err.Error())
+			} else {
+				writeJSONError(w, 500, err.Error())
+			}
 			return
 		}
 		writeJSON(w, 201, entry)
@@ -271,7 +414,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			Host string `json:"host"`
 			Port int    `json:"port"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}
@@ -280,6 +423,10 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Port == 0 {
 			body.Port = store.DefaultPort
+		}
+		if body.Port < 1 || body.Port > 65535 {
+			writeJSONError(w, 400, "端口必须在 1-65535 范围内")
+			return
 		}
 		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
 			writeJSONError(w, 500, err.Error())
@@ -307,7 +454,7 @@ func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			PAT string `json:"pat"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}

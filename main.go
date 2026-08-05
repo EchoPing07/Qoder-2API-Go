@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"qoder2api/admin"
 	"qoder2api/auth"
@@ -85,14 +87,27 @@ func main() {
 
 	provider := newBridgeProvider(st)
 
-	// Request statistics recorder with periodic persistence (30s cadence)
+	// Request statistics recorder with periodic persistence (30s cadence).
+	// The loop also drains a stop channel so graceful shutdown can trigger a
+	// final flush, avoiding loss of the last <=30s of stats.
 	rec := stats.NewRecorder(st)
+	statsStop := make(chan struct{})
+	statsDone := make(chan struct{})
 	go func() {
+		defer close(statsDone)
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			if err := rec.Flush(); err != nil {
-				log.Printf("[stats] WARN flush failed: %v", err)
+		for {
+			select {
+			case <-ticker.C:
+				if err := rec.Flush(); err != nil {
+					log.Printf("[stats] WARN flush failed: %v", err)
+				}
+			case <-statsStop:
+				if err := rec.Flush(); err != nil {
+					log.Printf("[stats] WARN final flush failed: %v", err)
+				}
+				return
 			}
 		}
 	}()
@@ -129,7 +144,38 @@ func main() {
 	addr := host + ":" + strconv.Itoa(port)
 	log.Printf("[bridge] listening http://%s/v1/chat/completions", addr)
 	log.Printf("[admin]  http://%s/admin", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	// Timeouts: ReadHeaderTimeout/IdleTimeout harden against slowloris-style
+	// resource exhaustion. WriteTimeout is intentionally unset so that
+	// long-lived SSE streaming responses are not prematurely cancelled.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Graceful shutdown on SIGINT/SIGTERM: stop the stats ticker (final
+	// flush) and drain in-flight requests with a bounded deadline.
+	shutdownErr := make(chan error, 1)
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		log.Printf("[server] received %s, shutting down...", sig)
+		close(statsStop)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		shutdownErr <- srv.Shutdown(ctx)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[server] failed to listen on %s: %v\n[server] If port %d is in use, change it in the admin UI or data.json", addr, err, port)
 	}
+	if err := <-shutdownErr; err != nil {
+		log.Printf("[server] shutdown error: %v", err)
+	}
+	// Wait for the stats goroutine to finish its final flush before exiting.
+	<-statsDone
+	log.Printf("[server] stopped")
 }

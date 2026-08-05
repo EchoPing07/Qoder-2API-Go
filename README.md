@@ -16,17 +16,17 @@
 
 ## 支持的模型
 
-| 显示名称 | 内部 Key | 视觉 |
-|---------|----------|------|
-| Qwen3.8-Max-Preview | qmodel_preview | 支持 |
-| Qwen3.7-Max | qmodel_latest | 支持 |
-| Qwen3.7-Plus | qmodel | 支持 |
-| Qwen3.6-Flash | q36fmodel | 支持 |
-| DeepSeek-V4-Pro | dmodel | 支持 |
-| DeepSeek-V4-Flash | dfmodel | 支持 |
-| GLM-5.2 | gm51model | 支持 |
-| Kimi-K2.7-Code | kmodel | 支持 |
-| MiniMax-M2.7 | mmodel | 不支持 |
+| 显示名称                | 内部 Key         | 视觉  |
+| ------------------- | -------------- | --- |
+| Qwen3.8-Max-Preview | qmodel_preview | 支持  |
+| Qwen3.7-Max         | qmodel_latest  | 不支持 |
+| Qwen3.7-Plus        | qmodel         | 支持  |
+| Qwen3.6-Flash       | q36fmodel      | 支持  |
+| DeepSeek-V4-Pro     | dmodel         | 不支持 |
+| DeepSeek-V4-Flash   | dfmodel        | 不支持 |
+| GLM-5.2             | gm51model      | 不支持 |
+| Kimi-K2.7-Code      | kmodel         | 支持  |
+| MiniMax-M2.7        | mmodel         | 不支持 |
 
 > 以上为内置默认列表，实际可用模型以网关动态返回为准。
 
@@ -41,6 +41,8 @@ go build -o qoder2api .
 # 运行（默认监听 0.0.0.0:10081）
 ./qoder2api
 ```
+
+> 收到 `SIGINT`（Ctrl+C）或 `SIGTERM` 会触发优雅关闭：停止接受新连接、等待在途请求并落盘统计后退出。
 
 ### 方式二：Docker 部署
 
@@ -69,7 +71,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
 
-> 请求统计（`stats` 字段）随 data.json 持久化，服务每 30 秒批量写入一次；仅统计通过密钥鉴权且请求体合法的调用。
+> 请求统计（`stats` 字段）随 data.json 持久化：服务每 30 秒批量写入一次，并在收到 `SIGINT`/`SIGTERM` 优雅关闭时执行最终落盘；仅统计通过密钥鉴权且请求体合法的调用，客户端主动断开不计入失败。
 
 ### 配置文件 (data.json)
 
@@ -97,6 +99,8 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 ### 1. 配置 PAT
 
 启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「令牌」标签页中填入你的 Qoder PAT。
+
+> ⚠️ **默认密码仅用于首次登录，请立即在「设置」标签页中修改**。登录失败会按客户端 IP 触发指数退避限流，部署到公网时务必启用 HTTPS 反代。
 
 ### 2. 创建 API 密钥
 
@@ -137,6 +141,21 @@ curl http://localhost:10081/v1/models \
 | `/admin/api/config` | GET/POST | 服务器配置 |
 | `/admin/api/password` | POST | 修改管理密码 |
 
+**错误响应约定**：登录失败限流返回 `429`（附 `Retry-After`）；创建重复 API Key 返回 `409`；端口配置越界（非 1–65535）返回 `400`；未鉴权或会话过期返回 `401`。
+
+## 安全
+
+本项目面向内网 / 个人使用，已内置以下加固措施，**部署到公网前请务必修改默认密码并使用 HTTPS 反代**：
+
+- **HTTP 超时**：`ReadHeaderTimeout=10s`、`IdleTimeout=120s`，抵御 slowloris 类慢速连接耗尽；`WriteTimeout` 不设以兼容长连接 SSE 流式响应。
+- **请求体上限**：`/v1/chat/completions` 限制 10 MiB，管理 API 限制 64 KiB，防止超大 payload 耗尽内存。
+- **登录限流**：管理面板登录按客户端 IP 计数，失败后指数退避（1s → 30s 封顶），锁定期间返回 `429` + `Retry-After`。
+- **恒定时间比较**：API Key 校验与管理密码比对均使用 `crypto/subtle`，避免时序侧信道泄露。
+- **Cookie 安全**：会话 Cookie 为 `HttpOnly` + `SameSite=Lax`，在 HTTPS（含 `X-Forwarded-Proto: https` 反代）下自动附加 `Secure`。
+- **优雅关闭**：收到 `SIGINT`/`SIGTERM` 后停止接受新连接、等待在途请求（最长 15s）并完成统计最终落盘，避免数据丢失。
+- **XSS 防护**：Web 面板用户输入通过 `textContent` 渲染与 `addEventListener` 绑定，避免内联事件处理器中的字符串注入。
+- **输入校验**：API Key 唯一性校验（重复返回 `409`）；端口范围校验 1–65535；工具调用索引边界保护（防 panic / OOM）。
+
 ## 项目结构
 
 ```
@@ -159,8 +178,9 @@ Qoder-2API-Go/
 - **语言**：Go 1.22+
 - **依赖**：仅使用 `github.com/google/uuid`，其余全部标准库
 - **加密**：RSA + AES 混合加密、MD5 签名、自定义 Base64 编码
-- **HTTP**：标准库 `net/http`，SSE 流式响应
+- **HTTP**：标准库 `net/http`，SSE 流式响应，优雅关闭
 - **存储**：JSON 文件持久化，线程安全读写
+- **安全**：请求体上限、登录限流、恒定时间鉴权、Secure Cookie、XSS 防护
 
 ## 开发
 

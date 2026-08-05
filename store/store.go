@@ -4,8 +4,10 @@ package store
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -13,6 +15,9 @@ import (
 
 	"qoder2api/stats"
 )
+
+// ErrDuplicateKey is returned by AddKey when an identical key already exists.
+var ErrDuplicateKey = errors.New("api key already exists")
 
 // APIKey represents a single API key entry.
 type APIKey struct {
@@ -180,11 +185,16 @@ func (s *Store) SetPAT(pat string) error {
 
 // --- Stats ---
 
-// LoadStats returns the persisted stats snapshot, or nil if none exists.
+// LoadStats returns a deep copy of the persisted stats snapshot, or nil if
+// none exists. A copy is returned so callers can never race with concurrent
+// save() calls that marshal the live snapshot.
 func (s *Store) LoadStats() *stats.Data {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.config.Stats
+	if s.config.Stats == nil {
+		return nil
+	}
+	return s.config.Stats.Clone()
 }
 
 // SaveStats persists the stats snapshot into the config file.
@@ -207,17 +217,32 @@ func (s *Store) ListKeys() []APIKey {
 }
 
 // AddKey creates a new API key. If key is empty, a random one is generated.
+// Returns an error if the key already exists (duplicate) or generation fails.
 func (s *Store) AddKey(key, note string) (*APIKey, error) {
 	if key == "" {
-		key = GenerateAPIKey()
+		var err error
+		key, err = GenerateAPIKey()
+		if err != nil {
+			return nil, fmt.Errorf("generate api key: %w", err)
+		}
+	}
+	id, err := GenerateID()
+	if err != nil {
+		return nil, fmt.Errorf("generate id: %w", err)
 	}
 	entry := &APIKey{
-		ID:        GenerateID(),
+		ID:        id,
 		Key:       key,
 		Note:      note,
 		CreatedAt: time.Now().Unix(),
 	}
 	s.mu.Lock()
+	for _, k := range s.config.APIKeys {
+		if k.Key == key {
+			s.mu.Unlock()
+			return nil, ErrDuplicateKey
+		}
+	}
 	s.config.APIKeys = append(s.config.APIKeys, *entry)
 	s.mu.Unlock()
 	if err := s.save(); err != nil {
@@ -247,11 +272,14 @@ func (s *Store) DeleteKey(id string) error {
 }
 
 // ValidateKey returns true if the given key exists in the store.
+// Comparison is constant-time to avoid leaking key material via timing.
 func (s *Store) ValidateKey(key string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	kb := []byte(key)
 	for _, k := range s.config.APIKeys {
-		if k.Key == key {
+		// ConstantTimeCompare returns 1 only when lengths match and bytes equal.
+		if subtle.ConstantTimeCompare([]byte(k.Key), kb) == 1 {
 			return true
 		}
 	}
@@ -261,15 +289,19 @@ func (s *Store) ValidateKey(key string) bool {
 // --- Generators ---
 
 // GenerateAPIKey returns a random "sk-" prefixed key (32 hex chars).
-func GenerateAPIKey() string {
+func GenerateAPIKey() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 // GenerateID returns a short random hex ID.
-func GenerateID() string {
+func GenerateID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

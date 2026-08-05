@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"qoder2api/auth"
@@ -28,6 +29,10 @@ var (
 	refreshMarginMs = int64(2 * 3600 * 1000) // 2 hours
 	catalogTTL      = float64(600)           // 10 minutes
 )
+
+// chatMaxBodyBytes caps the /v1/chat/completions request body to bound memory
+// use against oversized payloads (DoS hardening).
+const chatMaxBodyBytes = 10 << 20 // 10 MiB
 
 // --- Chat request body types ---
 
@@ -163,13 +168,11 @@ type OpenAiBridge struct {
 	refreshToken  string
 	securityOauth string
 	expireTimeMs  int64
-	bootstrapped  bool
+	bootstrapped  atomic.Bool
 
 	catalogMu sync.Mutex
 	catalog   *models.ModelCatalog
 	catalogTs float64
-
-	templateLoaded bool
 }
 
 // NewOpenAiBridge creates a new bridge for the given PAT.
@@ -207,8 +210,7 @@ func (b *OpenAiBridge) bootstrapSession(ctx context.Context) error {
 	exp, _ := jt["expireTime"]
 	log.Printf("[bridge] session for %s (%s) [%s] exp=%v", name, id, b.Region.Name, exp)
 	b.applyJobToken(jt)
-	b.templateLoaded = true
-	b.bootstrapped = true
+	b.bootstrapped.Store(true)
 	return nil
 }
 
@@ -304,12 +306,12 @@ func (b *OpenAiBridge) doRenew(ctx context.Context, force bool) error {
 
 // EnsureFreshSession proactively rotates the session token before expiry.
 func (b *OpenAiBridge) EnsureFreshSession(ctx context.Context) error {
-	if b.bootstrapped && !b.needsRefresh() {
+	if b.bootstrapped.Load() && !b.needsRefresh() {
 		return nil
 	}
 	b.refreshMu.Lock()
 	defer b.refreshMu.Unlock()
-	if !b.bootstrapped {
+	if !b.bootstrapped.Load() {
 		return b.bootstrapSession(ctx)
 	}
 	if !b.needsRefresh() {
@@ -694,6 +696,9 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 			return
 		}
 
+		// Cap request body to bound memory use against oversized payloads.
+		r.Body = http.MaxBytesReader(w, r.Body, chatMaxBodyBytes)
+
 		var reqBody map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 			writeError(w, 400, "invalid_request_error", "Invalid JSON body: "+err.Error())
@@ -711,9 +716,14 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 
 		err := b.HandleChat(r.Context(), w, reqBody)
 		if err != nil {
+			// A client-initiated disconnect (or server shutdown) is not a
+			// request failure and must not skew the success rate.
+			clientGone := errors.Is(err, context.Canceled)
 			var repErr *StreamReportedError
 			if errors.As(err, &repErr) {
-				record(false)
+				if !clientGone {
+					record(false)
+				}
 				return
 			}
 			var valErr *models.UnsupportedModelError
@@ -729,7 +739,9 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 				return
 			}
 			writeError(w, 500, "qoder_error", errMsg)
-			record(false)
+			if !clientGone {
+				record(false)
+			}
 			return
 		}
 		record(true)

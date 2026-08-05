@@ -93,7 +93,7 @@ func NewRecorder(p Persister) *Recorder {
 	r := &Recorder{persist: p}
 	if p != nil {
 		if d := p.LoadStats(); d != nil {
-			r.data = normalize(d).clone()
+			r.data = normalize(d).Clone()
 		}
 	}
 	if r.data == nil {
@@ -119,9 +119,9 @@ func normalize(d *Data) *Data {
 	return d
 }
 
-// clone returns a deep copy of d. Callers must not hold the recorder mutex
+// Clone returns a deep copy of d. Callers must not hold the recorder mutex
 // when the copy is needed for concurrent use.
-func (d *Data) clone() *Data {
+func (d *Data) Clone() *Data {
 	cp := &Data{
 		Total:   d.Total,
 		Success: d.Success,
@@ -194,7 +194,7 @@ func (r *Recorder) Flush() error {
 		return nil
 	}
 	r.pruneLocked()
-	cp := r.data.clone()
+	cp := r.data.Clone()
 	r.dirty = false
 	r.mu.Unlock()
 

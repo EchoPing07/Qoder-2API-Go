@@ -414,7 +414,7 @@ code, .mono, .num {
   margin-top: 2px;
 }
 .card-body { padding: 20px; }
-.card-body.flush { padding: 0; }
+.card-body.flush { padding: 0; overflow-x: auto; }
 
 /* ---------- Chart ---------- */
 
@@ -718,6 +718,7 @@ input[readonly] {
 .mobile-nav .nav-item span.mnav-label { font-size: 12.5px; }
 
 @media (max-width: 900px) {
+  .shell { flex-direction: column; }
   .sidebar { display: none; }
   .main { padding: 24px 18px 48px; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
@@ -729,6 +730,8 @@ input[readonly] {
   .row > label { min-width: auto; }
   .stat-value { font-size: 22px; }
   .chart-col { min-width: 12px; }
+  /* Prevent iOS Safari auto-zoom on focus (requires >=16px). */
+  input[type="text"], input[type="number"], input[type="password"] { font-size: 16px; }
 }
 </style>
 </head>
@@ -1252,10 +1255,20 @@ function loadKeys() {
         '<td><span class="mono">' + escapeHtml(k.key) + '</span></td>' +
         '<td>' + (k.note ? escapeHtml(k.note) : '<span class="muted">—</span>') + '</td>' +
         '<td class="muted num">' + dt + '</td>' +
-        '<td><div class="btn-row" style="justify-content:flex-end">' +
-        '<button class="btn secondary sm" type="button" onclick="copyText(\'' + escapeHtml(k.key) + '\')">复制</button>' +
-        '<button class="btn danger sm" type="button" onclick="deleteKey(\'' + k.id + '\')">删除</button>' +
-        '</div></td>';
+        '<td><div class="btn-row" style="justify-content:flex-end"></div></td>';
+      var btnRow = tr.querySelector('.btn-row');
+      var copyBtn = document.createElement('button');
+      copyBtn.className = 'btn secondary sm';
+      copyBtn.type = 'button';
+      copyBtn.textContent = '复制';
+      copyBtn.addEventListener('click', function() { copyText(k.key); });
+      var delBtn = document.createElement('button');
+      delBtn.className = 'btn danger sm';
+      delBtn.type = 'button';
+      delBtn.textContent = '删除';
+      delBtn.addEventListener('click', function() { deleteKey(k.id); });
+      btnRow.appendChild(copyBtn);
+      btnRow.appendChild(delBtn);
       tb.appendChild(tr);
     });
   }).catch(function(e) { showToast(e.message, 'error'); });
@@ -1276,7 +1289,7 @@ function addKey(gen) {
 
 function deleteKey(id) {
   if (!confirm('确定删除此密钥？')) return;
-  api('/keys?id=' + id, { method: 'DELETE' })
+  api('/keys?id=' + encodeURIComponent(id), { method: 'DELETE' })
     .then(function() { showToast('密钥已删除'); loadKeys(); })
     .catch(function(e) { showToast(e.message, 'error'); });
 }
@@ -1311,8 +1324,13 @@ function loadModels() {
     data.models.forEach(function(m) {
       var d = document.createElement('div');
       d.className = 'model-item';
-      d.innerHTML = '<span class="mono">' + escapeHtml(m) + '</span>' +
-        '<button class="btn secondary sm" type="button" onclick="copyText(\'' + escapeHtml(m) + '\')">复制</button>';
+      d.innerHTML = '<span class="mono">' + escapeHtml(m) + '</span>';
+      var copyBtn = document.createElement('button');
+      copyBtn.className = 'btn secondary sm';
+      copyBtn.type = 'button';
+      copyBtn.textContent = '复制';
+      copyBtn.addEventListener('click', function() { copyText(m); });
+      d.appendChild(copyBtn);
       g.appendChild(d);
     });
   }).catch(function(e) { showToast(e.message, 'error'); });

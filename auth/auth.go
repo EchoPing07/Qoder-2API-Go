@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -381,6 +380,7 @@ func postEncoded(ctx context.Context, urlStr string, obj interface{}, machineID,
 
 	if resp.StatusCode != 200 {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
@@ -443,72 +443,12 @@ func RefreshJobToken(ctx context.Context, personalToken, refreshToken, securityO
 	return requestJobToken(ctx, personalToken, refreshToken, securityOauthToken, true, machineID, machineToken, machineType, region)
 }
 
-type userStatusInnerStruct struct {
-	UserID             string          `json:"userId"`
-	PersonalToken      string          `json:"personalToken"`
-	SecurityOauthToken string          `json:"securityOauthToken"`
-	RefreshToken       string          `json:"refreshToken"`
-	NeedRefresh        bool            `json:"needRefresh"`
-	AuthInfo           json.RawMessage `json:"authInfo"`
-}
-
-func UserStatus(ctx context.Context, userID, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
-	if region == nil {
-		region = CN
-	}
-	urlStr := AuthURL(region, "/algo/api/v3/user/status?Encode=1")
-	inner := userStatusInnerStruct{
-		UserID:             userID,
-		PersonalToken:      "",
-		SecurityOauthToken: "",
-		RefreshToken:       "",
-		NeedRefresh:        false,
-		AuthInfo:           emptyJSON,
-	}
-	innerJSON, err := marshalNoEscape(inner)
-	if err != nil {
-		return nil, err
-	}
-	outer := jobTokenOuterStruct{
-		Payload:       string(innerJSON),
-		EncodeVersion: "1",
-	}
-	return postEncoded(ctx, urlStr, outer, machineID, machineToken, machineType)
-}
-
-type heartbeatBodyStruct struct {
-	EventTime  int64           `json:"event_time"`
-	EventType  string          `json:"event_type"`
-	Mid        string          `json:"mid"`
-	OsArch     string          `json:"os_arch"`
-	OsVersion  string          `json:"os_version"`
-	IdeType    string          `json:"ide_type"`
-	IdeVersion string          `json:"ide_version"`
-	ExtraInfo  json.RawMessage `json:"extra_info"`
-}
-
-func Heartbeat(ctx context.Context, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
-	if region == nil {
-		region = CN
-	}
-	urlStr := AuthURL(region, "/algo/api/v1/heartbeat?Encode=1")
-	arch := runtime.GOARCH
-	osArch := arch
-	if arch == "amd64" {
-		osArch = "windows_amd64"
-	}
-	osVersion := runtime.GOOS
-	hb := heartbeatBodyStruct{
-		EventTime:  time.Now().UnixMilli(),
-		EventType:  "cosy_heartbeat",
-		Mid:        machineID,
-		OsArch:     osArch,
-		OsVersion:  osVersion,
-		IdeType:    "qodercli",
-		IdeVersion: "0.1.43",
-		ExtraInfo:  emptyJSON,
-	}
-	return postEncoded(ctx, urlStr, hb, machineID, machineToken, machineType)
+// drainBody reads and discards the remaining response body (up to a cap) so
+// the underlying TCP connection can be returned to the pool for reuse.
+// Must be called before resp.Body.Close() on error paths where the body was
+// only partially read.
+func drainBody(body io.Reader) {
+	io.Copy(io.Discard, io.LimitReader(body, 1<<20))
 }
 
 // --- Bearer API Client ---
@@ -596,6 +536,7 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 
 	if resp.StatusCode != 200 {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
@@ -639,6 +580,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 
 	if resp.StatusCode != 200 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return &AuthError{StatusCode: resp.StatusCode, Detail: string(errBody)}
 		}

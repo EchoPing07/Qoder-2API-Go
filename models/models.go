@@ -3,6 +3,23 @@ package models
 
 import "sort"
 
+// enableFlag coerces a model entry's "enable" field to a bool. Missing or
+// unrecognised values are treated as enabled, matching the prior default.
+func enableFlag(v interface{}) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return !(x == "false" || x == "0" || x == "False" || x == "FALSE")
+	case float64:
+		return x != 0
+	case nil:
+		return true
+	default:
+		return true
+	}
+}
+
 // DefaultModelMap is the built-in fallback map (display_name -> qoder internal key).
 // Matches catalog-v5 (2026-07-19) chat scene. Only used when dynamic fetch fails.
 var DefaultModelMap = map[string]string{
@@ -111,12 +128,10 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 		if !ok {
 			continue
 		}
-		// enable defaults to true if missing
+		// enable defaults to true if missing; coerce common non-bool shapes.
 		enableVal, hasEnable := m["enable"]
-		if hasEnable {
-			if b, ok := enableVal.(bool); ok && !b {
-				continue
-			}
+		if hasEnable && !enableFlag(enableVal) {
+			continue
 		}
 		key, _ := m["key"].(string)
 		name, _ := m["display_name"].(string)

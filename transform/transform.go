@@ -548,6 +548,10 @@ func ParseToolCallsText(text string) []NormalizedToolCall {
 	return normalizeToolCalls(parsed)
 }
 
+// maxToolCalls caps how many tool calls a single response may accumulate,
+// defending against malformed/huge indices from upstream.
+const maxToolCalls = 128
+
 // --- ToolCallAccumulator ---
 
 type ToolCallAccumulator struct {
@@ -565,6 +569,12 @@ func (a *ToolCallAccumulator) Append(deltaCalls []map[string]interface{}) {
 			idx = float64(len(a.calls))
 		}
 		i := int(idx)
+		// Guard against malformed indices: negative values would panic on
+		// slice access, and huge values would trigger unbounded growth. Fall
+		// back to appending at the end in either case.
+		if i < 0 || i > len(a.calls) || i >= maxToolCalls {
+			i = len(a.calls)
+		}
 		for len(a.calls) <= i {
 			a.calls = append(a.calls, map[string]interface{}{
 				"id":       "",

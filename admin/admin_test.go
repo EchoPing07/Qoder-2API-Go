@@ -286,3 +286,37 @@ func TestServeIndex(t *testing.T) {
 		t.Error("expected HTML doctype")
 	}
 }
+
+// Repeated wrong passwords trigger per-IP rate limiting (HTTP 429).
+func TestLoginRateLimit(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleLogin, "POST", "/admin/api/login", map[string]string{"password": "wrong"})
+	if w.Code != 401 {
+		t.Fatalf("expected 401 on first wrong login, got %d", w.Code)
+	}
+	// Immediately retry: should be locked out.
+	w = doRequest(t, a.handleLogin, "POST", "/admin/api/login", map[string]string{"password": "wrong"})
+	if w.Code != 429 {
+		t.Errorf("expected 429 on second wrong login (rate limited), got %d", w.Code)
+	}
+}
+
+// Out-of-range ports must be rejected before persisting.
+func TestConfigSetInvalidPort(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config",
+		map[string]interface{}{"host": "0.0.0.0", "port": 99999})
+	if w.Code != 400 {
+		t.Errorf("expected 400 for out-of-range port, got %d", w.Code)
+	}
+}
+
+// Duplicate keys are reported as 409, not 500.
+func TestAddKeyDuplicateReturns409(t *testing.T) {
+	a, _ := newAdmin(t)
+	doRequest(t, a.handleKeys, "POST", "/admin/api/keys", map[string]string{"key": "sk-dup", "note": "first"})
+	w := doRequest(t, a.handleKeys, "POST", "/admin/api/keys", map[string]string{"key": "sk-dup", "note": "second"})
+	if w.Code != 409 {
+		t.Errorf("expected 409 for duplicate key, got %d", w.Code)
+	}
+}
