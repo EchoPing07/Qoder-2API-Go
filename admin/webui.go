@@ -1270,7 +1270,7 @@ function loadKeys() {
       tr.innerHTML =
         '<td><span class="mono">' + escapeHtml(k.key) + '</span></td>' +
         '<td>' + (k.note ? escapeHtml(k.note) : '<span class="muted">—</span>') + '</td>' +
-        '<td class="muted num">' + dt + '</td>' +
+        '<td class="muted">' + dt + '</td>' +
         '<td><div class="btn-row" style="justify-content:flex-end"></div></td>';
       var btnRow = tr.querySelector('.btn-row');
       var copyBtn = document.createElement('button');

@@ -170,7 +170,11 @@ func TestNewRequestBody(t *testing.T) {
 // --- Regression tests for review fixes ---
 
 func TestTruncateRunesNeverSplitsUTF8(t *testing.T) {
-	cases := []struct{ in string; n int; want string }{
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
 		{"你好世界", 3, "你好世"},
 		{"你好世界", 10, "你好世界"},
 		{"abc", 0, ""},
@@ -330,7 +334,7 @@ func TestHandleSyncEndToEnd(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	err := b.HandleChat(context.Background(), w, map[string]interface{}{
-		"model":   "Fake-Model",
+		"model":    "Fake-Model",
 		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "q"}},
 	}, nil)
 	if err != nil {
@@ -379,5 +383,205 @@ func TestHandleStreamUpstreamErrorAfterContent(t *testing.T) {
 	}
 	if strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
 		t.Error("failed stream must not terminate with [DONE]")
+	}
+}
+
+// Regression: the real Qoder gateway terminates its SSE stream with [DONE]
+// wrapped inside the Encode-layer envelope (data: {"body":"[DONE]",...}),
+// followed by an "event:finish" line and a telemetry data frame. The bare
+// "data: [DONE]" check previously used by OpenStreamLines never matched this
+// shape, so every real request failed with "stream ended without [DONE]".
+// This test replays the real wire format end-to-end.
+func TestHandleStreamRealGatewayDoneFormat(t *testing.T) {
+	doneFrame, _ := json.Marshal(map[string]interface{}{"body": "[DONE]"})
+	telemetryFrame, _ := json.Marshal(map[string]interface{}{
+		"firstTokenDuration": float64(728),
+		"serverDuration":     float64(66),
+		"totalDuration":      float64(1230),
+	})
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "blue"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{}, "finish_reason": "stop"}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+		"data: " + string(doneFrame),      // wrapped [DONE] — the real gateway form
+		"event:finish",                    // SSE event field, no data: prefix
+		"data: " + string(telemetryFrame), // trailing telemetry, no body/choices
+	}}
+	b := newFakeBridge(t, gw)
+
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model":    "Fake-Model",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "sky color"}},
+		"stream":   true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("real-format stream must not error, got %v", err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "blue") {
+		t.Error("content must be delivered")
+	}
+	if !strings.Contains(body, "\"finish_reason\":\"stop\"") {
+		t.Error("finish_reason stop must be emitted")
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Error("client-facing stream must end with our own bare [DONE]")
+	}
+}
+
+// Regression (real gateway, GLM-5.3): the final SSE frame carries BOTH
+// finish_reason=stop and usage on the same frame (with an empty delta).
+// The old mutually-exclusive classification dropped the usage, leaving
+// token stats at zero for GLM models while Qwen models (standalone usage
+// frame) worked fine. The stream must deliver content, finish_reason and
+// the usage chunk, and the usage sink must fire.
+func TestHandleStreamGLMStyleUsageOnFinalContentFrame(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "蓝", "role": "assistant"}}}}),
+		sseFrame(t, map[string]interface{}{
+			"choices": []interface{}{map[string]interface{}{
+				"delta":         map[string]interface{}{"content": ""},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]interface{}{
+				"prompt_tokens":             19,
+				"completion_tokens":         90,
+				"total_tokens":              109,
+				"credits":                   0.059,
+				"prompt_tokens_details":     map[string]interface{}{"cached_tokens": 3},
+				"completion_tokens_details": map[string]interface{}{"reasoning_tokens": 86},
+			},
+		}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+
+	var usageSeen *stats.Usage
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model": "Fake-Model",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "sky color"},
+		},
+		"stream": true,
+	}, func(u *transform.Usage) {
+		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedPromptTokens(), Credits: u.Credits}
+	})
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "蓝") {
+		t.Errorf("content missing:\n%s", body)
+	}
+	if !strings.Contains(body, "\"finish_reason\":\"stop\"") {
+		t.Errorf("finish_reason stop missing:\n%s", body)
+	}
+	if !strings.Contains(body, "\"prompt_tokens\":19") {
+		t.Errorf("usage chunk missing:\n%s", body)
+	}
+	if usageSeen == nil {
+		t.Fatal("usage sink not invoked")
+	}
+	if usageSeen.PromptTokens != 19 || usageSeen.CompletionTokens != 90 || usageSeen.CachedTokens != 3 {
+		t.Errorf("usage sink wrong: %+v", usageSeen)
+	}
+}
+
+// Non-streaming variant of the same GLM-style regression.
+func TestHandleSyncGLMStyleUsageOnFinalContentFrame(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "蓝"}}}}),
+		sseFrame(t, map[string]interface{}{
+			"choices": []interface{}{map[string]interface{}{
+				"delta":         map[string]interface{}{},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]interface{}{"prompt_tokens": 19, "completion_tokens": 90, "total_tokens": 109, "credits": 0.059},
+		}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+
+	var usageSeen *stats.Usage
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model":    "Fake-Model",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "sky color"}},
+	}, func(u *transform.Usage) {
+		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens}
+	})
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if resp["usage"] == nil {
+		t.Fatal("usage missing from sync response")
+	}
+	u, _ := resp["usage"].(map[string]interface{})
+	if u["prompt_tokens"].(float64) != 19 {
+		t.Errorf("unexpected usage: %v", u)
+	}
+	if usageSeen == nil || usageSeen.PromptTokens != 19 {
+		t.Errorf("usage sink not invoked correctly: %+v", usageSeen)
+	}
+}
+
+// Regression (real gateway, MiniMax / key "mmodel"): the stream terminates
+// with "event:finish" + a telemetry frame instead of a [DONE] marker, and
+// interleaves body:"null" keep-alive frames. The old sawDone check flagged
+// these streams as truncated ("stream ended without [DONE]"), failing the
+// request even though content and usage had fully arrived.
+func TestHandleStreamMiniMaxStyleFinishEvent(t *testing.T) {
+	nullFrame, _ := json.Marshal(map[string]interface{}{"body": "null"})
+	telemetryFrame, _ := json.Marshal(map[string]interface{}{
+		"firstTokenDuration": float64(669),
+		"serverDuration":     float64(59),
+		"totalDuration":      float64(5590),
+	})
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "蓝", "role": "assistant"}}}}),
+		"data: " + string(nullFrame),
+		sseFrame(t, map[string]interface{}{
+			"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "色"}, "finish_reason": "stop"}},
+		}),
+		"data: " + string(nullFrame),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 48, "completion_tokens": 146, "total_tokens": 194, "credits": 0.029}}),
+		"data: " + string(nullFrame),
+		"event:finish", // MiniMax termination: no [DONE] frame
+		"data: " + string(telemetryFrame),
+	}}
+	b := newFakeBridge(t, gw)
+
+	var usageSeen *stats.Usage
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model": "Fake-Model",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "sky color"},
+		},
+		"stream": true,
+	}, func(u *transform.Usage) {
+		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Credits: u.Credits}
+	})
+	if err != nil {
+		t.Fatalf("MiniMax-style stream must not error, got %v", err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "蓝") || !strings.Contains(body, "色") {
+		t.Errorf("content missing:\n%s", body)
+	}
+	if !strings.Contains(body, "\"prompt_tokens\":48") {
+		t.Errorf("usage chunk missing:\n%s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Error("client-facing stream must still end with our own [DONE]")
+	}
+	if usageSeen == nil || usageSeen.PromptTokens != 48 {
+		t.Errorf("usage sink not invoked correctly: %+v", usageSeen)
 	}
 }

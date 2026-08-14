@@ -560,6 +560,34 @@ type StreamCallback func(line string) error
 // intentionally sets no WriteTimeout for SSE.
 const idleStreamTimeout = 5 * time.Minute
 
+// isDoneLine reports whether an SSE line carries the terminal [DONE]
+// marker. The Qoder gateway wraps [DONE] inside its Encode-layer envelope
+// ({"body":"[DONE]",...}) rather than emitting a bare "data: [DONE]";
+// both forms are accepted so test fakes and real traffic both terminate
+// cleanly.
+func isDoneLine(line string) bool {
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	payload := strings.TrimSpace(line[5:])
+	if payload == "[DONE]" {
+		return true
+	}
+	var env struct{ Body string `json:"body"` }
+	if json.Unmarshal([]byte(payload), &env) == nil && env.Body == "[DONE]" {
+		return true
+	}
+	return false
+}
+
+// isFinishEvent reports whether an SSE line is the gateway's terminal
+// "event:finish" marker. Some models (MiniMax) end their stream with this
+// event instead of a [DONE] frame, so it must count as a clean termination
+// just like [DONE].
+func isFinishEvent(line string) bool {
+	return strings.HasPrefix(line, "event:") && strings.TrimSpace(line[len("event:"):]) == "finish"
+}
+
 // OpenStreamLines sends a POST and reads SSE response line by line.
 func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, jsonBody []byte, extraHeaders map[string]string, callback StreamCallback) error {
 	pathSig := sigPath(fullURL)
@@ -629,7 +657,12 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "data:") && strings.TrimSpace(line[5:]) == "[DONE]" {
+		if isDoneLine(line) {
+			sawDone = true
+		}
+		if isFinishEvent(line) {
+			// MiniMax-style termination: no [DONE] frame, just event:finish
+			// followed by a telemetry frame and EOF.
 			sawDone = true
 		}
 		isAuthErr, detail := detectInStreamAuthError(line)

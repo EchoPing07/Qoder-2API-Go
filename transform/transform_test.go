@@ -389,8 +389,9 @@ func TestWithToolCallIndicesPreservesUpstreamIndex(t *testing.T) {
 	}
 }
 
-// A frame carrying both choices (content) and usage is a content frame:
-// the usage check must not swallow its text.
+// A frame may carry BOTH choices (content) and usage (GLM-style final
+// frame). Both must be surfaced; usage must not swallow content and
+// content must not drop usage.
 func TestExtractDeltaContentFrameWithUsageIsNotSwallowed(t *testing.T) {
 	inner, _ := json.Marshal(map[string]interface{}{
 		"choices": []interface{}{
@@ -404,11 +405,48 @@ func TestExtractDeltaContentFrameWithUsageIsNotSwallowed(t *testing.T) {
 	})
 	wrapper, _ := json.Marshal(map[string]interface{}{"body": string(inner)})
 	delta := ExtractDelta(string(wrapper))
-	if delta.Usage != nil {
-		t.Error("content frame must not be classified as a usage frame")
+	if delta.Usage == nil {
+		t.Error("usage attached to a content frame must be captured")
+	} else if delta.Usage.PromptTokens != 5 {
+		t.Errorf("unexpected usage: %+v", delta.Usage)
 	}
 	if delta.Content != "hello" {
 		t.Errorf("content swallowed: %+v", delta)
+	}
+}
+
+// Regression (real gateway, GLM-5.3 / key "gmodel"): the terminal frame
+// carries finish_reason=stop together with usage and an empty delta. The
+// old code treated any frame with choices as content-only and silently
+// dropped the usage, so token stats stayed zero for GLM models.
+func TestExtractDeltaGLMStyleFinalFrame(t *testing.T) {
+	inner, _ := json.Marshal(map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"index":         float64(0),
+				"delta":         map[string]interface{}{"content": "", "role": "assistant"},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":             19,
+			"completion_tokens":         90,
+			"total_tokens":              109,
+			"credits":                   0.059,
+			"prompt_tokens_details":     map[string]interface{}{"cached_tokens": 0},
+			"completion_tokens_details": map[string]interface{}{"reasoning_tokens": 86},
+		},
+	})
+	wrapper, _ := json.Marshal(map[string]interface{}{"body": string(inner)})
+	delta := ExtractDelta(string(wrapper))
+	if delta.Usage == nil {
+		t.Fatal("usage on GLM-style final frame must be captured")
+	}
+	if delta.Usage.PromptTokens != 19 || delta.Usage.CompletionTokens != 90 {
+		t.Errorf("unexpected usage: %+v", delta.Usage)
+	}
+	if delta.FinishReason != "stop" {
+		t.Errorf("finish_reason lost: %+v", delta)
 	}
 }
 

@@ -897,15 +897,13 @@ func ExtractDelta(dataLine string) *BridgeDelta {
 	if err := json.Unmarshal([]byte(innerStr), &innerJSON); err != nil {
 		return delta
 	}
+	// Usage arrives in two shapes depending on the model: a standalone
+	// final frame with empty choices (Qwen-style), or attached to the last
+	// content frame that carries finish_reason (GLM-style). Capture it in
+	// both cases; content processing below is unaffected.
+	delta.Usage = extractUsage(innerJSON["usage"])
 	choices, ok := innerJSON["choices"].([]interface{})
-	// Usage frame: empty choices + usage object, sent right before [DONE].
-	// A frame that carries both choices and usage is a content frame;
-	// treating it as a usage frame would drop the content (some gateways
-	// attach cumulative usage to every frame).
 	if !ok || len(choices) == 0 {
-		if u := extractUsage(innerJSON["usage"]); u != nil {
-			return &BridgeDelta{Usage: u}
-		}
 		return delta
 	}
 	for _, ch := range choices {
@@ -927,13 +925,11 @@ func ExtractDelta(dataLine string) *BridgeDelta {
 			toolCalls = interfaceSliceToMapSlice(tc)
 		}
 		if role != "" || content != "" || reasoning != "" || toolCalls != nil || finish != "" {
-			return &BridgeDelta{
-				Role:             role,
-				Content:          content,
-				ReasoningContent: reasoning,
-				FinishReason:     finish,
-				ToolCalls:        toolCalls,
-			}
+			delta.Role = role
+			delta.Content = content
+			delta.ReasoningContent = reasoning
+			delta.ToolCalls = toolCalls
+			return delta
 		}
 	}
 	return delta

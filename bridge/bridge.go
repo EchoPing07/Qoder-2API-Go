@@ -583,9 +583,10 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 			return nil
 		}
 		delta := transform.ExtractDelta(strings.TrimSpace(line[5:]))
+		// Usage may ride on the final content frame (GLM-style) instead of a
+		// standalone frame; capture it and keep processing the delta below.
 		if delta.Usage != nil {
 			usage = delta.Usage
-			return nil
 		}
 		if !delta.IsEmpty() {
 			acc.Accept(delta)
@@ -646,9 +647,10 @@ func (b *OpenAiBridge) handleSync(ctx context.Context, w http.ResponseWriter, js
 			return nil
 		}
 		delta := transform.ExtractDelta(strings.TrimSpace(line[5:]))
+		// Usage may ride on the final content frame (GLM-style); capture it
+		// and keep processing content/reasoning/tool calls below.
 		if delta.Usage != nil {
 			usage = delta.Usage
-			return nil
 		}
 		if delta.ReasoningContent != "" {
 			fullReasoning = append(fullReasoning, delta.ReasoningContent)
