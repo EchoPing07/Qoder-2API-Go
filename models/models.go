@@ -24,29 +24,35 @@ func enableFlag(v interface{}) bool {
 }
 
 // DefaultModelMap is the built-in fallback map (display_name -> qoder internal key).
-// Matches catalog-v5 (2026-07-19) chat scene. Only used when dynamic fetch fails.
+// Matches catalog-v6 (2026-08-15) chat scene. Only used when dynamic fetch fails.
+// Notable vs v5: Qwen3.8-Max graduated from preview (qmodel_preview ->
+// qmodel_38max, renamed without "-Preview"); GLM-5.3 (gmodel) added.
 var DefaultModelMap = map[string]string{
-	"Qwen3.8-Max-Preview": "qmodel_preview",
-	"Qwen3.7-Max":         "qmodel_latest",
-	"Qwen3.7-Plus":        "qmodel",
-	"Qwen3.6-Flash":       "q36fmodel",
-	"DeepSeek-V4-Pro":     "dmodel",
-	"DeepSeek-V4-Flash":   "dfmodel",
-	"GLM-5.2":             "gm51model",
-	"Kimi-K2.7-Code":      "kmodel",
-	"MiniMax-M2.7":        "mmodel",
+	"Qwen3.8-Max":      "qmodel_38max",
+	"Qwen3.7-Max":      "qmodel_latest",
+	"Qwen3.7-Plus":     "qmodel",
+	"Qwen3.6-Flash":    "q36fmodel",
+	"DeepSeek-V4-Pro":  "dmodel",
+	"DeepSeek-V4-Flash": "dfmodel",
+	"GLM-5.3":          "gmodel",
+	"GLM-5.2":          "gm51model",
+	"Kimi-K2.7-Code":   "kmodel",
+	"MiniMax-M2.7":     "mmodel",
 }
 
-// DefaultVisionModels are models that support vision input (display_name).
+// DefaultVisionModels mirrors the gateway's is_vl metadata for the fallback
+// catalog (display_name). NOTE: the gateway's is_vl flags have proven
+// unreliable — do not treat this as an authoritative capability matrix.
 var DefaultVisionModels = map[string]bool{
-	"Qwen3.8-Max-Preview": true,
-	"Qwen3.7-Max":         true,
-	"Qwen3.7-Plus":        true,
-	"Qwen3.6-Flash":       true,
-	"DeepSeek-V4-Pro":     true,
-	"DeepSeek-V4-Flash":   true,
-	"GLM-5.2":             true,
-	"Kimi-K2.7-Code":      true,
+	"Qwen3.8-Max":      true,
+	"Qwen3.7-Max":      true,
+	"Qwen3.7-Plus":     true,
+	"Qwen3.6-Flash":    true,
+	"DeepSeek-V4-Pro":  true,
+	"DeepSeek-V4-Flash": true,
+	"GLM-5.3":          true,
+	"GLM-5.2":          true,
+	"Kimi-K2.7-Code":   true,
 }
 
 // PreferredDefaultKey is the default model key when model param is None/empty.

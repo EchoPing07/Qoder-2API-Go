@@ -17,19 +17,22 @@
 
 ## 支持的模型
 
-| 显示名称                | 内部 Key         | 视觉  |
-| ------------------- | -------------- | --- |
-| Qwen3.8-Max-Preview | qmodel_preview | 支持  |
-| Qwen3.7-Max         | qmodel_latest  | 不支持 |
-| Qwen3.7-Plus        | qmodel         | 支持  |
-| Qwen3.6-Flash       | q36fmodel      | 支持  |
-| DeepSeek-V4-Pro     | dmodel         | 不支持 |
-| DeepSeek-V4-Flash   | dfmodel        | 不支持 |
-| GLM-5.2             | gm51model      | 不支持 |
-| Kimi-K2.7-Code      | kmodel         | 支持  |
-| MiniMax-M2.7        | mmodel         | 不支持 |
+| 显示名称            | 内部 Key         |
+| ----------------- | -------------- |
+| Qwen3.8-Max       | qmodel_38max   |
+| Qwen3.7-Max       | qmodel_latest  |
+| Qwen3.7-Plus      | qmodel         |
+| Qwen3.6-Flash     | q36fmodel      |
+| DeepSeek-V4-Pro   | dmodel         |
+| DeepSeek-V4-Flash | dfmodel        |
+| GLM-5.3           | gmodel         |
+| GLM-5.2           | gm51model      |
+| Kimi-K2.7-Code    | kmodel         |
+| MiniMax-M2.7      | mmodel         |
 
-> 以上为内置默认列表，实际可用模型以网关动态返回为准。
+> 以上为内置默认列表（catalog-v6，2026-08-15），实际可用模型以网关动态返回为准。
+>
+> **关于图片输入**：部分模型并非原生多模态，而是由网关对图片附带辅助识别（非原生多模态模型加上辅助后实际可以识图），因此上表不再标注是否支持视觉；识图效果以实际调用结果为准。
 
 ## 快速开始
 

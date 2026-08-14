@@ -531,6 +531,58 @@ func TestHandleSyncGLMStyleUsageOnFinalContentFrame(t *testing.T) {
 	}
 }
 
+// Regression (real gateway, qmodel_preview provider outage): stream opens
+// with HTTP 200 but carries a 429 envelope (provider_error "All backends
+// failed"), event:error, a Java stack frame and a bare success:false frame,
+// then EOF without [DONE]. The client must receive the real gateway error
+// in the SSE error chunk — not the misleading "connection truncated".
+func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
+	providerErr, _ := json.Marshal(map[string]interface{}{
+		"body": `{"code":"provider_error","message":"All backends failed","request_id":"x","type":"provider_error","param":{"retries":2}}
+`,
+		"statusCode": "TOO_MANY_REQUESTS", "statusCodeValue": float64(429),
+	})
+	stackTrace, _ := json.Marshal(map[string]interface{}{
+		"localizedMessage": "Unknown sse issue",
+		"stackTrace":        []interface{}{},
+	})
+	bareFail, _ := json.Marshal(map[string]interface{}{
+		"success": false, "msgCode": float64(500),
+		"msgInfo": "Internal Server Error", "message": "Internal Server Error",
+	})
+	gw := &fakeGateway{chatLines: []string{
+		"data: " + string(providerErr),
+		"event:error",
+		"data: " + string(stackTrace),
+		"data: " + string(bareFail),
+	}}
+	b := newFakeBridge(t, gw)
+
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model":    "Fake-Model",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, nil)
+	if err == nil {
+		t.Fatal("provider outage stream must fail")
+	}
+	var repErr *StreamReportedError
+	if !errors.As(err, &repErr) {
+		t.Fatalf("expected StreamReportedError, got %T: %v", err, err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "HTTP 429") || !strings.Contains(body, "provider_error: All backends failed") {
+		t.Errorf("error chunk must surface the real gateway cause, got:\n%s", body)
+	}
+	if strings.Contains(body, "connection truncated") {
+		t.Errorf("misleading truncated message must be gone, got:\n%s", body)
+	}
+	if strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Error("failed stream must not terminate with [DONE]")
+	}
+}
+
 // Regression (real gateway, MiniMax / key "mmodel"): the stream terminates
 // with "event:finish" + a telemetry frame instead of a [DONE] marker, and
 // interleaves body:"null" keep-alive frames. The old sawDone check flagged

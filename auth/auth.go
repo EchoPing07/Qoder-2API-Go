@@ -588,6 +588,110 @@ func isFinishEvent(line string) bool {
 	return strings.HasPrefix(line, "event:") && strings.TrimSpace(line[len("event:"):]) == "finish"
 }
 
+// isErrorEvent reports whether an SSE line is the gateway's terminal
+// "event:error" marker: the upstream provider failed and the stream is
+// about to end without [DONE]. Observed on qmodel_preview provider outages
+// (429 provider_error "All backends failed").
+func isErrorEvent(line string) bool {
+	return strings.HasPrefix(line, "event:") && strings.TrimSpace(line[len("event:"):]) == "error"
+}
+
+// inStreamError describes a gateway failure delivered inside the SSE stream
+// (HTTP status is still 200). Kept when seen so the EOF-without-[DONE]
+// fallback reports the real cause instead of a misleading "connection
+// truncated".
+type inStreamError struct {
+	status int
+	detail string
+}
+
+func (e *inStreamError) Error() string {
+	if e.status > 0 {
+		return fmt.Sprintf("gateway in-stream error (HTTP %d): %s", e.status, e.detail)
+	}
+	return fmt.Sprintf("gateway in-stream error: %s", e.detail)
+}
+
+// detectInStreamGatewayError extracts a terminal gateway/provider failure
+// from an SSE data line. Two shapes are recognized:
+//
+//  1. Envelope frame with an HTTP error status, e.g. (qmodel_preview
+//	     provider outage):
+//	     {"body":"{\"code\":\"provider_error\",\"message\":\"All backends failed\"...}",
+//	      "statusCodeValue":429,"statusCode":"TOO_MANY_REQUESTS"}
+//
+//  2. Bare success:false gateway error frame, e.g.
+//	     {"success":false,"msgCode":500,"message":"Internal Server Error"}
+//
+// A 200 OK envelope with normal chat/usage/[DONE] bodies returns nil.
+func detectInStreamGatewayError(line string) *inStreamError {
+	if !strings.HasPrefix(line, "data:") {
+		return nil
+	}
+	payload := strings.TrimSpace(line[len("data:"):])
+	var env struct {
+		Body          string `json:"body"`
+		StatusCode    string `json:"statusCode"`
+		StatusValue   int    `json:"statusCodeValue"`
+	}
+	if err := json.Unmarshal([]byte(payload), &env); err != nil {
+		return nil
+	}
+	if env.StatusValue >= 400 {
+		detail := env.Body
+		if detail == "" {
+			detail = env.StatusCode
+		}
+		return &inStreamError{status: env.StatusValue, detail: trimJSONMessage(detail)}
+	}
+	if env.Body != "" || env.StatusCode != "" {
+		// A well-formed envelope with a 2xx status is a normal frame.
+		return nil
+	}
+	var bare struct {
+		Success  bool             `json:"success"`
+		MsgCode  int              `json:"msgCode"`
+		MsgInfo  string           `json:"msgInfo"`
+		Message  string           `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(payload), &bare); err != nil {
+		return nil
+	}
+	if !bare.Success && (bare.MsgCode >= 400 || bare.Message != "" || bare.MsgInfo != "") {
+		// Only treat it as a failure when a message/code is present; a bare
+		// {"success":false} with no reason is too ambiguous to fail on.
+		detail := bare.Message
+		if detail == "" {
+			detail = bare.MsgInfo
+		}
+		if detail == "" {
+			detail = fmt.Sprintf("msgCode %d", bare.MsgCode)
+		}
+		return &inStreamError{status: bare.MsgCode, detail: detail}
+	}
+	return nil
+}
+
+// trimJSONMessage pulls the "message" field out of a JSON-string body when
+// present ("{\"code\":\"provider_error\",\"message\":\"All backends failed\"...}")
+// so the surfaced error reads "provider_error: All backends failed" instead
+// of a wall of escaped JSON.
+func trimJSONMessage(body string) string {
+	var m struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(body), &m); err == nil {
+		if m.Code != "" && m.Message != "" {
+			return m.Code + ": " + m.Message
+		}
+		if m.Message != "" {
+			return m.Message
+		}
+	}
+	return strings.TrimSpace(body)
+}
+
 // OpenStreamLines sends a POST and reads SSE response line by line.
 func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, jsonBody []byte, extraHeaders map[string]string, callback StreamCallback) error {
 	pathSig := sigPath(fullURL)
@@ -633,6 +737,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	// success would silently truncate the answer and still emit our own
 	// [DONE] to the client.
 	sawDone := false
+	var gwErr *inStreamError
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -665,6 +770,17 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 			// followed by a telemetry frame and EOF.
 			sawDone = true
 		}
+		if isErrorEvent(line) {
+			// Provider-side failure: the stream will end without [DONE]; make
+			// sure the EOF fallback reports the real cause (from the error
+			// frames seen before this event) instead of "truncated".
+			if gwErr == nil {
+				gwErr = &inStreamError{detail: "upstream stream failed (event:error)"}
+			}
+		}
+		if e := detectInStreamGatewayError(line); e != nil && gwErr == nil {
+			gwErr = e
+		}
 		isAuthErr, detail := detectInStreamAuthError(line)
 		if isAuthErr {
 			return &AuthError{StatusCode: 401, Detail: detail}
@@ -683,6 +799,11 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		return err
 	}
 	if !sawDone {
+		// Prefer the gateway's own failure reason when it sent error frames
+		// before the premature EOF; "connection truncated" is the fallback.
+		if gwErr != nil {
+			return gwErr
+		}
 		return fmt.Errorf("stream ended without [DONE] marker (connection truncated?)")
 	}
 	return nil

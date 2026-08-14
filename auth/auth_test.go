@@ -107,3 +107,78 @@ func TestBuildPayloadB64(t *testing.T) {
 func decodeStd(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
 }
+
+// --- In-stream gateway error detection (real wire formats) ---
+
+// Regression (real gateway, qmodel_preview provider outage): the stream
+// opens with HTTP 200 but the first data frame carries a 429 envelope
+// (provider_error "All backends failed"), followed by event:error and a
+// bare success:false frame, then EOF without [DONE]. The terminal check
+// must surface the real cause instead of "connection truncated".
+func TestDetectInStreamGatewayErrorEnvelope429(t *testing.T) {
+	line := `data:{"headers":{"Content-Type":["application/json"]},"body":"{\"code\":\"provider_error\",\"message\":\"All backends failed\",\"request_id\":\"x\",\"type\":\"provider_error\",\"param\":{\"retries\":2}}\n","statusCodeValue":429,"statusCode":"TOO_MANY_REQUESTS"}`
+	e := detectInStreamGatewayError(line)
+	if e == nil {
+		t.Fatal("429 envelope must be detected as in-stream error")
+	}
+	if e.status != 429 {
+		t.Errorf("status = %d, want 429", e.status)
+	}
+	if e.detail != "provider_error: All backends failed" {
+		t.Errorf("detail = %q, want provider_error message", e.detail)
+	}
+}
+
+// Normal envelope frames (200 OK chat/usage/[DONE] bodies) must NOT be
+// treated as errors.
+func TestDetectInStreamGatewayErrorOKEnvelope(t *testing.T) {
+	for _, line := range []string{
+		`data:{"body":"[DONE]","statusCodeValue":200,"statusCode":"OK"}`,
+		`data:{"body":"{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}","statusCodeValue":200,"statusCode":"OK"}`,
+		`data:{"firstTokenDuration":799,"serverDuration":73,"totalDuration":2281}`,
+		`data:{"body":"null","statusCodeValue":200,"statusCode":"OK"}`,
+	} {
+		if e := detectInStreamGatewayError(line); e != nil {
+			t.Errorf("normal frame wrongly flagged: %q -> %v", line, e)
+		}
+	}
+}
+
+// The bare success:false / msgCode:500 frame that follows event:error.
+func TestDetectInStreamGatewayErrorBareFailure(t *testing.T) {
+	line := `data:{"success":false,"traceId":"t","msgCode":500,"msgInfo":"Internal Server Error","message":"Internal Server Error"}`
+	e := detectInStreamGatewayError(line)
+	if e == nil {
+		t.Fatal("bare success:false frame must be detected")
+	}
+	if e.detail != "Internal Server Error" {
+		t.Errorf("detail = %q", e.detail)
+	}
+}
+
+// isErrorEvent / isFinishEvent classification.
+func TestErrorAndFinishEventClassification(t *testing.T) {
+	if !isErrorEvent("event:error") || !isErrorEvent("event: error ") {
+		t.Error("event:error must be classified as error event")
+	}
+	if isErrorEvent("event:finish") || isErrorEvent("data: error") {
+		t.Error("event:finish / data lines must not be error events")
+	}
+	if !isFinishEvent("event:finish") || isFinishEvent("event:error") {
+		t.Error("event:finish classification broken")
+	}
+}
+
+// trimJSONMessage extracts code+message from an escaped JSON body.
+func TestTrimJSONMessage(t *testing.T) {
+	got := trimJSONMessage(`{"code":"provider_error","message":"All backends failed","param":{"retries":2}}`)
+	if got != "provider_error: All backends failed" {
+		t.Errorf("got %q", got)
+	}
+	if got := trimJSONMessage("  plain text  "); got != "plain text" {
+		t.Errorf("plain text passthrough: %q", got)
+	}
+	if got := trimJSONMessage(""); got != "" {
+		t.Errorf("empty: %q", got)
+	}
+}
