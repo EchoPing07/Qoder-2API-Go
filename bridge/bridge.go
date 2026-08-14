@@ -99,7 +99,9 @@ type ChatRequestBody struct {
 	ParallelToolCalls json.RawMessage          `json:"parallel_tool_calls,omitempty"`
 }
 
-// newRequestBody creates a ChatRequestBody with defaults from baseprompt.json.
+// newRequestBody creates a ChatRequestBody with hardcoded defaults that
+// mirror the reference Qoder client's request template (the former
+// baseprompt.json, now inlined and always in sync with the struct).
 func newRequestBody() *ChatRequestBody {
 	return &ChatRequestBody{
 		Stream:   true,
@@ -168,11 +170,13 @@ type OpenAiBridge struct {
 	refreshToken  string
 	securityOauth string
 	expireTimeMs  int64
+	refreshedAtMs int64
 	bootstrapped  atomic.Bool
 
-	catalogMu sync.Mutex
-	catalog   *models.ModelCatalog
-	catalogTs float64
+	catalogMu    sync.Mutex
+	catalog      *models.ModelCatalog
+	catalogTs    float64
+	catalogInflt bool // single-flight: a fetch is already in progress
 }
 
 // NewOpenAiBridge creates a new bridge for the given PAT.
@@ -240,6 +244,10 @@ func (b *OpenAiBridge) applyJobToken(jt map[string]interface{}) {
 	b.refreshToken = refreshToken
 	b.securityOauth = securityOauth
 	b.expireTimeMs = toInt64(jt["expireTime"])
+	b.refreshedAtMs = time.Now().UnixMilli()
+	if b.expireTimeMs == 0 {
+		log.Printf("[bridge] WARN gateway did not report expireTime; assuming %s validity", unknownExpiryTTL)
+	}
 	b.mu.Unlock()
 }
 
@@ -258,11 +266,24 @@ func toInt64(v interface{}) int64 {
 	}
 }
 
+// unknownExpiryTTL bounds how long a session with a missing/invalid
+// expireTime is trusted. Without it, expireTimeMs == 0 makes needsRefresh
+// always true, degrading every request to a serialized renewal call.
+const unknownExpiryTTL = 30 * time.Minute
+
 func (b *OpenAiBridge) needsRefresh() bool {
 	nowMs := time.Now().UnixMilli()
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.sess == nil || b.expireTimeMs == 0 || nowMs > b.expireTimeMs-refreshMarginMs
+	if b.sess == nil {
+		return true
+	}
+	if b.expireTimeMs == 0 {
+		// No expiry reported: fall back to a time-since-renewal bound so we
+		// do not hit the token endpoint on every request.
+		return nowMs-b.refreshedAtMs > unknownExpiryTTL.Milliseconds()
+	}
+	return nowMs > b.expireTimeMs-refreshMarginMs
 }
 
 func (b *OpenAiBridge) currentSess() *auth.SessionContext {
@@ -273,6 +294,16 @@ func (b *OpenAiBridge) currentSess() *auth.SessionContext {
 		panic("session not bootstrapped")
 	}
 	return sess
+}
+
+// currentIdentity returns a snapshot of the identity taken under the lock.
+// applyJobToken swaps the pointer concurrently (e.g. a 401-triggered refresh
+// on another request), so an unlocked read is a data race.
+func (b *OpenAiBridge) currentIdentity() *auth.AuthIdentity {
+	b.mu.Lock()
+	id := b.identity
+	b.mu.Unlock()
+	return id
 }
 
 // doRenew renews the session token via refreshToken.
@@ -326,7 +357,7 @@ func (b *OpenAiBridge) forceRefresh(ctx context.Context) error {
 	return b.doRenew(ctx, true)
 }
 
-// GetCatalog returns the dynamic model catalog (TTL cached).
+// GetCatalog returns the dynamic model catalog (TTL cached, single-flight).
 func (b *OpenAiBridge) GetCatalog(ctx context.Context) *models.ModelCatalog {
 	now := float64(time.Now().Unix())
 	b.catalogMu.Lock()
@@ -335,7 +366,29 @@ func (b *OpenAiBridge) GetCatalog(ctx context.Context) *models.ModelCatalog {
 		b.catalogMu.Unlock()
 		return cached
 	}
+	// Single-flight: while one goroutine refetches, everyone else (including
+	// late arrivals) waits and then re-checks the cache instead of piling
+	// parallel model/list calls onto the gateway.
+	for b.catalogInflt {
+		b.catalogMu.Unlock()
+		// Cheap sleep-loop instead of sync.Cond: catalog fetches are rare
+		// (once per TTL) and short (seconds).
+		time.Sleep(50 * time.Millisecond)
+		b.catalogMu.Lock()
+		cached = b.catalog
+		now = float64(time.Now().Unix())
+		if cached != nil && now-b.catalogTs < catalogTTL {
+			b.catalogMu.Unlock()
+			return cached
+		}
+	}
+	b.catalogInflt = true
 	b.catalogMu.Unlock()
+	defer func() {
+		b.catalogMu.Lock()
+		b.catalogInflt = false
+		b.catalogMu.Unlock()
+	}()
 
 	var fetched *models.ModelCatalog
 	err := b.EnsureFreshSession(ctx)
@@ -396,14 +449,20 @@ func (b *OpenAiBridge) openStreamAsync(ctx context.Context, url string, jsonBody
 	return nil
 }
 
+// UsageSink receives the gateway usage frame of a completed request (may be
+// nil if the stream ended without one). Used for statistics aggregation.
+type UsageSink func(u *transform.Usage)
+
 // HandleChat processes a chat completion request.
 // For streaming, it writes SSE chunks to w and returns nil.
 // For non-streaming, it returns the response as a map.
-func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, reqBody map[string]interface{}) error {
+// usageSink (may be nil) receives upstream token accounting when available.
+func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, reqBody map[string]interface{}, usageSink UsageSink) error {
 	if err := b.EnsureFreshSession(ctx); err != nil {
 		return err
 	}
-	if b.identity == nil {
+	identity := b.currentIdentity()
+	if identity == nil {
 		return fmt.Errorf("session not bootstrapped")
 	}
 
@@ -423,7 +482,7 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	body.RequestSetID = uuid.New().String()
 	body.SessionID = uuid.New().String()
 	body.Stream = true
-	body.AliyunUserType = b.identity.UserType
+	body.AliyunUserType = identity.UserType
 	body.ModelConfig.Key = qoderModel
 	body.ModelConfig.IsReasoning = true
 	body.ChatContext.Extra.ModelConfig.Key = qoderModel
@@ -434,11 +493,7 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	prompt := transform.ExtractLatestUserPrompt(messages)
 	body.ChatContext.Text.Text = prompt
 	body.ChatContext.Extra.OriginalContent.Text = prompt
-	if len(prompt) > 30 {
-		body.Business.Name = prompt[:30]
-	} else {
-		body.Business.Name = prompt
-	}
+	body.Business.Name = truncateRunes(prompt, 30)
 
 	toolsEnabled := applyToolConfig(body, reqBody)
 	body.Messages = transform.BuildQoderMessages(messages, prompt, toolsEnabled)
@@ -494,9 +549,9 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	}
 
 	if stream {
-		return b.handleStream(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled)
+		return b.handleStream(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled, usageSink)
 	}
-	return b.handleSync(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled)
+	return b.handleSync(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled, usageSink)
 }
 
 // StreamReportedError wraps an upstream stream error that has already been
@@ -509,10 +564,12 @@ type StreamReportedError struct {
 func (e *StreamReportedError) Error() string { return e.Err.Error() }
 func (e *StreamReportedError) Unwrap() error { return e.Err }
 
-func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool) error {
+func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool, usageSink UsageSink) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
+
+	var usage *transform.Usage
 
 	acc := transform.NewStreamAccumulator(reqID, created, model, toolsEnabled, func(chunk string) {
 		w.Write([]byte(chunk))
@@ -526,6 +583,10 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 			return nil
 		}
 		delta := transform.ExtractDelta(strings.TrimSpace(line[5:]))
+		if delta.Usage != nil {
+			usage = delta.Usage
+			return nil
+		}
 		if !delta.IsEmpty() {
 			acc.Accept(delta)
 		}
@@ -551,6 +612,19 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 		w.Write([]byte("data: " + string(doneBytes) + "\n\n"))
 	}
 
+	// Emit the usage frame before [DONE] (OpenAI stream_options.include_usage
+	// convention: a terminal chunk with empty choices carrying usage).
+	if usage != nil {
+		usageChunk := transform.MakeChunk(reqID, created, model)
+		usageChunk["choices"] = []map[string]interface{}{}
+		usageChunk["usage"] = usage
+		usageBytes, _ := marshalNoEscape(usageChunk)
+		w.Write([]byte("data: " + string(usageBytes) + "\n\n"))
+		if usageSink != nil {
+			usageSink(usage)
+		}
+	}
+
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -561,16 +635,21 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 	return nil
 }
 
-func (b *OpenAiBridge) handleSync(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool) error {
+func (b *OpenAiBridge) handleSync(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool, usageSink UsageSink) error {
 	var fullContent []string
 	var fullReasoning []string
 	toolCalls := transform.NewToolCallAccumulator()
+	var usage *transform.Usage
 
 	err := b.openStreamAsync(ctx, url, jsonBody, extraHeaders, func(line string) error {
 		if !strings.HasPrefix(line, "data:") {
 			return nil
 		}
 		delta := transform.ExtractDelta(strings.TrimSpace(line[5:]))
+		if delta.Usage != nil {
+			usage = delta.Usage
+			return nil
+		}
 		if delta.ReasoningContent != "" {
 			fullReasoning = append(fullReasoning, delta.ReasoningContent)
 		}
@@ -636,6 +715,12 @@ func (b *OpenAiBridge) handleSync(ctx context.Context, w http.ResponseWriter, js
 			"completion_tokens": 0,
 			"total_tokens":      0,
 		},
+	}
+	if usage != nil {
+		resp["usage"] = usage
+		if usageSink != nil {
+			usageSink(usage)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -707,14 +792,24 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 
 		// Only authenticated requests with a valid body are counted.
 		model := statsModelLabel(reqBody, b, r.Context())
-		stream, _ := reqBody["stream"].(bool)
 		record := func(ok bool) {
 			if rec != nil {
-				rec.Record(model, ok, stream)
+				rec.Record(model, ok)
+			}
+		}
+		var usageSink UsageSink
+		if rec != nil {
+			usageSink = func(u *transform.Usage) {
+				rec.RecordUsage(&stats.Usage{
+					PromptTokens:     u.PromptTokens,
+					CompletionTokens: u.CompletionTokens,
+					CachedTokens:     u.CachedPromptTokens(),
+					Credits:          u.Credits,
+				})
 			}
 		}
 
-		err := b.HandleChat(r.Context(), w, reqBody)
+		err := b.HandleChat(r.Context(), w, reqBody, usageSink)
 		if err != nil {
 			// A client-initiated disconnect (or server shutdown) is not a
 			// request failure and must not skew the success rate.
@@ -781,9 +876,7 @@ func MakeModelsHandler(resolver BridgeResolver) http.HandlerFunc {
 // and an empty/invalid model falls back to the catalog default or "(default)".
 func statsModelLabel(reqBody map[string]interface{}, b *OpenAiBridge, ctx context.Context) string {
 	model, _ := reqBody["model"].(string)
-	if len(model) > 64 {
-		model = model[:64]
-	}
+	model = truncateRunes(model, 64)
 	if model == "" {
 		if b != nil {
 			if catalog := b.GetCatalog(ctx); catalog != nil {
@@ -873,4 +966,18 @@ func toolsCallsToMaps(calls []transform.NormalizedToolCall) []map[string]interfa
 
 func sortStrings(s []string) {
 	sort.Strings(s)
+}
+
+// truncateRunes caps s to at most n runes, never splitting a multi-byte
+// UTF-8 sequence (a byte slice like prompt[:30] can produce invalid UTF-8
+// for CJK input, which the gateway sees as U+FFFD replacement characters).
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }

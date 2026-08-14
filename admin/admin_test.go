@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"qoder2api/models"
 	"qoder2api/stats"
@@ -105,13 +106,17 @@ func TestPATSetAndGet(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
+	// The plaintext PAT must never appear in the response; only the masked form.
+	if strings.Contains(w.Body.String(), "pt-test123") {
+		t.Error("response must not leak the plaintext PAT")
+	}
 	var resp map[string]string
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["pat"] != "pt-test123" {
-		t.Errorf("expected 'pt-test123', got %q", resp["pat"])
+	if _, ok := resp["pat"]; ok {
+		t.Error("response must not contain a 'pat' field")
 	}
-	if resp["pat_masked"] == "" {
-		t.Error("expected non-empty pat_masked")
+	if resp["pat_masked"] != "pt-t****t123" {
+		t.Errorf("expected masked PAT, got %q", resp["pat_masked"])
 	}
 }
 
@@ -213,9 +218,9 @@ func TestStatsEndpoint(t *testing.T) {
 		return models.DefaultCatalog().Keys()
 	}
 	rec := stats.NewRecorder(nil)
-	rec.Record("Qwen3.7-Max", true, true)
-	rec.Record("Qwen3.7-Max", false, true)
-	rec.Record("DeepSeek-V4-Pro", true, false)
+	rec.Record("Qwen3.7-Max", true)
+	rec.Record("Qwen3.7-Max", false)
+	rec.Record("DeepSeek-V4-Pro", true)
 	a := New(s, mf, rec)
 
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
@@ -318,5 +323,60 @@ func TestAddKeyDuplicateReturns409(t *testing.T) {
 	w := doRequest(t, a.handleKeys, "POST", "/admin/api/keys", map[string]string{"key": "sk-dup", "note": "second"})
 	if w.Code != 409 {
 		t.Errorf("expected 409 for duplicate key, got %d", w.Code)
+	}
+}
+
+// --- Regression tests for review fixes ---
+
+// Sustained brute-force attempts must stay locked out: the old shift-based
+// backoff overflowed int64 nanoseconds after ~34 consecutive failures and
+// silently disabled the lockout entirely.
+func TestLoginLimiterStaysLockedAfterManyFailures(t *testing.T) {
+	l := newLoginLimiter()
+	for i := 0; i < 100; i++ {
+		l.fail("1.2.3.4")
+	}
+	if locked, _ := l.check("1.2.3.4"); !locked {
+		t.Fatal("attacker unlocked after 100 consecutive failures")
+	}
+	// And a capped wait is reported, not a bogus negative one.
+	_, retry := l.check("1.2.3.4")
+	if retry > 31*time.Second {
+		t.Errorf("retry hint exceeds cap: %v", retry)
+	}
+}
+
+// Changing the password must invalidate all pre-existing sessions.
+func TestPasswordChangeInvalidatesSessions(t *testing.T) {
+	a, s := newAdmin(t)
+	if err := s.SetPassword("oldpass"); err != nil {
+		t.Fatal(err)
+	}
+	token, err := a.createSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.isValidSession(token) {
+		t.Fatal("session should be valid before password change")
+	}
+	w := doRequest(t, a.handlePassword, "POST", "/admin/api/password",
+		map[string]string{"current_password": "oldpass", "new_password": "newpass"})
+	if w.Code != 200 {
+		t.Fatalf("password change failed: %d %s", w.Code, w.Body.String())
+	}
+	if a.isValidSession(token) {
+		t.Error("old session must be invalidated after password change")
+	}
+}
+
+func TestClientIPv6(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "[::1]:8080"
+	if got := clientIP(r); got != "::1" {
+		t.Errorf("clientIP([::1]:8080) = %q, want ::1", got)
+	}
+	r.RemoteAddr = "1.2.3.4:5678"
+	if got := clientIP(r); got != "1.2.3.4" {
+		t.Errorf("clientIP(1.2.3.4:5678) = %q, want 1.2.3.4", got)
 	}
 }

@@ -7,11 +7,12 @@
 ## 功能特性
 
 - **OpenAI API 兼容** —— 支持 `/v1/chat/completions` 和 `/v1/models` 端点，可无缝替换 OpenAI API
-- **流式响应** —— 支持 SSE 流式输出
+- **流式响应** —— 支持 SSE 流式输出，末尾附带 usage 帧（含输入 / 输出 / 缓存命中 / 思考 token 与实际扣费额度，遵循 `stream_options.include_usage` 终帧格式）
+- **真实用量统计** —— `/v1/chat/completions` 响应携带网关真实 token 用量：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`，以及 Qoder 扩展字段 `credits`（实际扣费额度）/ `original_credits`（折扣前额度）
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
-- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 按模型 / 近 24 小时趋势）
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / 实际扣费额度 / 按模型 / 近 24 小时趋势）
 - **单文件部署** —— 编译为单一二进制文件，零外部依赖
 
 ## 支持的模型
@@ -71,7 +72,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
 
-> 请求统计（`stats` 字段）随 data.json 持久化：服务每 30 秒批量写入一次，并在收到 `SIGINT`/`SIGTERM` 优雅关闭时执行最终落盘；仅统计通过密钥鉴权且请求体合法的调用，客户端主动断开不计入失败。
+> 请求统计（`stats` 字段）随 data.json 持久化：服务每 30 秒批量写入一次，并在收到 `SIGINT`/`SIGTERM` 优雅关闭时执行最终落盘；仅统计通过密钥鉴权且请求体合法的调用，客户端主动断开不计入失败。令牌用量（总输入 / 总输出 / 缓存命中 / 实际扣费额度）从网关 usage 帧自动累计，流中断无 usage 帧时仅计次不计量。
 
 ### 配置文件 (data.json)
 
@@ -137,7 +138,7 @@ curl http://localhost:10081/v1/models \
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
 | `/admin/api/pat` | GET/POST | PAT 令牌管理 |
 | `/admin/api/models` | GET | 获取模型列表 |
-| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势） |
+| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 扣费额度） |
 | `/admin/api/config` | GET/POST | 服务器配置 |
 | `/admin/api/password` | POST | 修改管理密码 |
 
@@ -147,7 +148,7 @@ curl http://localhost:10081/v1/models \
 
 本项目面向内网 / 个人使用，已内置以下加固措施，**部署到公网前请务必修改默认密码并使用 HTTPS 反代**：
 
-- **HTTP 超时**：`ReadHeaderTimeout=10s`、`IdleTimeout=120s`，抵御 slowloris 类慢速连接耗尽；`WriteTimeout` 不设以兼容长连接 SSE 流式响应。
+- **HTTP 超时**：`ReadHeaderTimeout=10s`、`IdleTimeout=120s`，抵御 slowloris 类慢速连接耗尽；`WriteTimeout` 不设以兼容长连接 SSE 流式响应，流内超过 5 分钟无数据（空闲）自动断开，防止网关连接卡死。
 - **请求体上限**：`/v1/chat/completions` 限制 10 MiB，管理 API 限制 64 KiB，防止超大 payload 耗尽内存。
 - **登录限流**：管理面板登录按客户端 IP 计数，失败后指数退避（1s → 30s 封顶），锁定期间返回 `429` + `Retry-After`。
 - **恒定时间比较**：API Key 校验与管理密码比对均使用 `crypto/subtle`，避免时序侧信道泄露。
@@ -160,14 +161,13 @@ curl http://localhost:10081/v1/models \
 
 ```
 Qoder-2API-Go/
-├── main.go              # 程序入口
+├── main.go              # 程序入口（请求模板内联在 bridge 包中）
 ├── auth/                # 认证模块
 ├── bridge/              # API 桥接模块
 ├── models/              # 模型管理
 ├── store/               # 数据持久化
 ├── transform/           # 数据转换
 ├── admin/               # Web 管理面板
-├── baseprompt.json      # Qoder 请求模板
 ├── Dockerfile           # Docker 构建文件
 ├── docker-compose.yaml  # Docker Compose 配置
 └── .github/workflows/   # GitHub Actions 自动构建

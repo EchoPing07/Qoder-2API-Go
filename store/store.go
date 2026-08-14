@@ -116,7 +116,25 @@ func (s *Store) saveLocked() error {
 		return err
 	}
 	tmp := s.filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// fsync before rename: without it a crash can leave a truncated or empty
+	// data.json on some filesystems (rename is not a barrier for unflushed
+	// file contents).
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, s.filePath)

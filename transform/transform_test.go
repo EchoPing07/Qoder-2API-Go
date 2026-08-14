@@ -112,6 +112,73 @@ func TestExtractDeltaCapturesReasoningContent(t *testing.T) {
 	}
 }
 
+// The gateway sends a final frame with empty choices + usage right before
+// [DONE]. ExtractDelta must surface it as a Usage-only delta.
+func TestExtractDeltaCapturesUsageFrame(t *testing.T) {
+	inner, _ := json.Marshal(map[string]interface{}{
+		"choices": []interface{}{},
+		"usage": map[string]interface{}{
+			"billable":                  true,
+			"prompt_tokens":             17,
+			"completion_tokens":         70,
+			"total_tokens":              87,
+			"credits":                   0.005279472,
+			"original_credits":          0.01319868,
+			"prompt_tokens_details":     map[string]interface{}{"cached_tokens": 3},
+			"completion_tokens_details": map[string]interface{}{"reasoning_tokens": 64},
+		},
+	})
+	wrapper := map[string]interface{}{"body": string(inner)}
+	line, _ := json.Marshal(wrapper)
+	delta := ExtractDelta(string(line))
+	if delta.Usage == nil {
+		t.Fatal("expected usage on final frame")
+	}
+	u := delta.Usage
+	if u.PromptTokens != 17 || u.CompletionTokens != 70 || u.TotalTokens != 87 {
+		t.Errorf("unexpected token counts: %+v", u)
+	}
+	if u.CachedPromptTokens() != 3 {
+		t.Errorf("expected 3 cached tokens, got %d", u.CachedPromptTokens())
+	}
+	if u.ReasoningTokens() != 64 {
+		t.Errorf("expected 64 reasoning tokens, got %d", u.ReasoningTokens())
+	}
+	if u.Credits < 0.005279 || u.Credits > 0.005280 {
+		t.Errorf("unexpected credits: %v", u.Credits)
+	}
+	if delta.Role != "" || delta.Content != "" {
+		t.Errorf("usage frame must not carry content: %+v", delta)
+	}
+	if delta.IsEmpty() {
+		t.Error("usage delta should not be empty")
+	}
+}
+
+// [DONE] and frames without usage must not produce a Usage delta.
+func TestExtractDeltaDoneAndPlainFrames(t *testing.T) {
+	wrapper := map[string]interface{}{"body": "[DONE]"}
+	line, _ := json.Marshal(wrapper)
+	if d := ExtractDelta(string(line)); d.Usage != nil {
+		t.Error("[DONE] must not yield usage")
+	}
+
+	inner, _ := json.Marshal(map[string]interface{}{
+		"choices": []map[string]interface{}{
+			{"delta": map[string]interface{}{"content": "hi"}, "finish_reason": nil},
+		},
+	})
+	wrapper = map[string]interface{}{"body": string(inner)}
+	line, _ = json.Marshal(wrapper)
+	d := ExtractDelta(string(line))
+	if d.Usage != nil {
+		t.Error("content frame must not yield usage")
+	}
+	if d.Content != "hi" {
+		t.Errorf("expected content 'hi', got %q", d.Content)
+	}
+}
+
 func TestStreamAccumulatorForwardsReasoningAndNonReasoningDeltas(t *testing.T) {
 	acc := NewStreamAccumulator("r1", 0, "m", false, nil)
 	acc.Accept(&BridgeDelta{Content: "hello"})
@@ -280,4 +347,115 @@ func TestToolCallAccumulatorRejectsBadIndex(t *testing.T) {
 func withIndex(m map[string]interface{}, idx int) map[string]interface{} {
 	m["index"] = float64(idx)
 	return m
+}
+
+// --- Regression tests for review fixes ---
+
+// Deltas without an index (or with malformed ones) must not grow the
+// accumulator beyond maxToolCalls: the fallback i = len(calls) used to
+// bypass the cap entirely.
+func TestToolCallAccumulatorCapNotBypassedByMissingIndex(t *testing.T) {
+	a := NewToolCallAccumulator()
+	fn := func() map[string]interface{} {
+		return map[string]interface{}{
+			"function": map[string]interface{}{"name": "x", "arguments": "{}"},
+			"type":     "function",
+			// no "index" key at all
+		}
+	}
+	for i := 0; i < maxToolCalls+100; i++ {
+		a.Append([]map[string]interface{}{fn()})
+	}
+	if got := len(a.Snapshot()); got != maxToolCalls {
+		t.Errorf("cap bypassed: got %d calls, want exactly %d", got, maxToolCalls)
+	}
+}
+
+// An upstream float64 index must be preserved in the emitted chunk so
+// clients can reassemble parallel tool calls correctly.
+func TestWithToolCallIndicesPreservesUpstreamIndex(t *testing.T) {
+	delta := []map[string]interface{}{
+		{"id": "call_2", "type": "function", "index": float64(2),
+			"function": map[string]interface{}{"name": "f", "arguments": ""}},
+	}
+	out := withToolCallIndices(delta)
+	if got, _ := out[0]["index"].(float64); got != 2 {
+		t.Errorf("upstream index clobbered: got %v, want 2", out[0]["index"])
+	}
+	// Missing index still gets a sequential one.
+	out = withToolCallIndices([]map[string]interface{}{{"id": "a"}})
+	if got, _ := out[0]["index"].(float64); got != 0 {
+		t.Errorf("expected sequential index 0, got %v", out[0]["index"])
+	}
+}
+
+// A frame carrying both choices (content) and usage is a content frame:
+// the usage check must not swallow its text.
+func TestExtractDeltaContentFrameWithUsageIsNotSwallowed(t *testing.T) {
+	inner, _ := json.Marshal(map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"index":         float64(0),
+				"delta":         map[string]interface{}{"content": "hello"},
+				"finish_reason": nil,
+			},
+		},
+		"usage": map[string]interface{}{"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+	})
+	wrapper, _ := json.Marshal(map[string]interface{}{"body": string(inner)})
+	delta := ExtractDelta(string(wrapper))
+	if delta.Usage != nil {
+		t.Error("content frame must not be classified as a usage frame")
+	}
+	if delta.Content != "hello" {
+		t.Errorf("content swallowed: %+v", delta)
+	}
+}
+
+// Upstream finish_reason (e.g. "length") must flow through to the client.
+func TestExtractDeltaCapturesFinishReason(t *testing.T) {
+	inner, _ := json.Marshal(map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"index":         float64(0),
+				"delta":         map[string]interface{}{},
+				"finish_reason": "length",
+			},
+		},
+	})
+	wrapper, _ := json.Marshal(map[string]interface{}{"body": string(inner)})
+	delta := ExtractDelta(string(wrapper))
+	if delta.FinishReason != "length" {
+		t.Errorf("expected finish_reason=length, got %q", delta.FinishReason)
+	}
+	if delta.IsEmpty() {
+		t.Error("finish_reason-only delta must not be empty")
+	}
+}
+
+func TestStreamAccumulatorUpstreamFinishReason(t *testing.T) {
+	var out []string
+	acc := NewStreamAccumulator("r", 1, "m", false, func(c string) { out = append(out, c) })
+	acc.Accept(&BridgeDelta{Content: "hi"})
+	acc.Accept(&BridgeDelta{FinishReason: "length"})
+	acc.Flush()
+	if got := acc.FinishReason(); got != "length" {
+		t.Errorf("expected upstream finish_reason=length to win, got %q", got)
+	}
+}
+
+// Images carried in the Qoder-style "contents" array must be extracted just
+// like "content" ones (the text fallback path already reads "contents").
+func TestExtractMessageImagesFallsBackToContents(t *testing.T) {
+	msg := map[string]interface{}{
+		"role": "user",
+		"contents": []interface{}{
+			map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "https://x/1.png"}},
+			map[string]interface{}{"type": "text", "text": "hi"},
+		},
+	}
+	urls := ExtractMessageImages(msg)
+	if len(urls) != 1 || urls[0] != "https://x/1.png" {
+		t.Errorf("expected contents image fallback, got %v", urls)
+	}
 }

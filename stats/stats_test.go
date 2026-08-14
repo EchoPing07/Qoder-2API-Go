@@ -9,10 +9,10 @@ import (
 
 func TestRecordAndReport(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("Qwen3.7-Max", true, true)
-	r.Record("Qwen3.7-Max", true, true)
-	r.Record("Qwen3.7-Max", false, true)
-	r.Record("DeepSeek-V4-Pro", true, false)
+	r.Record("Qwen3.7-Max", true)
+	r.Record("Qwen3.7-Max", true)
+	r.Record("Qwen3.7-Max", false)
+	r.Record("DeepSeek-V4-Pro", true)
 
 	rep := r.Report()
 	if rep.Total != 4 {
@@ -23,12 +23,6 @@ func TestRecordAndReport(t *testing.T) {
 	}
 	if rep.Failed != 1 {
 		t.Errorf("expected failed 1, got %d", rep.Failed)
-	}
-	if rep.Streams != 3 {
-		t.Errorf("expected streams 3, got %d", rep.Streams)
-	}
-	if rep.Syncs != 1 {
-		t.Errorf("expected syncs 1, got %d", rep.Syncs)
 	}
 	if rep.SuccessRate != 0.75 {
 		t.Errorf("expected rate 0.75, got %f", rep.SuccessRate)
@@ -65,7 +59,7 @@ func TestFlushPersists(t *testing.T) {
 		},
 	}
 	r := NewRecorder(p)
-	r.Record("GLM-5.2", false, true)
+	r.Record("GLM-5.2", false)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
@@ -107,7 +101,7 @@ func TestPruneRemovesOldBuckets(t *testing.T) {
 	r := NewRecorder(nil)
 	r.data.Hourly["2020-01-01T00"] = &HourStat{Hour: "2020-01-01T00", Total: 1}
 	r.data.Hourly[time.Now().Format(HourKeyFormat)] = &HourStat{Hour: "now", Total: 2}
-	r.Record("Kimi-K2.7-Code", true, true)
+	r.Record("Kimi-K2.7-Code", true)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
@@ -125,9 +119,40 @@ func TestPruneRemovesOldBuckets(t *testing.T) {
 
 func TestNilPersisterSafe(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("x", true, false)
+	r.Record("x", true)
 	if err := r.Flush(); err != nil {
 		t.Errorf("Flush with nil persister should not fail, got %v", err)
+	}
+}
+
+func TestRecordUsageAggregates(t *testing.T) {
+	r := NewRecorder(nil)
+	r.RecordUsage(&Usage{PromptTokens: 17, CompletionTokens: 70, CachedTokens: 3, Credits: 0.005279472})
+	r.RecordUsage(&Usage{PromptTokens: 14, CompletionTokens: 341, CachedTokens: 0, Credits: 0.02449533})
+	r.RecordUsage(nil) // no-op guard
+
+	rep := r.Report()
+	if rep.PromptTokens != 31 {
+		t.Errorf("expected 31 prompt tokens, got %d", rep.PromptTokens)
+	}
+	if rep.CompletionTokens != 411 {
+		t.Errorf("expected 411 completion tokens, got %d", rep.CompletionTokens)
+	}
+	if rep.CachedTokens != 3 {
+		t.Errorf("expected 3 cached tokens, got %d", rep.CachedTokens)
+	}
+	want := 0.005279472 + 0.02449533
+	if rep.Credits < want-1e-9 || rep.Credits > want+1e-9 {
+		t.Errorf("expected credits %v, got %v", want, rep.Credits)
+	}
+
+	// Usage must persist through Flush like the counters do, and restored
+	// data carries prior usage forward.
+	r2 := NewRecorder(nil)
+	r2.data.PromptTokens = 5 // restored data carries prior usage
+	r2.RecordUsage(&Usage{PromptTokens: 1, CompletionTokens: 2, CachedTokens: 0, Credits: 0.5})
+	if r2.Report().PromptTokens != 6 {
+		t.Errorf("expected restored+new prompt tokens 6, got %d", r2.Report().PromptTokens)
 	}
 }
 
@@ -142,12 +167,12 @@ func TestFlushPersistsSnapshotCopy(t *testing.T) {
 		},
 	}
 	r := NewRecorder(p)
-	r.Record("A", true, true)
+	r.Record("A", true)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
-	r.Record("A", true, true)
-	r.Record("B", false, true)
+	r.Record("A", true)
+	r.Record("B", false)
 	if saved.Total != 1 {
 		t.Errorf("saved snapshot mutated by later records: total=%d", saved.Total)
 	}
@@ -167,7 +192,7 @@ func TestRestoreIsCloned(t *testing.T) {
 	orig.ByModel["M"] = &ModelStat{Model: "M", Total: 3}
 	p := &fakePersister{loadFn: func() *Data { return orig }}
 	r := NewRecorder(p)
-	r.Record("M", true, true)
+	r.Record("M", true)
 	if orig.Total != 3 {
 		t.Errorf("recorder mutated persisted data: total=%d", orig.Total)
 	}
@@ -187,7 +212,7 @@ func TestConcurrentRecordFlushReport(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				r.Record("Model-"+strconv.Itoa(g), i%3 != 0, true)
+				r.Record("Model-"+strconv.Itoa(g), i%3 != 0)
 			}
 		}(g)
 	}

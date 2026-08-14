@@ -2,11 +2,20 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
+	"qoder2api/auth"
 	"qoder2api/stats"
+	"qoder2api/transform"
 )
 
 func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
@@ -155,5 +164,220 @@ func TestNewRequestBody(t *testing.T) {
 	}
 	if body.Version != "3" {
 		t.Error("Version should be 3")
+	}
+}
+
+// --- Regression tests for review fixes ---
+
+func TestTruncateRunesNeverSplitsUTF8(t *testing.T) {
+	cases := []struct{ in string; n int; want string }{
+		{"你好世界", 3, "你好世"},
+		{"你好世界", 10, "你好世界"},
+		{"abc", 0, ""},
+		{"", 5, ""},
+		{"a你b", 2, "a你"},
+	}
+	for _, c := range cases {
+		if got := truncateRunes(c.in, c.n); got != c.want {
+			t.Errorf("truncateRunes(%q,%d)=%q want %q", c.in, c.n, got, c.want)
+		}
+	}
+	// The result must always be valid UTF-8.
+	for _, in := range []string{"你好世界abcdefg", "日本語テキスト"} {
+		got := truncateRunes(in, 4)
+		if !utf8.ValidString(got) {
+			t.Errorf("truncateRunes(%q,4) produced invalid UTF-8: %q", in, got)
+		}
+	}
+}
+
+// expireTimeMs == 0 (gateway did not report an expiry) must not force a
+// renewal network call on every request: after applyJobToken the bridge
+// trusts the session for unknownExpiryTTL.
+func TestNeedsRefreshWithUnknownExpiry(t *testing.T) {
+	b := NewOpenAiBridge("pat", nil)
+	if !b.needsRefresh() {
+		t.Fatal("fresh bridge must need refresh (no session)")
+	}
+	b.applyJobToken(map[string]interface{}{
+		"name": "u", "id": "1", "userType": "personal_standard",
+		"refreshToken": "r", "securityOauthToken": "s",
+		"expireTime": nil, // missing expiry
+	})
+	if b.needsRefresh() {
+		t.Error("missing expireTime must fall back to TTL-based freshness, not always-refresh")
+	}
+	b.mu.Lock()
+	b.refreshedAtMs -= (unknownExpiryTTL + time.Minute).Milliseconds()
+	b.mu.Unlock()
+	if !b.needsRefresh() {
+		t.Error("stale unknown-expiry session must need refresh")
+	}
+}
+
+// currentIdentity must return the post-refresh identity snapshot taken
+// under the lock (unlocked b.identity reads were a data race).
+func TestCurrentIdentitySnapshot(t *testing.T) {
+	b := NewOpenAiBridge("pat", nil)
+	if b.currentIdentity() != nil {
+		t.Fatal("expected nil identity before bootstrap")
+	}
+	b.applyJobToken(map[string]interface{}{"name": "u", "id": "1", "expireTime": float64(1e15)})
+	id := b.currentIdentity()
+	if id == nil || id.Name != "u" {
+		t.Fatalf("expected identity snapshot, got %+v", id)
+	}
+}
+
+// --- SSE end-to-end: fake gateway wired through RegionConfig ---
+
+// fakeGateway serves the auth + chat endpoints with canned SSE frames
+// (frames are pre-encoded: {"body": "<json string>"}, matching the real
+// gateway's Encode=1 wire format which OpenStreamLines decodes upstream —
+// here the chat path is driven through OpenAiBridge.HandleChat with a
+// region pointing at this test server).
+type fakeGateway struct {
+	chatLines []string // raw SSE lines ("data: {...}")
+}
+
+func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+	})
+	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for _, l := range gw.chatLines {
+			fmt.Fprintf(w, "%s\n\n", l)
+			flusher.Flush()
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL}
+	return NewOpenAiBridge("pt-test", region)
+}
+
+func sseFrame(t *testing.T, inner map[string]interface{}) string {
+	t.Helper()
+	b, _ := json.Marshal(inner)
+	line, _ := json.Marshal(map[string]interface{}{"body": string(b)})
+	return "data: " + string(line)
+}
+
+// Streaming path: content deltas flow as OpenAI chunks; usage frame is
+// emitted before [DONE]; tool calls keep upstream indices.
+func TestHandleStreamEndToEnd(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"role": "assistant"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "Hel"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "lo"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"tool_calls": []interface{}{map[string]interface{}{"index": float64(7), "function": map[string]interface{}{"name": "f", "arguments": "{}"}}}}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "credits": 0.1}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+
+	var usageSeen *stats.Usage
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model": "Fake-Model",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "hi"},
+		},
+		"stream": true,
+	}, func(u *transform.Usage) { usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, Credits: u.Credits} })
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"Hel", "lo", "f", "\"index\":7"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stream body missing %q\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, "\"prompt_tokens\":3") {
+		t.Errorf("usage frame missing from stream:\n%s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Error("stream must end with [DONE]")
+	}
+	if !strings.Contains(body, "\"finish_reason\":\"tool_calls\"") {
+		t.Error("tool call stream must finish with tool_calls")
+	}
+	if usageSeen == nil || usageSeen.PromptTokens != 3 {
+		t.Errorf("usage sink not invoked correctly: %+v", usageSeen)
+	}
+}
+
+// Non-streaming path: content + tool calls + usage are assembled into a
+// single chat.completion response.
+func TestHandleSyncEndToEnd(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"reasoning_content": "thinking"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "answer"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "credits": 0.2}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model":   "Fake-Model",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "q"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"content":"answer"`, `"reasoning_content":"thinking"`, `"total_tokens":14`, `"finish_reason":"stop"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sync body missing %s\n%s", want, body)
+		}
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+}
+
+// An upstream error mid-stream (after content) is delivered as an SSE error
+// chunk and reported as StreamReportedError, so the outer handler does not
+// write a second error response.
+func TestHandleStreamUpstreamErrorAfterContent(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "partial"}}}}),
+	}}
+	b := newFakeBridge(t, gw)
+
+	w := httptest.NewRecorder()
+	err := b.HandleChat(context.Background(), w, map[string]interface{}{
+		"model":    "Fake-Model",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error from truncated stream")
+	}
+	var repErr *StreamReportedError
+	if !errors.As(err, &repErr) {
+		t.Fatalf("expected StreamReportedError, got %T: %v", err, err)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "partial") {
+		t.Error("delivered content must remain in the stream")
+	}
+	if !strings.Contains(body, "error") {
+		t.Error("error chunk must be present")
+	}
+	if strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Error("failed stream must not terminate with [DONE]")
 	}
 }

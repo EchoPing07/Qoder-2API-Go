@@ -187,7 +187,7 @@ func TestStatsPersistence(t *testing.T) {
 	if s1.LoadStats() != nil {
 		t.Error("expected nil stats on fresh store")
 	}
-	d := &stats.Data{Total: 5, Success: 4, Failed: 1, Streams: 3, Syncs: 2}
+	d := &stats.Data{Total: 5, Success: 4, Failed: 1}
 	d.ByModel = map[string]*stats.ModelStat{
 		"Qwen3.7-Max": {Model: "Qwen3.7-Max", Total: 5, Success: 4, Failed: 1},
 	}
@@ -203,7 +203,7 @@ func TestStatsPersistence(t *testing.T) {
 	if got == nil {
 		t.Fatal("expected restored stats")
 	}
-	if got.Total != 5 || got.Success != 4 || got.Failed != 1 || got.Streams != 3 || got.Syncs != 2 {
+	if got.Total != 5 || got.Success != 4 || got.Failed != 1 {
 		t.Errorf("unexpected restored totals: %+v", got)
 	}
 	m, ok := got.ByModel["Qwen3.7-Max"]
@@ -261,5 +261,26 @@ func TestAddKeyDuplicate(t *testing.T) {
 	}
 	if len(s.ListKeys()) != 1 {
 		t.Errorf("expected 1 key after duplicate rejection, got %d", len(s.ListKeys()))
+	}
+}
+
+// Saves must go through the fsync'd tmp+rename path: no .tmp leftovers and
+// no partial files.
+func TestSaveLeavesNoTmpFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	s, _ := New(path)
+	if _, err := s.AddKey("sk-x", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("tmp file leaked: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "sk-x") {
+		t.Error("persisted file missing key")
 	}
 }

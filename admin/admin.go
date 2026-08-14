@@ -9,10 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -174,7 +174,15 @@ func (l *loginLimiter) fail(ip string) {
 	}
 	st.failures++
 	st.lastFail = time.Now()
-	backoff := time.Duration(1<<uint(st.failures-1)) * time.Second
+	// Compute the backoff in plain integers and clamp before converting to
+	// time.Duration: 1<<63 seconds overflows int64 nanoseconds and yields a
+	// negative duration, which would silently disable the lockout after
+	// enough consecutive failures.
+	shift := st.failures - 1
+	if shift > 5 { // 1<<5 s == 32s > loginMaxBackoff
+		shift = 5
+	}
+	backoff := time.Second << uint(shift)
 	if backoff > loginMaxBackoff {
 		backoff = loginMaxBackoff
 	}
@@ -212,8 +220,9 @@ func passwordsEqual(a, b string) bool {
 
 func clientIP(r *http.Request) string {
 	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
+	// Trim the port, handling both "1.2.3.4:5678" and "[::1]:5678".
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return host
 }
@@ -331,6 +340,10 @@ func (a *Admin) handlePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 400, "请求格式错误")
 		return
 	}
+	if os.Getenv("QODER_ADMIN_PASSWORD") != "" {
+		writeJSONError(w, 400, "密码由环境变量 QODER_ADMIN_PASSWORD 管理，无法在面板中修改")
+		return
+	}
 	if !passwordsEqual(body.CurrentPassword, a.getPassword()) {
 		writeJSONError(w, 401, "当前密码错误")
 		return
@@ -343,6 +356,11 @@ func (a *Admin) handlePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 500, err.Error())
 		return
 	}
+	// Invalidate every existing session so a (possibly stolen) cookie from
+	// before the password change cannot be replayed.
+	a.sessionMu.Lock()
+	a.sessions = make(map[string]time.Time)
+	a.sessionMu.Unlock()
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -447,9 +465,10 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		pat := a.store.GetPAT()
-		masked := maskPAT(pat)
-		writeJSON(w, 200, map[string]string{"pat": pat, "pat_masked": masked})
+		// Only the masked form is exposed; the plaintext PAT never leaves
+		// the server. The UI edits it as a whole new value, never in place.
+		masked := maskPAT(a.store.GetPAT())
+		writeJSON(w, 200, map[string]string{"pat_masked": masked})
 	case http.MethodPost:
 		var body struct {
 			PAT string `json:"pat"`

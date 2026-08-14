@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -553,6 +554,12 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 // StreamCallback is called for each non-empty SSE line.
 type StreamCallback func(line string) error
 
+// idleStreamTimeout bounds how long the SSE stream may stay silent (no bytes
+// received) before we give up. Without it a wedged gateway connection (TCP
+// alive, no data) pins a goroutine + connection forever, and the server
+// intentionally sets no WriteTimeout for SSE.
+const idleStreamTimeout = 5 * time.Minute
+
 // OpenStreamLines sends a POST and reads SSE response line by line.
 func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, jsonBody []byte, extraHeaders map[string]string, callback StreamCallback) error {
 	pathSig := sigPath(fullURL)
@@ -587,12 +594,43 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(errBody))
 	}
 
+	// Reset an idle deadline on every received line: long generations are
+	// fine (lines keep arriving), only a silent connection is cut off.
+	idleTimer := time.NewTimer(idleStreamTimeout)
+	defer idleTimer.Stop()
+	idleErr := fmt.Errorf("stream idle for over %s", idleStreamTimeout)
+
+	// The gateway always terminates its stream with a [DONE] marker. An EOF
+	// before it means the connection was cut mid-response; treating that as
+	// success would silently truncate the answer and still emit our own
+	// [DONE] to the client.
+	sawDone := false
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-idleTimer.C:
+			// Cancel the body read; scanner.Scan() then returns with an error.
+			if c, ok := resp.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
+				c.SetReadDeadline(time.Now())
+			} else {
+				// Best effort for bodies without deadline support.
+				resp.Body.Close()
+			}
+		case <-done:
+		}
+	}()
 	for scanner.Scan() {
 		line := scanner.Text()
+		idleTimer.Reset(idleStreamTimeout)
 		if line == "" {
 			continue
+		}
+		if strings.HasPrefix(line, "data:") && strings.TrimSpace(line[5:]) == "[DONE]" {
+			sawDone = true
 		}
 		isAuthErr, detail := detectInStreamAuthError(line)
 		if isAuthErr {
@@ -606,7 +644,13 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return idleErr
+		}
 		return err
+	}
+	if !sawDone {
+		return fmt.Errorf("stream ended without [DONE] marker (connection truncated?)")
 	}
 	return nil
 }

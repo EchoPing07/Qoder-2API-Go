@@ -32,13 +32,16 @@ type HourStat struct {
 
 // Data is the persisted stats snapshot.
 type Data struct {
-	Total   int64                 `json:"total"`
-	Success int64                 `json:"success"`
-	Failed  int64                 `json:"failed"`
-	Streams int64                 `json:"streams"`
-	Syncs   int64                 `json:"syncs"`
-	ByModel map[string]*ModelStat `json:"by_model,omitempty"`
-	Hourly  map[string]*HourStat  `json:"hourly,omitempty"`
+	Total   int64 `json:"total"`
+	Success int64 `json:"success"`
+	Failed  int64 `json:"failed"`
+	// Token / billing totals aggregated from the gateway usage frames.
+	PromptTokens     int64                 `json:"prompt_tokens"`
+	CompletionTokens int64                 `json:"completion_tokens"`
+	CachedTokens     int64                 `json:"cached_tokens"`
+	Credits          float64               `json:"credits"`
+	ByModel          map[string]*ModelStat `json:"by_model,omitempty"`
+	Hourly           map[string]*HourStat  `json:"hourly,omitempty"`
 }
 
 // ModelRow is a per-model report row served to the admin UI.
@@ -61,14 +64,17 @@ type HourRow struct {
 
 // Report is the aggregated snapshot served to the admin UI.
 type Report struct {
-	Total       int64      `json:"total"`
-	Success     int64      `json:"success"`
-	Failed      int64      `json:"failed"`
-	Streams     int64      `json:"streams"`
-	Syncs       int64      `json:"syncs"`
-	SuccessRate float64    `json:"success_rate"`
-	ByModel     []ModelRow `json:"by_model"`
-	Hourly      []HourRow  `json:"hourly"`
+	Total       int64   `json:"total"`
+	Success     int64   `json:"success"`
+	Failed      int64   `json:"failed"`
+	SuccessRate float64 `json:"success_rate"`
+	// Token / billing totals.
+	PromptTokens     int64      `json:"prompt_tokens"`
+	CompletionTokens int64      `json:"completion_tokens"`
+	CachedTokens     int64      `json:"cached_tokens"`
+	Credits          float64    `json:"credits"`
+	ByModel          []ModelRow `json:"by_model"`
+	Hourly           []HourRow  `json:"hourly"`
 }
 
 // Persister persists the stats data (implemented by store.Store).
@@ -123,13 +129,15 @@ func normalize(d *Data) *Data {
 // when the copy is needed for concurrent use.
 func (d *Data) Clone() *Data {
 	cp := &Data{
-		Total:   d.Total,
-		Success: d.Success,
-		Failed:  d.Failed,
-		Streams: d.Streams,
-		Syncs:   d.Syncs,
-		ByModel: make(map[string]*ModelStat, len(d.ByModel)),
-		Hourly:  make(map[string]*HourStat, len(d.Hourly)),
+		Total:            d.Total,
+		Success:          d.Success,
+		Failed:           d.Failed,
+		PromptTokens:     d.PromptTokens,
+		CompletionTokens: d.CompletionTokens,
+		CachedTokens:     d.CachedTokens,
+		Credits:          d.Credits,
+		ByModel:          make(map[string]*ModelStat, len(d.ByModel)),
+		Hourly:           make(map[string]*HourStat, len(d.Hourly)),
 	}
 	for k, v := range d.ByModel {
 		cp.ByModel[k] = &ModelStat{Model: v.Model, Total: v.Total, Success: v.Success, Failed: v.Failed}
@@ -141,7 +149,7 @@ func (d *Data) Clone() *Data {
 }
 
 // Record counts one completed request.
-func (r *Recorder) Record(model string, ok, stream bool) {
+func (r *Recorder) Record(model string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -151,11 +159,6 @@ func (r *Recorder) Record(model string, ok, stream bool) {
 		r.data.Success++
 	} else {
 		r.data.Failed++
-	}
-	if stream {
-		r.data.Streams++
-	} else {
-		r.data.Syncs++
 	}
 
 	m := r.data.ByModel[model]
@@ -182,6 +185,31 @@ func (r *Recorder) Record(model string, ok, stream bool) {
 	} else {
 		h.Failed++
 	}
+}
+
+// RecordUsage adds token/billing totals extracted from a gateway usage frame.
+// Called once per successful request when the upstream supplies usage data;
+// missing frames (error-interrupted streams) simply skip this call.
+func (r *Recorder) RecordUsage(u *Usage) {
+	if u == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dirty = true
+	r.data.PromptTokens += int64(u.PromptTokens)
+	r.data.CompletionTokens += int64(u.CompletionTokens)
+	r.data.CachedTokens += int64(u.CachedTokens)
+	r.data.Credits += u.Credits
+}
+
+// Usage is the token accounting payload produced by transform.Usage.
+// Declared locally to avoid an import cycle (transform is a lower layer).
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	CachedTokens     int
+	Credits          float64
 }
 
 // Flush persists pending data if anything changed since the last flush.
@@ -228,13 +256,15 @@ func (r *Recorder) Report() *Report {
 	defer r.mu.Unlock()
 
 	rep := &Report{
-		Total:   r.data.Total,
-		Success: r.data.Success,
-		Failed:  r.data.Failed,
-		Streams: r.data.Streams,
-		Syncs:   r.data.Syncs,
-		ByModel: []ModelRow{},
-		Hourly:  []HourRow{},
+		Total:            r.data.Total,
+		Success:          r.data.Success,
+		Failed:           r.data.Failed,
+		PromptTokens:     r.data.PromptTokens,
+		CompletionTokens: r.data.CompletionTokens,
+		CachedTokens:     r.data.CachedTokens,
+		Credits:          r.data.Credits,
+		ByModel:          []ModelRow{},
+		Hourly:           []HourRow{},
 	}
 	if r.data.Total > 0 {
 		rep.SuccessRate = float64(r.data.Success) / float64(r.data.Total)

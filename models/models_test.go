@@ -83,3 +83,31 @@ func TestDefaultCatalogVisionModels(t *testing.T) {
 		t.Error("Qwen3.7-Plus should support vision")
 	}
 }
+
+// --- Regression tests for review fixes ---
+
+// When the preferred default key is absent from a dynamic catalog, the
+// fallback must prefer cheap tiers over flagship models (dictionary order
+// used to pick whatever came first, potentially the most expensive model).
+func TestFallbackDefaultPrefersCheapTier(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "k1", "display_name": "Zeta-Max-Ultra", "enable": true},
+			map[string]interface{}{"key": "k2", "display_name": "Alpha-Flash", "enable": true},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat.DefaultName != "Alpha-Flash" {
+		t.Errorf("expected cheap-tier Alpha-Flash as default, got %q", cat.DefaultName)
+	}
+	// Cost preference is tier first, then name for determinism.
+	raw2 := map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "k1", "display_name": "B-Lite"},
+			map[string]interface{}{"key": "k2", "display_name": "A-Lite"},
+		},
+	}
+	if got := ExtractCatalog(raw2).DefaultName; got != "A-Lite" {
+		t.Errorf("expected deterministic A-Lite, got %q", got)
+	}
+}

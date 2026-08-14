@@ -8,3 +8,8 @@ data.json
 # OS files
 .DS_Store
 Thumbs.db
+probe/
+
+# Editor local config
+.obsidian/
+.vscode/

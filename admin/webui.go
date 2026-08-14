@@ -717,6 +717,10 @@ input[readonly] {
 .mobile-nav .nav-item { flex: 0 0 auto; justify-content: center; padding: 8px 14px; }
 .mobile-nav .nav-item span.mnav-label { font-size: 12.5px; }
 
+@media (max-width: 1180px) {
+  .stat-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
 @media (max-width: 900px) {
   .shell { flex-direction: column; }
   .sidebar { display: none; }
@@ -823,22 +827,22 @@ input[readonly] {
         <div class="stat-card">
           <div class="stat-label"><span class="stat-dot total"></span>总请求</div>
           <div class="stat-value num" id="statTotal">0</div>
-          <div class="stat-sub num" id="statStreams">流式 0 · 同步 0</div>
+          <div class="stat-sub num" id="statReqSub">成功率 —</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label"><span class="stat-dot success"></span>成功</div>
-          <div class="stat-value num" id="statSuccess">0</div>
-          <div class="stat-sub">已完成请求</div>
+          <div class="stat-label"><span class="stat-dot success"></span>Token 总数</div>
+          <div class="stat-value num" id="statTokens">0</div>
+          <div class="stat-sub num" id="statCredits">Credits 消耗 0</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label"><span class="stat-dot failed"></span>失败</div>
-          <div class="stat-value num" id="statFailed">0</div>
-          <div class="stat-sub">请求错误</div>
+          <div class="stat-label"><span class="stat-dot rate"></span>总输入</div>
+          <div class="stat-value num" id="statPrompt">0</div>
+          <div class="stat-sub num" id="statCached">缓存命中 0</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label"><span class="stat-dot rate"></span>成功率</div>
-          <div class="stat-value num" id="statRate">—</div>
-          <div class="stat-sub">成功 / 总请求</div>
+          <div class="stat-label"><span class="stat-dot total"></span>总输出</div>
+          <div class="stat-value num" id="statCompletion">0</div>
+          <div class="stat-sub num" id="statAvgOut">平均 0 / 次</div>
         </div>
       </div>
 
@@ -1164,14 +1168,26 @@ applyTheme(themeDark());
 
 function loadStats() {
   api('/stats').then(function(d) {
+    var tokens = (d.prompt_tokens || 0) + (d.completion_tokens || 0);
     document.getElementById('statTotal').textContent = fmt(d.total);
-    document.getElementById('statSuccess').textContent = fmt(d.success);
-    document.getElementById('statFailed').textContent = fmt(d.failed);
-    document.getElementById('statRate').textContent = pct(d.success_rate);
-    document.getElementById('statStreams').textContent = '流式 ' + fmt(d.streams) + ' · 同步 ' + fmt(d.syncs);
+    document.getElementById('statReqSub').textContent = '成功率 ' + pct(d.success_rate);
+    document.getElementById('statTokens').textContent = fmt(tokens);
+    document.getElementById('statCredits').textContent = 'Credits 消耗 ' + fmtCredits(d.credits);
+    document.getElementById('statPrompt').textContent = fmt(d.prompt_tokens);
+    document.getElementById('statCached').textContent = '缓存命中 ' + fmt(d.cached_tokens);
+    document.getElementById('statCompletion').textContent = fmt(d.completion_tokens);
+    var avg = d.total > 0 ? Math.round((d.completion_tokens || 0) / d.total) : 0;
+    document.getElementById('statAvgOut').textContent = '平均 ' + fmt(avg) + ' / 次';
     renderChart(d.hourly || []);
     renderStatsTable(d.by_model || []);
   }).catch(function(e) { showToast(e.message, 'error'); });
+}
+
+function fmtCredits(v) {
+  var n = Number(v || 0);
+  if (n === 0) return '0';
+  if (n >= 1000) return n.toLocaleString('zh-CN', {maximumFractionDigits: 2});
+  return n.toPrecision(6).replace(/\.?0+$/, '');
 }
 
 function renderChart(hourly) {

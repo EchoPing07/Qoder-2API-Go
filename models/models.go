@@ -1,7 +1,10 @@
 // Package models provides model catalog resolution with dynamic loading and fallback.
 package models
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // enableFlag coerces a model entry's "enable" field to a bool. Missing or
 // unrecognised values are treated as enabled, matching the prior default.
@@ -91,21 +94,9 @@ func DefaultCatalog() *ModelCatalog {
 	}
 }
 
-// rawModelEntry represents a single model entry in the gateway response.
-type rawModelEntry struct {
-	Key         string `json:"key"`
-	DisplayName string `json:"display_name"`
-	Enable      *bool  `json:"enable"` // pointer so missing = true
-	IsVL        bool   `json:"is_vl"`
-	IsDefault   bool   `json:"is_default"`
-}
-
-// rawCatalogResponse represents the /api/v2/model/list response shape.
-type rawCatalogResponse struct {
-	Chat      []rawModelEntry `json:"chat"`
-	Developer []rawModelEntry `json:"developer"`
-	Qwork     []rawModelEntry `json:"qwork"`
-}
+// rawModelEntry / rawCatalogResponse were removed: catalog parsing walks
+// the dynamic map form directly (ExtractCatalog), so the typed structs were
+// dead code.
 
 // ExtractCatalog parses a model/list response into a ModelCatalog.
 // Returns nil if the format doesn't match (caller should fall back).
@@ -213,20 +204,34 @@ func (e *UnsupportedModelError) Error() string {
 	return "Unsupported model '" + e.Model + "'. Supported: " + e.Supported
 }
 
-// nameForKey reverse-looks-up the display_name for a given qoder key.
-// If not found, returns the first key in the map (deterministic via sorted keys).
+// nameForKey reverse-looks-up the display_name for a given qoder key,
+// falling back to a cost-aware default when the key is absent.
 func nameForKey(modelMap map[string]string, key string) string {
 	for name, k := range modelMap {
 		if k == key {
 			return name
 		}
 	}
-	// fallback: return first sorted key
+	return fallbackDefaultName(modelMap)
+}
+
+// fallbackDefaultName picks a default model name when the preferred key is
+// absent from the dynamic catalog. It prefers cheaper tiers (flash/lite/plus
+// variants) over flagship "max" models so a missing default never silently
+// routes every request to the most expensive model.
+func fallbackDefaultName(modelMap map[string]string) string {
 	keys := make([]string, 0, len(modelMap))
 	for k := range modelMap {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	for _, want := range []string{"flash", "lite", "plus"} {
+		for _, k := range keys {
+			if strings.Contains(strings.ToLower(k), want) {
+				return k
+			}
+		}
+	}
 	if len(keys) > 0 {
 		return keys[0]
 	}

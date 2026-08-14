@@ -14,12 +14,51 @@ type BridgeDelta struct {
 	Role             string
 	Content          string
 	ReasoningContent string
+	FinishReason     string
 	ToolCalls        []map[string]interface{}
+	// Usage is non-nil only on the final usage frame (empty choices) that the
+	// gateway sends right before [DONE].
+	Usage *Usage
 }
 
 func (d *BridgeDelta) IsEmpty() bool {
 	return d.Role == "" && d.Content == "" && d.ReasoningContent == "" &&
-		(d.ToolCalls == nil || len(d.ToolCalls) == 0)
+		d.FinishReason == "" &&
+		(d.ToolCalls == nil || len(d.ToolCalls) == 0) && d.Usage == nil
+}
+
+// Usage carries token accounting from the gateway's final SSE frame.
+// Standard OpenAI fields plus Qoder extensions (credits = actual billed quota).
+type Usage struct {
+	PromptTokens            int     `json:"prompt_tokens"`
+	CompletionTokens        int     `json:"completion_tokens"`
+	TotalTokens             int     `json:"total_tokens"`
+	PromptTokensDetails     *Detail `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *Detail `json:"completion_tokens_details,omitempty"`
+	Credits                 float64 `json:"credits"`
+	OriginalCredits         float64 `json:"original_credits"`
+}
+
+// Detail is a token breakdown (cached prompt tokens / reasoning tokens).
+type Detail struct {
+	CachedTokens    int `json:"cached_tokens,omitempty"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// CachedPromptTokens returns the cached token count (0 when absent).
+func (u *Usage) CachedPromptTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
+}
+
+// ReasoningTokens returns the reasoning token count (0 when absent).
+func (u *Usage) ReasoningTokens() int {
+	if u == nil || u.CompletionTokensDetails == nil {
+		return 0
+	}
+	return u.CompletionTokensDetails.ReasoningTokens
 }
 
 // --- Qoder message types ---
@@ -453,10 +492,15 @@ func extractImageDataURL(part map[string]interface{}) string {
 }
 
 // ExtractMessageImages returns all image URLs found in an OpenAI message.
+// Falls back to the Qoder-style "contents" array, mirroring the text
+// normalization fallback so images are never silently dropped.
 func ExtractMessageImages(message map[string]interface{}) []string {
 	content, ok := message["content"].([]interface{})
 	if !ok {
-		return nil
+		content, ok = message["contents"].([]interface{})
+		if !ok {
+			return nil
+		}
 	}
 	urls := []string{}
 	for _, item := range content {
@@ -564,6 +608,12 @@ func NewToolCallAccumulator() *ToolCallAccumulator {
 
 func (a *ToolCallAccumulator) Append(deltaCalls []map[string]interface{}) {
 	for _, dc := range deltaCalls {
+		// Hard cap: once full, additional calls are dropped. This also covers
+		// the fallback path below (i = len(calls)), which would otherwise grow
+		// the slice without bound when deltas carry no usable index.
+		if len(a.calls) >= maxToolCalls {
+			return
+		}
 		idx, ok := dc["index"].(float64)
 		if !ok {
 			idx = float64(len(a.calls))
@@ -608,10 +658,7 @@ func (a *ToolCallAccumulator) IsEmpty() bool {
 func (a *ToolCallAccumulator) Snapshot() []map[string]interface{} {
 	result := make([]map[string]interface{}, len(a.calls))
 	for i, c := range a.calls {
-		b, _ := json.Marshal(c)
-		var copy map[string]interface{}
-		json.Unmarshal(b, &copy)
-		result[i] = copy
+		result[i] = deepCopyMap(c)
 	}
 	return result
 }
@@ -626,6 +673,7 @@ type StreamAccumulator struct {
 	toolCalls        *ToolCallAccumulator
 	pendingContent   []string
 	pendingRole      string
+	finishReason     string
 	emitted          bool
 	streamingText    bool
 	emitFn           func(string)
@@ -649,6 +697,9 @@ func NewStreamAccumulator(reqID string, created int64, model string, toolCallFal
 func (a *StreamAccumulator) Accept(delta *BridgeDelta) {
 	if delta.Role != "" {
 		a.pendingRole = delta.Role
+	}
+	if delta.FinishReason != "" {
+		a.finishReason = delta.FinishReason
 	}
 
 	if delta.ReasoningContent != "" {
@@ -703,6 +754,9 @@ func (a *StreamAccumulator) Flush() {
 func (a *StreamAccumulator) FinishReason() string {
 	if !a.toolCalls.IsEmpty() {
 		return "tool_calls"
+	}
+	if a.finishReason != "" {
+		return a.finishReason
 	}
 	return "stop"
 }
@@ -762,8 +816,11 @@ func withToolCallIndices(rawToolCalls []map[string]interface{}) []map[string]int
 	indexed := []map[string]interface{}{}
 	for i, tc := range rawToolCalls {
 		copy := deepCopyMap(tc)
-		if _, ok := copy["index"].(int); !ok {
-			copy["index"] = i
+		// JSON-decoded values are always float64; preserve an upstream index
+		// (parallel tool calls depend on it) and only assign a sequential one
+		// when missing.
+		if _, ok := copy["index"].(float64); !ok {
+			copy["index"] = float64(i)
 		}
 		indexed = append(indexed, copy)
 	}
@@ -841,13 +898,24 @@ func ExtractDelta(dataLine string) *BridgeDelta {
 		return delta
 	}
 	choices, ok := innerJSON["choices"].([]interface{})
-	if !ok {
+	// Usage frame: empty choices + usage object, sent right before [DONE].
+	// A frame that carries both choices and usage is a content frame;
+	// treating it as a usage frame would drop the content (some gateways
+	// attach cumulative usage to every frame).
+	if !ok || len(choices) == 0 {
+		if u := extractUsage(innerJSON["usage"]); u != nil {
+			return &BridgeDelta{Usage: u}
+		}
 		return delta
 	}
 	for _, ch := range choices {
 		choice, ok := ch.(map[string]interface{})
 		if !ok {
 			continue
+		}
+		finish, _ := choice["finish_reason"].(string)
+		if finish != "" {
+			delta.FinishReason = finish
 		}
 		deltaMap, _ := choice["delta"].(map[string]interface{})
 		role, _ := deltaMap["role"].(string)
@@ -858,16 +926,53 @@ func ExtractDelta(dataLine string) *BridgeDelta {
 		if hasTC && len(tc) > 0 {
 			toolCalls = interfaceSliceToMapSlice(tc)
 		}
-		if role != "" || content != "" || reasoning != "" || toolCalls != nil {
+		if role != "" || content != "" || reasoning != "" || toolCalls != nil || finish != "" {
 			return &BridgeDelta{
 				Role:             role,
 				Content:          content,
 				ReasoningContent: reasoning,
+				FinishReason:     finish,
 				ToolCalls:        toolCalls,
 			}
 		}
 	}
 	return delta
+}
+
+// extractUsage parses the gateway usage object (nil when absent/malformed).
+func extractUsage(v interface{}) *Usage {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	u := &Usage{
+		PromptTokens:     toInt(m["prompt_tokens"]),
+		CompletionTokens: toInt(m["completion_tokens"]),
+		TotalTokens:      toInt(m["total_tokens"]),
+		Credits:          toFloat(m["credits"]),
+		OriginalCredits:  toFloat(m["original_credits"]),
+	}
+	if d, ok := m["prompt_tokens_details"].(map[string]interface{}); ok {
+		u.PromptTokensDetails = &Detail{CachedTokens: toInt(d["cached_tokens"])}
+	}
+	if d, ok := m["completion_tokens_details"].(map[string]interface{}); ok {
+		u.CompletionTokensDetails = &Detail{ReasoningTokens: toInt(d["reasoning_tokens"])}
+	}
+	return u
+}
+
+func toInt(v interface{}) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
+}
+
+func toFloat(v interface{}) float64 {
+	if f, ok := v.(float64); ok {
+		return f
+	}
+	return 0
 }
 
 // --- Helpers ---
@@ -888,10 +993,17 @@ func marshalNoEscapeChunk(v interface{}) ([]byte, error) {
 }
 
 func deepCopyMap(m map[string]interface{}) map[string]interface{} {
-	b, _ := json.Marshal(m)
-	var copy map[string]interface{}
-	json.Unmarshal(b, &copy)
-	return copy
+	// Shallow-recursive copy: tool call deltas are plain maps of scalars and
+	// nested maps, so a manual walk avoids the marshal/unmarshal round trip.
+	cp := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if nested, ok := v.(map[string]interface{}); ok {
+			cp[k] = deepCopyMap(nested)
+		} else {
+			cp[k] = v
+		}
+	}
+	return cp
 }
 
 func interfaceSliceToMapSlice(slice []interface{}) []map[string]interface{} {
