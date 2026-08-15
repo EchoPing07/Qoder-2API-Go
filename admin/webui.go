@@ -723,7 +723,7 @@ input[readonly] {
   flex: 1;
   overflow-x: auto;
 }
-.mobile-nav .nav-item { flex: 0 0 auto; justify-content: center; padding: 8px 14px; }
+.mobile-nav .nav-item { flex: 0 0 auto; width: auto; justify-content: center; padding: 8px 14px; }
 .mobile-nav .nav-item span.mnav-label { font-size: 12.5px; }
 
 @media (max-width: 1180px) {

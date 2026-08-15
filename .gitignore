@@ -9,6 +9,7 @@ data.json
 .DS_Store
 Thumbs.db
 probe/
+work/
 
 # Editor local config
 .obsidian/
