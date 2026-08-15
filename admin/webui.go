@@ -433,6 +433,9 @@ code, .mono, .num {
 .chart-peak { font-size: 12px; color: var(--muted); }
 
 .chart {
+  overflow-x: auto;
+}
+.chart-plot {
   display: flex;
   align-items: stretch;
   gap: 6px;
@@ -440,7 +443,6 @@ code, .mono, .num {
   margin-top: 18px;
   padding-top: 8px;
   border-bottom: 1px solid var(--border);
-  overflow-x: auto;
 }
 .chart-col {
   flex: 1 1 0;
@@ -462,11 +464,18 @@ code, .mono, .num {
 .bar { width: 100%; border-radius: 2px 2px 0 0; }
 .bar.ok { background: var(--accent); }
 .bar.fail { background: var(--danger); opacity: 0.85; }
-.chart-label {
+.chart-axis {
+  display: flex;
+  gap: 6px;
+  padding-top: 6px;
+}
+.chart-axis-item {
+  flex: 1 1 0;
+  min-width: 14px;
+  text-align: center;
   font-size: 10px;
   color: var(--muted);
   font-family: "SF Mono", Consolas, monospace;
-  padding-top: 6px;
   white-space: nowrap;
 }
 
@@ -733,7 +742,7 @@ input[readonly] {
   .row { flex-direction: column; align-items: stretch; }
   .row > label { min-width: auto; }
   .stat-value { font-size: 22px; }
-  .chart-col { min-width: 12px; }
+  .chart-col, .chart-axis-item { min-width: 12px; }
   /* Prevent iOS Safari auto-zoom on focus (requires >=16px). */
   input[type="text"], input[type="number"], input[type="password"] { font-size: 16px; }
 }
@@ -1197,10 +1206,18 @@ function renderChart(hourly) {
 
   var chart = document.getElementById('chart');
   chart.innerHTML = '';
+
+  var plot = document.createElement('div');
+  plot.className = 'chart-plot';
+  var axis = document.createElement('div');
+  axis.className = 'chart-axis';
+
   hourly.forEach(function(h, i) {
+    var tip = h.label + ' · 总 ' + h.total + ' · 成功 ' + h.success + ' · 失败 ' + h.failed;
+
     var col = document.createElement('div');
     col.className = 'chart-col';
-    col.title = h.label + ' · 总 ' + h.total + ' · 成功 ' + h.success + ' · 失败 ' + h.failed;
+    col.title = tip;
 
     var bars = document.createElement('div');
     bars.className = 'chart-bars';
@@ -1221,13 +1238,17 @@ function renderChart(hourly) {
       }
     }
     col.appendChild(bars);
+    plot.appendChild(col);
 
     var lab = document.createElement('div');
-    lab.className = 'chart-label';
+    lab.className = 'chart-axis-item';
     lab.textContent = (i % 4 === 0) ? h.label : '';
-    col.appendChild(lab);
-    chart.appendChild(col);
+    lab.title = tip;
+    axis.appendChild(lab);
   });
+
+  chart.appendChild(plot);
+  chart.appendChild(axis);
 }
 
 function renderStatsTable(rows) {
