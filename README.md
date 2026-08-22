@@ -74,6 +74,10 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
 | `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
+| `QODER_CHAT_TIMEOUT_SECONDS` | `120` | Chat 响应超时：等待上游开始响应（返回响应头）的最长秒数，范围 1-3600；设置后管理面板中不可修改 |
+| `QODER_IDLE_TIMEOUT_SECONDS` | `300` | 流空闲超时：流式响应中持续无数据的最长等待秒数，范围 1-3600（数据持续到达时流不会被中断）；设置后管理面板中不可修改 |
+
+> 两个超时也可在管理面板「设置 → 超时配置」中修改，保存后即时生效（无需重启）。响应超时只约束上游「开始响应」，不会截断已经建立的流。
 
 > 请求统计（`stats` 字段）随 data.json 持久化：服务每 30 秒批量写入一次，并在收到 `SIGINT`/`SIGTERM` 优雅关闭时执行最终落盘；仅统计通过密钥鉴权且请求体合法的调用，客户端主动断开不计入失败。令牌用量（总输入 / 总输出 / 缓存命中 / 实际扣费额度）从网关 usage 帧自动累计，流中断无 usage 帧时仅计次不计量。
 
@@ -87,6 +91,8 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
   "port": 10081,
   "pat": "pt-xxxxxxxx",
   "password": "password",
+  "chat_timeout_seconds": 120,
+  "idle_timeout_seconds": 300,
   "api_keys": [
     {
       "id": "xxxxxxxx",
@@ -95,6 +101,19 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
       "created_at": 1234567890
     }
   ]
+}
+```
+
+## 健康检查
+
+`GET /health` 返回服务状态（免鉴权，供容器探针 / 负载均衡使用）：
+
+```json
+{
+  "status": "ok",
+  "has_pat": true,
+  "chat_timeout_seconds": 120,
+  "idle_timeout_seconds": 300
 }
 ```
 

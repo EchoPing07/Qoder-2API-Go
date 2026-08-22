@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"qoder2api/auth"
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
@@ -420,17 +421,32 @@ func (a *Admin) handleKeys(w http.ResponseWriter, r *http.Request) {
 
 // --- Config endpoint ---
 
+// timeoutEnvManaged reports whether stream timeouts are pinned by env vars,
+// in which case the panel must not override them (same policy as
+// QODER_ADMIN_PASSWORD for password changes).
+func timeoutEnvManaged() bool {
+	return os.Getenv("QODER_CHAT_TIMEOUT_SECONDS") != "" ||
+		os.Getenv("QODER_IDLE_TIMEOUT_SECONDS") != ""
+}
+
 func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		// Report the effective stream timeouts (env startup overrides are
+		// already folded into them), not just the persisted file values.
+		timeouts := auth.CurrentStreamTimeouts()
 		writeJSON(w, 200, map[string]interface{}{
-			"host": a.store.GetHost(),
-			"port": a.store.GetPort(),
+			"host":                 a.store.GetHost(),
+			"port":                 a.store.GetPort(),
+			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
+			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
 		})
 	case http.MethodPost:
 		var body struct {
-			Host string `json:"host"`
-			Port int    `json:"port"`
+			Host               string `json:"host"`
+			Port               int    `json:"port"`
+			ChatTimeoutSeconds int    `json:"chat_timeout_seconds"`
+			IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -446,14 +462,58 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, 400, "端口必须在 1-65535 范围内")
 			return
 		}
+		// Timeout fields are optional (0 = keep current) so legacy callers
+		// that only send host/port keep working. Validate everything before
+		// saving anything so a bad value cannot leave a partial update.
+		wantsTimeouts := body.ChatTimeoutSeconds != 0 || body.IdleTimeoutSeconds != 0
+		if wantsTimeouts && timeoutEnvManaged() {
+			writeJSONError(w, 400, "超时由环境变量 QODER_CHAT_TIMEOUT_SECONDS / QODER_IDLE_TIMEOUT_SECONDS 管理，无法在面板中修改")
+			return
+		}
+		if body.ChatTimeoutSeconds != 0 {
+			if err := store.ValidateTimeoutSeconds(body.ChatTimeoutSeconds, store.MaxChatTimeoutSeconds); err != nil {
+				writeJSONError(w, 400, "Chat 响应超时："+err.Error())
+				return
+			}
+		}
+		if body.IdleTimeoutSeconds != 0 {
+			if err := store.ValidateTimeoutSeconds(body.IdleTimeoutSeconds, store.MaxIdleTimeoutSeconds); err != nil {
+				writeJSONError(w, 400, "流空闲超时："+err.Error())
+				return
+			}
+		}
 		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
 		}
+		if body.ChatTimeoutSeconds != 0 {
+			if err := a.store.SetChatTimeoutSeconds(body.ChatTimeoutSeconds); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if body.IdleTimeoutSeconds != 0 {
+			if err := a.store.SetIdleTimeoutSeconds(body.IdleTimeoutSeconds); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		// Hot-apply only when the request actually carried timeout fields:
+		// re-applying store values unconditionally would clobber env-pinned
+		// timeouts on a legacy host/port-only save.
+		if wantsTimeouts {
+			auth.SetStreamTimeouts(
+				time.Duration(a.store.GetChatTimeoutSeconds())*time.Second,
+				time.Duration(a.store.GetIdleTimeoutSeconds())*time.Second,
+			)
+		}
+		timeouts := auth.CurrentStreamTimeouts()
 		writeJSON(w, 200, map[string]interface{}{
-			"host":    body.Host,
-			"port":    body.Port,
-			"restart": "修改主机或端口后需要重启服务才能生效",
+			"host":                 body.Host,
+			"port":                 body.Port,
+			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
+			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
+			"restart":              "修改主机或端口后需要重启服务才能生效（超时配置已即时生效）",
 		})
 	default:
 		writeJSONError(w, 405, "方法不允许")

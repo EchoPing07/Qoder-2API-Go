@@ -284,3 +284,96 @@ func TestSaveLeavesNoTmpFile(t *testing.T) {
 		t.Error("persisted file missing key")
 	}
 }
+
+// -- Stream timeouts --
+
+func TestStreamTimeoutDefaults(t *testing.T) {
+	s := tempStore(t)
+	if s.GetChatTimeoutSeconds() != DefaultChatTimeoutSeconds {
+		t.Errorf("expected default chat timeout %d, got %d", DefaultChatTimeoutSeconds, s.GetChatTimeoutSeconds())
+	}
+	if s.GetIdleTimeoutSeconds() != DefaultIdleTimeoutSeconds {
+		t.Errorf("expected default idle timeout %d, got %d", DefaultIdleTimeoutSeconds, s.GetIdleTimeoutSeconds())
+	}
+}
+
+func TestStreamTimeoutPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	s1, _ := New(path)
+	if err := s1.SetChatTimeoutSeconds(90); err != nil {
+		t.Fatalf("SetChatTimeoutSeconds: %v", err)
+	}
+	if err := s1.SetIdleTimeoutSeconds(45); err != nil {
+		t.Fatalf("SetIdleTimeoutSeconds: %v", err)
+	}
+	s2, err := New(path)
+	if err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	if s2.GetChatTimeoutSeconds() != 90 || s2.GetIdleTimeoutSeconds() != 45 {
+		t.Errorf("timeouts not persisted: chat=%d idle=%d", s2.GetChatTimeoutSeconds(), s2.GetIdleTimeoutSeconds())
+	}
+}
+
+// Hand-edited files with out-of-range values are clamped on load instead of
+// rejecting the whole config.
+func TestStreamTimeoutClampOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	if err := os.WriteFile(path, []byte(`{"chat_timeout_seconds":999999,"idle_timeout_seconds":999999}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if s.GetChatTimeoutSeconds() != MaxChatTimeoutSeconds {
+		t.Errorf("expected chat timeout clamped to %d, got %d", MaxChatTimeoutSeconds, s.GetChatTimeoutSeconds())
+	}
+	if s.GetIdleTimeoutSeconds() != MaxIdleTimeoutSeconds {
+		t.Errorf("expected idle timeout clamped to %d, got %d", MaxIdleTimeoutSeconds, s.GetIdleTimeoutSeconds())
+	}
+}
+
+func TestSetStreamTimeoutValidation(t *testing.T) {
+	s := tempStore(t)
+	for _, n := range []int{0, -1, MaxChatTimeoutSeconds + 1} {
+		if err := s.SetChatTimeoutSeconds(n); err == nil {
+			t.Errorf("SetChatTimeoutSeconds(%d) should fail", n)
+		}
+	}
+	for _, n := range []int{0, -1, MaxIdleTimeoutSeconds + 1} {
+		if err := s.SetIdleTimeoutSeconds(n); err == nil {
+			t.Errorf("SetIdleTimeoutSeconds(%d) should fail", n)
+		}
+	}
+	if s.GetChatTimeoutSeconds() != DefaultChatTimeoutSeconds {
+		t.Errorf("rejected writes must not change the value, got %d", s.GetChatTimeoutSeconds())
+	}
+}
+
+// Negative hand-edited values normalize to defaults on load (and are
+// persisted back so the file stops lying about the effective value).
+func TestStreamTimeoutNegativeOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	if err := os.WriteFile(path, []byte(`{"chat_timeout_seconds":-5,"idle_timeout_seconds":-1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if s.GetChatTimeoutSeconds() != DefaultChatTimeoutSeconds || s.GetIdleTimeoutSeconds() != DefaultIdleTimeoutSeconds {
+		t.Errorf("negative values should fall back to defaults, got chat=%d idle=%d",
+			s.GetChatTimeoutSeconds(), s.GetIdleTimeoutSeconds())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "-5") {
+		t.Errorf("normalized values should be persisted back, file still has -5:\n%s", data)
+	}
+}

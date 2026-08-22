@@ -2,8 +2,14 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestEncodeDecodeRoundTrip(t *testing.T) {
@@ -180,5 +186,81 @@ func TestTrimJSONMessage(t *testing.T) {
 	}
 	if got := trimJSONMessage(""); got != "" {
 		t.Errorf("empty: %q", got)
+	}
+}
+
+// -- Stream timeouts --
+
+func TestStreamTimeoutsSetAndGet(t *testing.T) {
+	defer SetStreamTimeouts(DefaultChatHeaderTimeout, DefaultChatIdleTimeout)
+	got := CurrentStreamTimeouts()
+	if got.Header != DefaultChatHeaderTimeout || got.Idle != DefaultChatIdleTimeout {
+		t.Fatalf("expected defaults, got %+v", got)
+	}
+	// Zero values normalize to the defaults instead of disabling the timeout.
+	SetStreamTimeouts(3*time.Second, 0)
+	got = CurrentStreamTimeouts()
+	if got.Header != 3*time.Second || got.Idle != DefaultChatIdleTimeout {
+		t.Fatalf("expected {3s default}, got %+v", got)
+	}
+}
+
+// testSession builds a minimal session for OpenStreamLines against a test
+// server (the payload is never validated by the fake upstream).
+func testSession() *SessionContext {
+	return NewSession(AuthIdentity{UID: "u", Name: "n"}, "mid", "mtok", "mtype")
+}
+
+// A server that never starts responding must be cut off by the header
+// timeout instead of hanging until the client disconnects.
+func TestOpenStreamLinesHeaderTimeout(t *testing.T) {
+	defer SetStreamTimeouts(DefaultChatHeaderTimeout, DefaultChatIdleTimeout)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	SetStreamTimeouts(50*time.Millisecond, time.Minute)
+	start := time.Now()
+	err := OpenStreamLines(context.Background(), testSession(), srv.URL, []byte(`{}`), nil, func(string) error { return nil })
+	if err == nil {
+		t.Fatal("expected header timeout error, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+		t.Errorf("header timeout fired too late: %s", elapsed)
+	}
+}
+
+// A stream that goes silent mid-response must be cut off by the idle
+// timeout; the error must identify the idle timeout, not a truncation.
+func TestOpenStreamLinesIdleTimeout(t *testing.T) {
+	defer SetStreamTimeouts(DefaultChatHeaderTimeout, DefaultChatIdleTimeout)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		io.WriteString(w, "data: {\"body\":\"{}\"}\n\n")
+		flusher.Flush()
+		// Stall with the connection still open.
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+
+	SetStreamTimeouts(time.Minute, 50*time.Millisecond)
+	start := time.Now()
+	err := OpenStreamLines(context.Background(), testSession(), srv.URL, []byte(`{}`), nil, func(string) error { return nil })
+	if err == nil {
+		t.Fatal("expected idle timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "idle") {
+		t.Errorf("error should mention idle timeout, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("idle timeout fired too late: %s", elapsed)
 	}
 }

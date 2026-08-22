@@ -980,10 +980,25 @@ input[readonly] {
             <label>端口</label>
             <div class="field"><input type="number" id="cfgPort" placeholder="10081"></div>
           </div>
+          <div id="configHint" class="hint-warn hidden"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">超时配置</div></div>
+        <div class="card-body">
+          <p class="hint">Chat 响应超时（秒）：等待上游开始响应（返回响应头）的最长时间；流空闲超时（秒）：流式响应中持续无数据的最长等待，只要数据持续到达就不会中断。保存后立即生效，无需重启。</p>
+          <div class="row">
+            <label>响应超时</label>
+            <div class="field"><input type="number" id="cfgChatTimeout" placeholder="120" min="1" max="3600"></div>
+          </div>
+          <div class="row">
+            <label>空闲超时</label>
+            <div class="field"><input type="number" id="cfgIdleTimeout" placeholder="300" min="1" max="3600"></div>
+          </div>
           <div class="btn-row right">
             <button class="btn" type="button" onclick="saveConfig()">保存</button>
           </div>
-          <div id="configHint" class="hint-warn hidden"></div>
         </div>
       </div>
 
@@ -1379,6 +1394,8 @@ function loadConfig() {
   api('/config').then(function(data) {
     document.getElementById('cfgHost').value = data.host || '';
     document.getElementById('cfgPort').value = data.port || '';
+    document.getElementById('cfgChatTimeout').value = data.chat_timeout_seconds || '';
+    document.getElementById('cfgIdleTimeout').value = data.idle_timeout_seconds || '';
     document.getElementById('configHint').classList.add('hidden');
   }).catch(function(e) { showToast(e.message, 'error'); });
 }
@@ -1388,11 +1405,22 @@ function saveConfig() {
   var port = parseInt(document.getElementById('cfgPort').value, 10);
   if (!host) host = '0.0.0.0';
   if (!port || port < 1 || port > 65535) { showToast('端口无效', 'error'); return; }
-  api('/config', { method: 'POST', body: JSON.stringify({ host: host, port: port }) })
+  var body = { host: host, port: port };
+  var ct = parseInt(document.getElementById('cfgChatTimeout').value, 10);
+  var it = parseInt(document.getElementById('cfgIdleTimeout').value, 10);
+  if (document.getElementById('cfgChatTimeout').value.trim() !== '') {
+    if (!ct || ct < 1 || ct > 3600) { showToast('Chat 响应超时需在 1-3600 秒之间', 'error'); return; }
+    body.chat_timeout_seconds = ct;
+  }
+  if (document.getElementById('cfgIdleTimeout').value.trim() !== '') {
+    if (!it || it < 1 || it > 3600) { showToast('流空闲超时需在 1-3600 秒之间', 'error'); return; }
+    body.idle_timeout_seconds = it;
+  }
+  api('/config', { method: 'POST', body: JSON.stringify(body) })
     .then(function(data) {
-      showToast('配置已保存，重启后生效');
+      showToast('配置已保存（超时配置即时生效）');
       var h = document.getElementById('configHint');
-      h.textContent = data.restart || '修改后需要重启服务才能生效。';
+      h.textContent = data.restart || '修改主机或端口后需要重启服务才能生效。';
       h.classList.remove('hidden');
       loadConfig();
     })

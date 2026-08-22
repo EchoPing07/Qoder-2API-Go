@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"qoder2api/auth"
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
@@ -378,5 +379,129 @@ func TestClientIPv6(t *testing.T) {
 	r.RemoteAddr = "1.2.3.4:5678"
 	if got := clientIP(r); got != "1.2.3.4" {
 		t.Errorf("clientIP(1.2.3.4:5678) = %q, want 1.2.3.4", got)
+	}
+}
+
+// -- Config: stream timeouts --
+
+func TestConfigGetIncludesTimeouts(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["chat_timeout_seconds"].(float64)) != store.DefaultChatTimeoutSeconds {
+		t.Errorf("expected default chat timeout %d, got %v", store.DefaultChatTimeoutSeconds, resp["chat_timeout_seconds"])
+	}
+	if int(resp["idle_timeout_seconds"].(float64)) != store.DefaultIdleTimeoutSeconds {
+		t.Errorf("expected default idle timeout %d, got %v", store.DefaultIdleTimeoutSeconds, resp["idle_timeout_seconds"])
+	}
+}
+
+// Saving timeouts must persist to the store and hot-apply to the auth
+// package without a restart.
+func TestConfigSetTimeoutsHotApplied(t *testing.T) {
+	defer auth.SetStreamTimeouts(auth.DefaultChatHeaderTimeout, auth.DefaultChatIdleTimeout)
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "0.0.0.0", "port": 10081,
+		"chat_timeout_seconds": 90, "idle_timeout_seconds": 45,
+	})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.GetChatTimeoutSeconds() != 90 || s.GetIdleTimeoutSeconds() != 45 {
+		t.Errorf("timeouts not persisted: chat=%d idle=%d", s.GetChatTimeoutSeconds(), s.GetIdleTimeoutSeconds())
+	}
+	timeouts := auth.CurrentStreamTimeouts()
+	if timeouts.Header != 90*time.Second || timeouts.Idle != 45*time.Second {
+		t.Errorf("timeouts not hot-applied: %+v", timeouts)
+	}
+	// GET reflects the effective values.
+	w = doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["chat_timeout_seconds"].(float64)) != 90 {
+		t.Errorf("GET should report 90, got %v", resp["chat_timeout_seconds"])
+	}
+}
+
+// Omitted timeout fields (0) must keep current values so legacy callers
+// that only send host/port keep working; out-of-range values are rejected.
+func TestConfigSetTimeoutValidation(t *testing.T) {
+	defer auth.SetStreamTimeouts(auth.DefaultChatHeaderTimeout, auth.DefaultChatIdleTimeout)
+	a, s := newAdmin(t)
+	s.SetChatTimeoutSeconds(90)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{"host": "0.0.0.0", "port": 10081})
+	if w.Code != 200 {
+		t.Fatalf("legacy body should be accepted, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.GetChatTimeoutSeconds() != 90 {
+		t.Errorf("legacy body must not touch timeouts, got %d", s.GetChatTimeoutSeconds())
+	}
+	for _, body := range []map[string]interface{}{
+		{"host": "0.0.0.0", "port": 10081, "chat_timeout_seconds": 5000},
+		{"host": "0.0.0.0", "port": 10081, "idle_timeout_seconds": -3},
+	} {
+		w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", body)
+		if w.Code != 400 {
+			t.Errorf("expected 400 for %+v, got %d: %s", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+// When timeouts are pinned by env vars the panel must refuse changes (the
+// env would silently win again after the next restart).
+func TestConfigTimeoutsEnvManaged(t *testing.T) {
+	t.Setenv("QODER_CHAT_TIMEOUT_SECONDS", "90")
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "0.0.0.0", "port": 10081, "chat_timeout_seconds": 60,
+	})
+	if w.Code != 400 {
+		t.Errorf("expected 400 when env-managed, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A legacy host/port-only save must not clobber env-pinned timeouts with the
+// persisted (file) values.
+func TestConfigLegacyBodyKeepsEnvTimeouts(t *testing.T) {
+	auth.SetStreamTimeouts(200*time.Second, 300*time.Second)
+	defer auth.SetStreamTimeouts(auth.DefaultChatHeaderTimeout, auth.DefaultChatIdleTimeout)
+	t.Setenv("QODER_CHAT_TIMEOUT_SECONDS", "200")
+
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{"host": "0.0.0.0", "port": 10081})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	timeouts := auth.CurrentStreamTimeouts()
+	if timeouts.Header != 200*time.Second {
+		t.Errorf("legacy save clobbered env timeout, got %s", timeouts.Header)
+	}
+	if s.GetChatTimeoutSeconds() != store.DefaultChatTimeoutSeconds {
+		t.Errorf("legacy save must not touch stored timeouts, got %d", s.GetChatTimeoutSeconds())
+	}
+}
+
+// A request mixing a valid and an invalid timeout must apply neither.
+func TestConfigPartialInvalidTimeoutAppliesNothing(t *testing.T) {
+	defer auth.SetStreamTimeouts(auth.DefaultChatHeaderTimeout, auth.DefaultChatIdleTimeout)
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "0.0.0.0", "port": 10081,
+		"chat_timeout_seconds": 90, "idle_timeout_seconds": 9999,
+	})
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.GetChatTimeoutSeconds() != store.DefaultChatTimeoutSeconds {
+		t.Errorf("valid field must not be applied when another field is invalid, got %d", s.GetChatTimeoutSeconds())
+	}
+	timeouts := auth.CurrentStreamTimeouts()
+	if timeouts.Header != auth.DefaultChatHeaderTimeout {
+		t.Errorf("hot-apply must not run on rejected input, got %s", timeouts.Header)
 	}
 }

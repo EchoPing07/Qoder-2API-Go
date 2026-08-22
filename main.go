@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -60,6 +61,28 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	return p.bridge
 }
 
+// healthHandler serves an unauthenticated liveness/readiness probe. It is
+// deliberately cheap (no upstream calls, no session bootstrap): the body
+// carries readiness details (PAT configured, effective stream timeouts)
+// while the status stays 200 as long as the process is serving.
+func healthHandler(st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		timeouts := auth.CurrentStreamTimeouts()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":               "ok",
+			"has_pat":              st.GetPAT() != "",
+			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
+			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
+		})
+	}
+}
+
 func main() {
 	// Initialize store
 	dataPath := os.Getenv("QODER_DATA_PATH")
@@ -84,6 +107,27 @@ func main() {
 			log.Printf("[bridge] WARN invalid QODER_PORT=%q; using %d", envPort, port)
 		}
 	}
+
+	// Chat stream timeouts: env vars override the persisted config, the
+	// config file overrides the built-in defaults (same precedence as
+	// host/port). Applied to new requests immediately.
+	chatTimeout := st.GetChatTimeoutSeconds()
+	if v := os.Getenv("QODER_CHAT_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= store.MaxChatTimeoutSeconds {
+			chatTimeout = n
+		} else {
+			log.Printf("[bridge] WARN invalid QODER_CHAT_TIMEOUT_SECONDS=%q; using %d", v, chatTimeout)
+		}
+	}
+	idleTimeout := st.GetIdleTimeoutSeconds()
+	if v := os.Getenv("QODER_IDLE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= store.MaxIdleTimeoutSeconds {
+			idleTimeout = n
+		} else {
+			log.Printf("[bridge] WARN invalid QODER_IDLE_TIMEOUT_SECONDS=%q; using %d", v, idleTimeout)
+		}
+	}
+	auth.SetStreamTimeouts(time.Duration(chatTimeout)*time.Second, time.Duration(idleTimeout)*time.Second)
 
 	provider := newBridgeProvider(st)
 
@@ -128,6 +172,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec))
 	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
+	mux.HandleFunc("/health", healthHandler(st))
 
 	// Root redirect to admin UI
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

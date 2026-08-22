@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -554,11 +555,68 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 // StreamCallback is called for each non-empty SSE line.
 type StreamCallback func(line string) error
 
-// idleStreamTimeout bounds how long the SSE stream may stay silent (no bytes
-// received) before we give up. Without it a wedged gateway connection (TCP
-// alive, no data) pins a goroutine + connection forever, and the server
+// --- Configurable stream timeouts ---
+
+// DefaultChatHeaderTimeout bounds how long a chat stream may take to start
+// responding (time to response headers). DefaultChatIdleTimeout bounds how
+// long an established SSE stream may stay silent (no bytes received) before
+// we give up. Without the idle bound a wedged gateway connection (TCP alive,
+// no data) pins a goroutine + connection forever, and the server
 // intentionally sets no WriteTimeout for SSE.
-const idleStreamTimeout = 5 * time.Minute
+const (
+	DefaultChatHeaderTimeout = 120 * time.Second
+	DefaultChatIdleTimeout   = 5 * time.Minute
+)
+
+// StreamTimeouts bundles the two chat stream timeouts. Both can be changed
+// at runtime via SetStreamTimeouts; new requests pick the values up
+// immediately, in-flight streams keep running with the old ones.
+type StreamTimeouts struct {
+	Header time.Duration // wait for the chat stream to start responding
+	Idle   time.Duration // max silence on an established SSE stream
+}
+
+func (t StreamTimeouts) normalized() StreamTimeouts {
+	if t.Header <= 0 {
+		t.Header = DefaultChatHeaderTimeout
+	}
+	if t.Idle <= 0 {
+		t.Idle = DefaultChatIdleTimeout
+	}
+	return t
+}
+
+var (
+	streamTimeoutsVal atomic.Pointer[StreamTimeouts]
+	streamClientVal   atomic.Pointer[http.Client]
+)
+
+func init() {
+	SetStreamTimeouts(DefaultChatHeaderTimeout, DefaultChatIdleTimeout)
+}
+
+// SetStreamTimeouts configures the chat stream timeouts and rebuilds the
+// dedicated stream client. The client is swapped atomically so concurrent
+// requests never observe a half-updated state.
+func SetStreamTimeouts(header, idle time.Duration) {
+	t := StreamTimeouts{Header: header, Idle: idle}.normalized()
+	// Own transport (cloned from the default) isolates the long-lived SSE
+	// connection pool from the short-request clients, and lets the header
+	// timeout change without touching them. ResponseHeaderTimeout is the
+	// only deadline: a Client.Timeout here would truncate long generations.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = t.Header
+	streamClientVal.Store(&http.Client{Transport: transport})
+	streamTimeoutsVal.Store(&t)
+}
+
+// CurrentStreamTimeouts returns the effective stream timeouts.
+func CurrentStreamTimeouts() StreamTimeouts {
+	if t := streamTimeoutsVal.Load(); t != nil {
+		return *t
+	}
+	return StreamTimeouts{}.normalized()
+}
 
 // isDoneLine reports whether an SSE line carries the terminal [DONE]
 // marker. The Qoder gateway wraps [DONE] inside its Encode-layer envelope
@@ -710,8 +768,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	}
 	req.Header = headers
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := streamClientVal.Load().Do(req)
 	if err != nil {
 		return err
 	}
@@ -726,11 +783,27 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(errBody))
 	}
 
-	// Reset an idle deadline on every received line: long generations are
-	// fine (lines keep arriving), only a silent connection is cut off.
-	idleTimer := time.NewTimer(idleStreamTimeout)
-	defer idleTimer.Stop()
-	idleErr := fmt.Errorf("stream idle for over %s", idleStreamTimeout)
+	// Cut off silent streams: long generations are fine (lines keep
+	// arriving), only a silent connection is killed. The watchdog polls a
+	// last-activity timestamp instead of sharing a timer with the read loop —
+	// Reset on a fired-but-undrained timer is racy under the pre-Go-1.23
+	// timer semantics this module builds with.
+	timeouts := CurrentStreamTimeouts()
+	idleErr := fmt.Errorf("stream idle for over %s", timeouts.Idle)
+	var lastLineNs atomic.Int64
+	lastLineNs.Store(time.Now().UnixNano())
+	var idleFired atomic.Bool
+	cancelRead := func() {
+		// Cancel the body read; scanner.Scan() then returns with an error.
+		if c, ok := resp.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
+			c.SetReadDeadline(time.Now())
+		} else {
+			// Best effort for bodies without deadline support (HTTP/1.1):
+			// closing unblocks the read with a "closed network connection"
+			// error, which idleFired maps back to idleErr below.
+			resp.Body.Close()
+		}
+	}
 
 	// The gateway always terminates its stream with a [DONE] marker. An EOF
 	// before it means the connection was cut mid-response; treating that as
@@ -744,21 +817,28 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		select {
-		case <-idleTimer.C:
-			// Cancel the body read; scanner.Scan() then returns with an error.
-			if c, ok := resp.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
-				c.SetReadDeadline(time.Now())
-			} else {
-				// Best effort for bodies without deadline support.
-				resp.Body.Close()
+		checkEvery := timeouts.Idle / 4
+		if checkEvery < 10*time.Millisecond {
+			checkEvery = 10 * time.Millisecond
+		}
+		ticker := time.NewTicker(checkEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastLineNs.Load())) >= timeouts.Idle {
+					idleFired.Store(true)
+					cancelRead()
+					return
+				}
 			}
-		case <-done:
 		}
 	}()
 	for scanner.Scan() {
 		line := scanner.Text()
-		idleTimer.Reset(idleStreamTimeout)
+		lastLineNs.Store(time.Now().UnixNano())
 		if line == "" {
 			continue
 		}
@@ -793,7 +873,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) {
+		if idleFired.Load() || errors.Is(err, os.ErrDeadlineExceeded) {
 			return idleErr
 		}
 		return err

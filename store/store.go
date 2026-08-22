@@ -35,6 +35,11 @@ type Config struct {
 	Password string      `json:"password"`
 	APIKeys  []APIKey    `json:"api_keys"`
 	Stats    *stats.Data `json:"stats,omitempty"`
+	// ChatTimeoutSeconds bounds how long the upstream chat stream may take
+	// to start responding (time to response headers). IdleTimeoutSeconds
+	// bounds how long an established SSE stream may stay silent.
+	ChatTimeoutSeconds int `json:"chat_timeout_seconds"`
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 }
 
 // DefaultHost is the default listen host.
@@ -45,6 +50,24 @@ const DefaultPort = 10081
 
 // DefaultPassword is the default admin password.
 const DefaultPassword = "password"
+
+// Chat stream timeout bounds (seconds). The max cap also guards against
+// overflow when callers convert seconds to time.Duration nanoseconds — a
+// value beyond ~292 years wraps negative and silently disables the timeout.
+const (
+	DefaultChatTimeoutSeconds = 120
+	MaxChatTimeoutSeconds     = 3600
+	DefaultIdleTimeoutSeconds = 300
+	MaxIdleTimeoutSeconds     = 3600
+)
+
+// ValidateTimeoutSeconds checks that n is a usable timeout in seconds.
+func ValidateTimeoutSeconds(n, max int) error {
+	if n < 1 || n > max {
+		return fmt.Errorf("超时需在 1-%d 秒之间", max)
+	}
+	return nil
+}
 
 // Store manages persistent configuration with thread-safe access.
 type Store struct {
@@ -59,9 +82,11 @@ func New(filePath string) (*Store, error) {
 	s := &Store{
 		filePath: filePath,
 		config: &Config{
-			Host:    DefaultHost,
-			Port:    DefaultPort,
-			APIKeys: []APIKey{},
+			Host:               DefaultHost,
+			Port:               DefaultPort,
+			ChatTimeoutSeconds: DefaultChatTimeoutSeconds,
+			IdleTimeoutSeconds: DefaultIdleTimeoutSeconds,
+			APIKeys:            []APIKey{},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -100,6 +125,24 @@ func (s *Store) load() error {
 	}
 	if cfg.Password == "" {
 		cfg.Password = DefaultPassword
+		needsSave = true
+	}
+	if cfg.ChatTimeoutSeconds <= 0 {
+		cfg.ChatTimeoutSeconds = DefaultChatTimeoutSeconds
+		needsSave = true
+	}
+	if cfg.IdleTimeoutSeconds <= 0 {
+		cfg.IdleTimeoutSeconds = DefaultIdleTimeoutSeconds
+		needsSave = true
+	}
+	// Clamp out-of-range values (hand-edited files, older versions) instead
+	// of rejecting the whole file.
+	if cfg.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
+		cfg.ChatTimeoutSeconds = MaxChatTimeoutSeconds
+		needsSave = true
+	}
+	if cfg.IdleTimeoutSeconds > MaxIdleTimeoutSeconds {
+		cfg.IdleTimeoutSeconds = MaxIdleTimeoutSeconds
 		needsSave = true
 	}
 	s.config = &cfg
@@ -166,6 +209,58 @@ func (s *Store) SetHostPort(host string, port int) error {
 	s.config.Port = port
 	s.mu.Unlock()
 	return s.save()
+}
+
+// --- Stream Timeouts ---
+
+// GetChatTimeoutSeconds returns the chat response-header timeout in seconds
+// (0-normalized to the default; clamped to the max).
+func (s *Store) GetChatTimeoutSeconds() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeTimeout(s.config.ChatTimeoutSeconds, DefaultChatTimeoutSeconds, MaxChatTimeoutSeconds)
+}
+
+// GetIdleTimeoutSeconds returns the SSE idle timeout in seconds.
+func (s *Store) GetIdleTimeoutSeconds() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeTimeout(s.config.IdleTimeoutSeconds, DefaultIdleTimeoutSeconds, MaxIdleTimeoutSeconds)
+}
+
+// SetChatTimeoutSeconds validates and persists the chat response-header
+// timeout in seconds.
+func (s *Store) SetChatTimeoutSeconds(n int) error {
+	if err := ValidateTimeoutSeconds(n, MaxChatTimeoutSeconds); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.config.ChatTimeoutSeconds = n
+	s.mu.Unlock()
+	return s.save()
+}
+
+// SetIdleTimeoutSeconds validates and persists the SSE idle timeout in
+// seconds.
+func (s *Store) SetIdleTimeoutSeconds(n int) error {
+	if err := ValidateTimeoutSeconds(n, MaxIdleTimeoutSeconds); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.config.IdleTimeoutSeconds = n
+	s.mu.Unlock()
+	return s.save()
+}
+
+// normalizeTimeout maps 0 to def and clamps above max.
+func normalizeTimeout(n, def, max int) int {
+	if n <= 0 {
+		return def
+	}
+	if n > max {
+		return max
+	}
+	return n
 }
 
 // --- Password ---
