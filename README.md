@@ -76,6 +76,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
 | `QODER_CHAT_TIMEOUT_SECONDS` | `120` | Chat 响应超时：等待上游开始响应（返回响应头）的最长秒数，范围 1-3600；设置后管理面板中不可修改 |
 | `QODER_IDLE_TIMEOUT_SECONDS` | `300` | 流空闲超时：流式响应中持续无数据的最长等待秒数，范围 1-3600（数据持续到达时流不会被中断）；设置后管理面板中不可修改 |
+| `QODER_MAX_CONCURRENCY` | `1` | 单 PAT 同时发往上游的聊天请求数上限；超出部分本地排队等待。调大会提升吞吐，但超过 Qoder 账号的并发窗口时网关会拒绝请求（业务码 10605） |
 
 > 两个超时也可在管理面板「设置 → 超时配置」中修改，保存后即时生效（无需重启）。响应超时只约束上游「开始响应」，不会截断已经建立的流。
 

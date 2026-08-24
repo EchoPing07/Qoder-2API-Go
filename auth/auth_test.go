@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -262,5 +263,89 @@ func TestOpenStreamLinesIdleTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("idle timeout fired too late: %s", elapsed)
+	}
+}
+
+// TestBusyErrorParsing locks the classification of gateway admission-control
+// rejections (code 10605): they must surface as BusyError, never AuthError,
+// regardless of whether they arrive as an HTTP 401/403 body or an in-stream
+// control frame.
+func TestBusyErrorParsing(t *testing.T) {
+	// HTTP envelope: body prefixed with the upstream status ("403 {...").
+	envBody := []byte(`403 {"code":"10605","message":"{\"isQueued\":false,\"modelKey\":\"qmodel_38max\",\"queueCount\":0,\"queueType\":\"slow\",\"retryAfterSeconds\":2,\"serviceAvailable\":true,\"waitTime\":0}"}`)
+	busy := busyFromAuthEnvelope(401, envBody)
+	if busy == nil {
+		t.Fatal("expected BusyError from 10605 envelope, got nil")
+	}
+	if busy.RetryAfter != 2*time.Second {
+		t.Errorf("RetryAfter = %v, want 2s", busy.RetryAfter)
+	}
+
+	// A genuine auth failure must still classify as AuthError.
+	if busyFromAuthEnvelope(403, []byte(`{"code":"401","message":"unauthorized"}`)) != nil {
+		t.Error("non-10605 body must not be a BusyError")
+	}
+
+	// In-stream frame with statusCodeValue 403 + code 10605.
+	frame := `data: {"body":"{\"code\":\"10605\",\"message\":\"{\\\"retryAfterSeconds\\\":2}\"}","statusCode":"FORBIDDEN","statusCodeValue":403}`
+	inStream := detectInStreamBusyError(frame)
+	if inStream == nil {
+		t.Fatal("expected BusyError from in-stream 10605 frame, got nil")
+	}
+	if inStream.RetryAfter != 2*time.Second {
+		t.Errorf("in-stream RetryAfter = %v, want 2s", inStream.RetryAfter)
+	}
+	// ...and must NOT be misread as an auth error.
+	if isAuth, _ := detectInStreamAuthError(frame); isAuth {
+		t.Error("10605 frame must not be classified as an auth error")
+	}
+}
+
+// Numeric "code" variants (10605 as a JSON number instead of a string) must
+// still classify as busy, on both the HTTP-envelope and in-stream paths.
+func TestBusyErrorNumericCode(t *testing.T) {
+	env := []byte(`{"code":10605,"message":"{\"retryAfterSeconds\":3}"}`)
+	busy := busyFromAuthEnvelope(403, env)
+	if busy == nil {
+		t.Fatal("expected BusyError for numeric code, got nil")
+	}
+	if busy.RetryAfter != 3*time.Second {
+		t.Errorf("RetryAfter = %v, want 3s", busy.RetryAfter)
+	}
+
+	frame := `data: {"body":"{\"code\":10605,\"message\":\"{}\"}","statusCodeValue":401}`
+	if detectInStreamBusyError(frame) == nil {
+		t.Fatal("expected BusyError for numeric in-stream code, got nil")
+	}
+}
+
+// A truncated 10605 body (larger than the read cap) must not silently fall
+// back to AuthError classification.
+func TestBusyErrorFromLongBody(t *testing.T) {
+	longMsg := `{"isQueued":false,"modelKey":"` + strings.Repeat("m", 4096) + `","retryAfterSeconds":2}`
+	body := []byte(`{"code":"10605","message":` + strconv.Quote(longMsg) + `}`)
+	if busyFromAuthEnvelope(401, body) == nil {
+		t.Fatal("expected BusyError for long 10605 body within read cap, got nil")
+	}
+}
+
+// The upstream-provided message echoed into errors must be length-capped.
+func TestBusyErrorMessageCapped(t *testing.T) {
+	msg := strings.Repeat("x", 10000)
+	busy := busyFromAuthEnvelope(403, []byte(`{"code":"10605","message":"`+msg+`"}`))
+	if busy == nil {
+		t.Fatal("expected BusyError")
+	}
+	if got := len([]rune(busy.Message)); got > maxBusyMessageRunes+10 {
+		t.Errorf("message not capped: %d runes", got)
+	}
+}
+
+// Content-delta frames without a statusCodeValue envelope must skip the busy
+// pre-filter cheaply (no false positives either way).
+func TestDetectInStreamBusyIgnoresPlainDeltas(t *testing.T) {
+	line := `data: {"body":"{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"}`
+	if detectInStreamBusyError(line) != nil {
+		t.Error("plain content delta must not be classified as busy")
 	}
 }

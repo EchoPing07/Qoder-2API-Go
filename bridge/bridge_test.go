@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -544,7 +545,7 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	})
 	stackTrace, _ := json.Marshal(map[string]interface{}{
 		"localizedMessage": "Unknown sse issue",
-		"stackTrace":        []interface{}{},
+		"stackTrace":       []interface{}{},
 	})
 	bareFail, _ := json.Marshal(map[string]interface{}{
 		"success": false, "msgCode": float64(500),
@@ -635,5 +636,175 @@ func TestHandleStreamMiniMaxStyleFinishEvent(t *testing.T) {
 	}
 	if usageSeen == nil || usageSeen.PromptTokens != 48 {
 		t.Errorf("usage sink not invoked correctly: %+v", usageSeen)
+	}
+}
+
+// busyGateway is a fake upstream that rejects the first N chat requests with
+// a 10605 admission-control frame and counts jobToken exchanges, so tests can
+// verify that busy retries do NOT trigger a token refresh.
+type busyGateway struct {
+	busyFirstN int
+	chatHits   int
+	tokenHits  int
+}
+
+func newBusyBridge(t *testing.T, gw *busyGateway) *OpenAiBridge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		gw.tokenHits++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+	})
+	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		gw.chatHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		if gw.chatHits <= gw.busyFirstN {
+			io.WriteString(w, `data: {"body":"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":false,\\\"modelKey\\\":\\\"qmodel_38max\\\",\\\"queueCount\\\":0,\\\"queueType\\\":\\\"slow\\\",\\\"retryAfterSeconds\\\":1,\\\"serviceAvailable\\\":true,\\\"waitTime\\\":0}\"}","statusCode":"FORBIDDEN","statusCodeValue":403}`+"\n\n")
+			flusher.Flush()
+			return
+		}
+		for _, l := range []string{
+			sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+			"data: [DONE]",
+		} {
+			fmt.Fprintf(w, "%s\n\n", l)
+			flusher.Flush()
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL}
+	b := NewOpenAiBridge("pt-test", region)
+	orig := busyFallbackBackoff
+	busyFallbackBackoff = 5 * time.Millisecond
+	t.Cleanup(func() { busyFallbackBackoff = orig })
+	return b
+}
+
+func chatRequest(model string) map[string]interface{} {
+	return map[string]interface{}{
+		"model":    model,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}
+}
+
+// A 10605 rejection before any content must be retried once after back-off,
+// and the retry must NOT refresh the job token (the session is still valid).
+func TestHandleChatBusyRetriesWithoutTokenRefresh(t *testing.T) {
+	gw := &busyGateway{busyFirstN: 1}
+	b := newBusyBridge(t, gw)
+
+	w := httptest.NewRecorder()
+	if err := b.HandleChat(context.Background(), w, chatRequest("Fake-Model"), nil); err != nil {
+		t.Fatalf("HandleChat after busy retry: %v", err)
+	}
+	if !strings.Contains(w.Body.String(), `"content":"ok"`) {
+		t.Errorf("expected successful content after retry, got:\n%s", w.Body.String())
+	}
+	if gw.chatHits != 2 {
+		t.Errorf("chat hits = %d, want 2 (one rejection + one retry)", gw.chatHits)
+	}
+	if gw.tokenHits != 1 {
+		t.Errorf("jobToken exchanges = %d, want 1 (bootstrap only; busy must not force a refresh)", gw.tokenHits)
+	}
+}
+
+// When both attempts are rejected the busy error surfaces; via the HTTP
+// handler it maps to 429 (not 500), carrying Retry-After for sync callers.
+func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
+	gw := &busyGateway{busyFirstN: 99}
+	b := newBusyBridge(t, gw)
+
+	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	handler(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429\n%s", w.Code, w.Body.String())
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" || ra == "0" {
+		t.Errorf("Retry-After header missing/invalid: %q", ra)
+	}
+
+	// Streaming path: the error chunk carries the busy message and no second
+	// HTTP-level response is attempted.
+	w2 := httptest.NewRecorder()
+	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer sk-test")
+	handler(w2, req2)
+	if w2.Code != 200 {
+		t.Errorf("streaming status = %d, want 200 (SSE headers already sent)", w2.Code)
+	}
+	if !strings.Contains(w2.Body.String(), "10605") {
+		t.Errorf("stream body should carry the busy code:\n%s", w2.Body.String())
+	}
+}
+
+// Parallel requests queue on the per-PAT slot instead of all hitting the
+// gateway at once: with one slot, gateway concurrency never exceeds 1.
+func TestChatSlotsSerializeUpstreamCalls(t *testing.T) {
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+	})
+	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		n := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if n <= old || maxInFlight.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for _, l := range []string{
+			sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+			"data: [DONE]",
+		} {
+			fmt.Fprintf(w, "%s\n\n", l)
+			flusher.Flush()
+		}
+		inFlight.Add(-1)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL}
+	b := NewOpenAiBridge("pt-test", region)
+
+	const parallel = 4
+	done := make(chan error, parallel)
+	for i := 0; i < parallel; i++ {
+		go func() {
+			w := httptest.NewRecorder()
+			done <- b.HandleChat(context.Background(), w, chatRequest("Fake-Model"), nil)
+		}()
+	}
+	for i := 0; i < parallel; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("parallel HandleChat: %v", err)
+		}
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Errorf("max concurrent upstream calls = %d, want 1 (default slot limit)", got)
 	}
 }

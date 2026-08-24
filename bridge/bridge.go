@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,6 +178,11 @@ type OpenAiBridge struct {
 	catalog      *models.ModelCatalog
 	catalogTs    float64
 	catalogInflt bool // single-flight: a fetch is already in progress
+
+	// chatSlots bounds concurrent upstream chat requests per PAT. Exceeding
+	// the gateway's per-account admission window yields business code 10605
+	// ("gateway busy") over HTTP 401/403, so we queue locally instead.
+	chatSlots chan struct{}
 }
 
 // NewOpenAiBridge creates a new bridge for the given PAT.
@@ -200,7 +206,23 @@ func NewOpenAiBridge(pat string, region *auth.RegionConfig) *OpenAiBridge {
 		machineID:    machineID,
 		machineToken: machineToken,
 		machineType:  machineType,
+		chatSlots:    make(chan struct{}, maxUpstreamConcurrency()),
 	}
+}
+
+// maxUpstreamConcurrency returns the per-PAT limit on concurrent upstream
+// chat requests. The Qoder gateway enforces a strict per-account admission
+// window per model and rejects excess requests with business code 10605
+// (delivered over HTTP 401/403), so requests are queued locally by default
+// instead of tripping the gateway limiter. Override via QODER_MAX_CONCURRENCY.
+func maxUpstreamConcurrency() int {
+	if v := os.Getenv("QODER_MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 32 {
+			return n
+		}
+		log.Printf("[bridge] WARN invalid QODER_MAX_CONCURRENCY=%q; using 1", v)
+	}
+	return 1
 }
 
 // bootstrapSession performs a cold PAT → jobToken exchange.
@@ -419,10 +441,17 @@ func (b *OpenAiBridge) GetCatalog(ctx context.Context) *models.ModelCatalog {
 	return cat
 }
 
+// busyFallbackBackoff is used when a 10605 rejection carries no usable
+// retryAfterSeconds (or an implausible one). A package var so tests can
+// shorten the wait.
+var busyFallbackBackoff = 2 * time.Second
+
 // openStreamAsync opens the SSE stream with auth retry (refresh once on 401
-// before any content is produced).
+// before any content is produced) and busy back-off (gateway queue/
+// concurrency rejections, code 10605, are retried once after the server-
+// suggested delay instead of triggering a pointless token refresh).
 func (b *OpenAiBridge) openStreamAsync(ctx context.Context, url string, jsonBody []byte, extraHeaders map[string]string, callback func(line string) error) error {
-	for attempt := 1; attempt <= 2; attempt++ {
+	for attempt := 1; ; attempt++ {
 		sess := b.currentSess()
 		produced := false
 		err := auth.OpenStreamLines(ctx, sess, url, jsonBody, extraHeaders, func(line string) error {
@@ -444,9 +473,25 @@ func (b *OpenAiBridge) openStreamAsync(ctx context.Context, url string, jsonBody
 			}
 			continue
 		}
+		var busyErr *auth.BusyError
+		if errors.As(err, &busyErr) {
+			if produced || attempt >= 2 {
+				return err
+			}
+			wait := busyErr.RetryAfter
+			if wait <= 0 || wait > 10*time.Second {
+				wait = busyFallbackBackoff
+			}
+			log.Printf("[bridge] gateway busy (%s); backing off %s then retrying once", busyErr.Code, wait)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
 		return err
 	}
-	return nil
 }
 
 // UsageSink receives the gateway usage frame of a completed request (may be
@@ -542,6 +587,21 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 
 	reqID := "chatcmpl-" + uuid.New().String()[:24]
 	created := time.Now().Unix()
+
+	// Admission gate: hold one slot for the whole upstream exchange so
+	// parallel client requests queue here instead of being rejected by the
+	// gateway's concurrency limiter (code 10605).
+	select {
+	case b.chatSlots <- struct{}{}:
+	default:
+		log.Printf("[bridge] all %d upstream slot(s) busy; queuing request", cap(b.chatSlots))
+		select {
+		case b.chatSlots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { <-b.chatSlots }()
 
 	jsonBody, err := marshalNoEscape(body)
 	if err != nil {
@@ -826,6 +886,18 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 			var valErr *models.UnsupportedModelError
 			if errors.As(err, &valErr) {
 				writeError(w, 400, "invalid_request_error", valErr.Error())
+				record(false)
+				return
+			}
+			var busyErr *auth.BusyError
+			if errors.As(err, &busyErr) {
+				// Gateway admission-control rejection, not a server fault:
+				// surface it as 429 with Retry-After so clients back off.
+				if busyErr.RetryAfter > 0 {
+					retrySecs := int((busyErr.RetryAfter + time.Second - 1) / time.Second)
+					w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+				}
+				writeError(w, 429, "rate_limit_error", "upstream busy: "+busyErr.Message)
 				record(false)
 				return
 			}

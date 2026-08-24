@@ -337,6 +337,104 @@ func (e *AuthError) Error() string {
 	return s
 }
 
+// --- Gateway busy (queue/concurrency) errors ---
+
+// errBodyCap bounds how much of an upstream error response is read for
+// classification and reporting. The former 300-byte cap could truncate a
+// 10605 envelope mid-JSON, making it unparseable and misclassifying the
+// rejection as an auth failure.
+const errBodyCap = 4 << 10 // 4 KiB
+
+// QoderBusyCode is the gateway's business code for queue/admission-control
+// rejections. It rides HTTP 401/403 envelopes (and in-stream frames with a
+// matching statusCodeValue) even though the session is perfectly valid:
+//
+//	{"code":"10605","message":"{\"isQueued\":false,...,\"retryAfterSeconds\":2,...}"}
+//
+// Treating it as an auth failure causes a pointless token refresh followed
+// by an immediate retry that slams into the same concurrency window.
+const QoderBusyCode = "10605"
+
+// BusyError is a gateway queue/concurrency rejection (business code 10605).
+// The session is valid; the request was refused by admission control and may
+// succeed after RetryAfter.
+type BusyError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	RetryAfter time.Duration
+}
+
+func (e *BusyError) Error() string {
+	s := fmt.Sprintf("gateway busy (%s): %s", e.Code, e.Message)
+	if e.RetryAfter > 0 {
+		s += fmt.Sprintf(" (retry after %s)", e.RetryAfter)
+	}
+	return s
+}
+
+// busyMeta extracts retryAfterSeconds from the nested JSON message carried
+// inside a 10605 payload, if present.
+func busyMeta(msg string) time.Duration {
+	var meta struct {
+		RetryAfterSeconds int `json:"retryAfterSeconds"`
+	}
+	if strings.HasPrefix(strings.TrimSpace(msg), "{") && json.Unmarshal([]byte(msg), &meta) == nil && meta.RetryAfterSeconds > 0 {
+		return time.Duration(meta.RetryAfterSeconds) * time.Second
+	}
+	return 0
+}
+
+// maxBusyMessageRunes caps the upstream-provided busy message echoed into
+// logs and client-facing error bodies.
+const maxBusyMessageRunes = 512
+
+func truncateBusyMessage(s string) string {
+	r := []rune(s)
+	if len(r) <= maxBusyMessageRunes {
+		return s
+	}
+	return string(r[:maxBusyMessageRunes]) + "…"
+}
+
+// busyCodeOf normalizes a JSON "code" field that may arrive as a string
+// ("10605") or a number (10605).
+func busyCodeOf(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var n float64
+	if json.Unmarshal(raw, &n) == nil && n == float64(int64(n)) {
+		return strconv.FormatInt(int64(n), 10)
+	}
+	return ""
+}
+
+// busyFromAuthEnvelope parses a 401/403 response body and returns a
+// BusyError when it is a queue/concurrency rejection rather than an auth
+// failure. Bodies seen in the wild are prefixed with an upstream status
+// ("403 {..."), so decoding starts at the first '{'.
+func busyFromAuthEnvelope(statusCode int, body []byte) *BusyError {
+	s := strings.TrimSpace(string(body))
+	if i := strings.IndexByte(s, '{'); i > 0 {
+		s = s[i:]
+	}
+	var outer struct {
+		Code    json.RawMessage `json:"code"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal([]byte(s), &outer) != nil || busyCodeOf(outer.Code) != QoderBusyCode {
+		return nil
+	}
+	busy := &BusyError{StatusCode: statusCode, Code: QoderBusyCode}
+	if outer.Message != "" {
+		busy.Message = truncateBusyMessage(outer.Message)
+		busy.RetryAfter = busyMeta(outer.Message)
+	}
+	return busy
+}
+
 // --- Signature API Client ---
 
 func commonHeaders(machineID, machineToken, machineType, date, sig string) http.Header {
@@ -381,9 +479,12 @@ func postEncoded(ctx context.Context, urlStr string, obj interface{}, machineID,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
 		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if busy := busyFromAuthEnvelope(resp.StatusCode, detail); busy != nil {
+				return nil, busy
+			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
 		return nil, fmt.Errorf("HTTP %d at %s body=%s", resp.StatusCode, urlStr, string(detail))
@@ -537,9 +638,12 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
 		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if busy := busyFromAuthEnvelope(resp.StatusCode, detail); busy != nil {
+				return nil, busy
+			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
 		return nil, fmt.Errorf("HTTP %d body=%s", resp.StatusCode, string(detail))
@@ -631,7 +735,9 @@ func isDoneLine(line string) bool {
 	if payload == "[DONE]" {
 		return true
 	}
-	var env struct{ Body string `json:"body"` }
+	var env struct {
+		Body string `json:"body"`
+	}
 	if json.Unmarshal([]byte(payload), &env) == nil && env.Body == "[DONE]" {
 		return true
 	}
@@ -674,12 +780,12 @@ func (e *inStreamError) Error() string {
 // from an SSE data line. Two shapes are recognized:
 //
 //  1. Envelope frame with an HTTP error status, e.g. (qmodel_preview
-//	     provider outage):
-//	     {"body":"{\"code\":\"provider_error\",\"message\":\"All backends failed\"...}",
-//	      "statusCodeValue":429,"statusCode":"TOO_MANY_REQUESTS"}
+//     provider outage):
+//     {"body":"{\"code\":\"provider_error\",\"message\":\"All backends failed\"...}",
+//     "statusCodeValue":429,"statusCode":"TOO_MANY_REQUESTS"}
 //
 //  2. Bare success:false gateway error frame, e.g.
-//	     {"success":false,"msgCode":500,"message":"Internal Server Error"}
+//     {"success":false,"msgCode":500,"message":"Internal Server Error"}
 //
 // A 200 OK envelope with normal chat/usage/[DONE] bodies returns nil.
 func detectInStreamGatewayError(line string) *inStreamError {
@@ -688,9 +794,9 @@ func detectInStreamGatewayError(line string) *inStreamError {
 	}
 	payload := strings.TrimSpace(line[len("data:"):])
 	var env struct {
-		Body          string `json:"body"`
-		StatusCode    string `json:"statusCode"`
-		StatusValue   int    `json:"statusCodeValue"`
+		Body        string `json:"body"`
+		StatusCode  string `json:"statusCode"`
+		StatusValue int    `json:"statusCodeValue"`
 	}
 	if err := json.Unmarshal([]byte(payload), &env); err != nil {
 		return nil
@@ -707,10 +813,10 @@ func detectInStreamGatewayError(line string) *inStreamError {
 		return nil
 	}
 	var bare struct {
-		Success  bool             `json:"success"`
-		MsgCode  int              `json:"msgCode"`
-		MsgInfo  string           `json:"msgInfo"`
-		Message  string           `json:"message"`
+		Success bool   `json:"success"`
+		MsgCode int    `json:"msgCode"`
+		MsgInfo string `json:"msgInfo"`
+		Message string `json:"message"`
 	}
 	if err := json.Unmarshal([]byte(payload), &bare); err != nil {
 		return nil
@@ -775,9 +881,12 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyCap))
 		drainBody(resp.Body)
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if busy := busyFromAuthEnvelope(resp.StatusCode, errBody); busy != nil {
+				return busy
+			}
 			return &AuthError{StatusCode: resp.StatusCode, Detail: string(errBody)}
 		}
 		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(errBody))
@@ -861,6 +970,9 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 		if e := detectInStreamGatewayError(line); e != nil && gwErr == nil {
 			gwErr = e
 		}
+		if busy := detectInStreamBusyError(line); busy != nil {
+			return busy
+		}
 		isAuthErr, detail := detectInStreamAuthError(line)
 		if isAuthErr {
 			return &AuthError{StatusCode: 401, Detail: detail}
@@ -889,7 +1001,57 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	return nil
 }
 
+// detectInStreamBusyError reports whether an SSE frame carries the
+// gateway's queue/concurrency rejection (code 10605) under a 401/403
+// statusCodeValue. Such frames look like auth failures but are admission-
+// control refusals; the caller should back off instead of refreshing tokens.
+func detectInStreamBusyError(line string) *BusyError {
+	s := strings.TrimSpace(line)
+	if !strings.HasPrefix(s, "data:") {
+		return nil
+	}
+	// Cheap pre-filter: busy frames always ride a statusCodeValue envelope.
+	// Without this every content delta (potentially large base64 payloads)
+	// would pay a full JSON unmarshal per line.
+	if !strings.Contains(s, "statusCodeValue") {
+		return nil
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s[5:])), &obj); err != nil {
+		return nil
+	}
+	scv, ok := obj["statusCodeValue"].(float64)
+	if !ok || (scv != 401 && scv != 403) {
+		return nil
+	}
+	bodyMap, ok := parseBody(obj).(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	var code string
+	switch c := bodyMap["code"].(type) {
+	case string:
+		code = c
+	case float64:
+		if c == float64(int64(c)) {
+			code = strconv.FormatInt(int64(c), 10)
+		}
+	}
+	if code != QoderBusyCode {
+		return nil
+	}
+	busy := &BusyError{StatusCode: int(scv), Code: code}
+	if msg, _ := bodyMap["message"].(string); msg != "" {
+		busy.Message = truncateBusyMessage(msg)
+		busy.RetryAfter = busyMeta(msg)
+	}
+	return busy
+}
+
 // detectInStreamAuthError detects auth failures inside the SSE stream.
+// Queue/concurrency rejections (code 10605) share the 401/403 envelope but
+// are NOT auth failures; they are left to detectInStreamBusyError so callers
+// can distinguish "token expired" (refresh + retry) from "back off".
 func detectInStreamAuthError(line string) (bool, string) {
 	s := strings.TrimSpace(line)
 	if !strings.HasPrefix(s, "data:") {
@@ -897,6 +1059,9 @@ func detectInStreamAuthError(line string) (bool, string) {
 	}
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(s[5:])), &obj); err != nil {
+		return false, ""
+	}
+	if detectInStreamBusyError(line) != nil {
 		return false, ""
 	}
 	scv, ok := obj["statusCodeValue"].(float64)
