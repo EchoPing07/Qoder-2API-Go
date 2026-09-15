@@ -288,8 +288,14 @@ func TestServeIndex(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "<!DOCTYPE html>") {
+	body := w.Body.String()
+	if !strings.Contains(body, "<!DOCTYPE html>") {
 		t.Error("expected HTML doctype")
+	}
+	for _, want := range []string{`id="quotaCard"`, `id="quotaTable"`, "renderQuotaDetails(d)", "组织资源包"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected quota detail UI marker %q", want)
+		}
 	}
 }
 

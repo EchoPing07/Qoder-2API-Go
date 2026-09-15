@@ -387,7 +387,7 @@ code, .mono, .num {
   margin-top: 6px;
 }
 .stat-sub .badge { margin-left: 6px; vertical-align: middle; }
-.stat-sub .badge.neutral {
+.badge.neutral {
   background: var(--surface-2);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -861,6 +861,21 @@ input[readonly] {
         </div>
       </div>
 
+      <div class="card hidden" id="quotaCard">
+        <div class="card-head">
+          <div class="card-title">额度明细<small>Qoder 官方账号级额度，每分钟刷新</small></div>
+          <div class="chart-legend"><span class="num" id="quotaSummary"></span></div>
+        </div>
+        <div class="card-body flush">
+          <table>
+            <thead>
+              <tr><th>额度来源</th><th class="num">已用 / 总额</th><th class="num">剩余</th><th class="num" style="width:200px">使用率</th><th>状态</th></tr>
+            </thead>
+            <tbody id="quotaTable"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head">
           <div class="card-title">近 24 小时请求量</div>
@@ -1203,6 +1218,7 @@ function loadStats() {
     document.getElementById('statReqSub').textContent = '成功率 ' + pct(d.success_rate);
     document.getElementById('statTokens').textContent = fmt(tokens);
     renderCredits(d);
+    renderQuotaDetails(d);
     document.getElementById('statPrompt').textContent = fmt(d.prompt_tokens);
     document.getElementById('statCached').textContent = '缓存命中 ' + fmt(d.cached_tokens);
     document.getElementById('statCompletion').textContent = fmt(d.completion_tokens);
@@ -1270,6 +1286,68 @@ function renderCredits(d) {
   } else if (acct.tag) {
     el.appendChild(makeBadge(acct.tag, 'neutral'));
   }
+}
+
+/*
+ * Render every allowance pool returned by Qoder as visible content. The
+ * compact stat line intentionally remains a plan summary; this table prevents
+ * add-on and organization packages from being hidden behind a hover tooltip.
+ */
+function renderQuotaDetails(d) {
+  var card = document.getElementById('quotaCard');
+  var table = document.getElementById('quotaTable');
+  var summary = document.getElementById('quotaSummary');
+  var acct = d.account || {};
+  var pools = [];
+
+  if (acct.user_quota) {
+    pools.push({ name: '套餐额度', quota: acct.user_quota, totalKey: 'total', available: true });
+  }
+  if (acct.add_on_quota) {
+    pools.push({ name: '加购额度', quota: acct.add_on_quota, totalKey: 'total', available: true });
+  }
+  if (acct.org_resource_package) {
+    pools.push({
+      name: '组织资源包',
+      quota: acct.org_resource_package,
+      totalKey: 'cap',
+      available: Boolean(acct.org_resource_package.available)
+    });
+  }
+
+  if (pools.length === 0) {
+    card.classList.add('hidden');
+    table.textContent = '';
+    summary.textContent = '';
+    return;
+  }
+
+  card.classList.remove('hidden');
+  table.textContent = '';
+  var totalRemaining = 0;
+  pools.forEach(function(pool) {
+    var used = Number(pool.quota.used || 0);
+    var total = Number(pool.quota[pool.totalKey] || 0);
+    var remaining = Number(pool.quota.remaining || 0);
+    var ratio = total > 0 ? Math.min(Math.max(used / total, 0), 1) : 0;
+    var statusText = pool.available ? (remaining > 0 ? '可用' : '已用尽') : '不可用';
+    var statusKind = pool.available && remaining > 0 ? 'ok' : (pool.available ? 'bad' : 'neutral');
+    totalRemaining += remaining;
+
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + pool.name + '</td>' +
+      '<td class="num">' + fmtCredits(used) + ' / ' + (total >= 0 ? fmtCredits(total) : '—') + '</td>' +
+      '<td class="num">' + fmtCredits(remaining) + '</td>' +
+      '<td><div class="rate-cell"><div class="rate-bar"><div class="rate-fill" style="width:' + (ratio * 100) + '%"></div></div>' +
+      '<span class="rate-text num">' + Math.round(ratio * 100) + '%</span></div></td>' +
+      '<td><span class="badge ' + statusKind + '">' + statusText + '</span></td>';
+    table.appendChild(tr);
+  });
+
+  var resetMs = Number(d.next_reset_ms || 0);
+  summary.textContent = '合计剩余 ' + fmtCredits(totalRemaining) +
+    (resetMs > 0 ? ' · ' + fmtMonthDay(resetMs) + ' 重置' : '');
 }
 
 function makeBadge(text, kind) {
