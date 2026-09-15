@@ -505,3 +505,75 @@ func TestConfigPartialInvalidTimeoutAppliesNothing(t *testing.T) {
 		t.Errorf("hot-apply must not run on rejected input, got %s", timeouts.Header)
 	}
 }
+
+// The billing-cycle fields and account metadata must reach the panel through
+// the stats endpoint, so the UI can render cycle-relative credits without any
+// network call of its own.
+func TestStatsEndpointExposesBillingCycle(t *testing.T) {
+	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
+	rec := stats.NewRecorder(nil)
+	rec.SetBillingCycle(reset.UnixMilli())
+	rec.SetAccount(&stats.Account{Plan: "PLAN_TIER_TEAM", Tag: "Teams"})
+	rec.RecordUsage(&stats.Usage{PromptTokens: 5, Credits: 1.25})
+
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+
+	var resp struct {
+		Credits      float64 `json:"credits"`
+		CycleCredits float64 `json:"cycle_credits"`
+		CycleStartMs int64   `json:"cycle_start_ms"`
+		NextResetMs  int64   `json:"next_reset_ms"`
+		Account      *struct {
+			Plan            string `json:"plan"`
+			Tag             string `json:"tag"`
+			IsQuotaExceeded bool   `json:"is_quota_exceeded"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.NextResetMs != reset.UnixMilli() {
+		t.Errorf("expected next_reset_ms %d, got %d", reset.UnixMilli(), resp.NextResetMs)
+	}
+	wantStart := time.Date(2026, time.August, 25, 0, 0, 0, 0, time.Local).UnixMilli()
+	if resp.CycleStartMs != wantStart {
+		t.Errorf("expected cycle_start_ms %d (one calendar month back), got %d", wantStart, resp.CycleStartMs)
+	}
+	if resp.CycleCredits < 1.25-1e-9 || resp.CycleCredits > 1.25+1e-9 {
+		t.Errorf("expected cycle_credits 1.25, got %v", resp.CycleCredits)
+	}
+	if resp.Account == nil || resp.Account.Tag != "Teams" || resp.Account.Plan != "PLAN_TIER_TEAM" {
+		t.Errorf("expected account metadata in the response, got %+v", resp.Account)
+	}
+}
+
+// With no account status ever resolved the cycle fields stay zero and the
+// account is omitted, which is what makes the UI fall back to the lifetime
+// total instead of rendering a bogus "resetting soon".
+func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
+	rec := stats.NewRecorder(nil)
+	rec.RecordUsage(&stats.Usage{Credits: 2})
+
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+
+	var resp struct {
+		Credits      float64        `json:"credits"`
+		NextResetMs  int64          `json:"next_reset_ms"`
+		CycleCredits float64        `json:"cycle_credits"`
+		Account      map[string]any `json:"account"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.NextResetMs != 0 {
+		t.Errorf("expected no reset boundary, got %d", resp.NextResetMs)
+	}
+	if resp.Credits < 2-1e-9 || resp.Credits > 2+1e-9 {
+		t.Errorf("lifetime credits must still accrue with no cycle known, got %v", resp.Credits)
+	}
+	if resp.Account != nil {
+		t.Errorf("expected account to be omitted, got %+v", resp.Account)
+	}
+}

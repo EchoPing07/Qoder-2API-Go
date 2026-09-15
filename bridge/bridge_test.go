@@ -206,11 +206,13 @@ func TestNeedsRefreshWithUnknownExpiry(t *testing.T) {
 	if !b.needsRefresh() {
 		t.Fatal("fresh bridge must need refresh (no session)")
 	}
+	// An empty resolved tier falls back to the jobToken value, matching the
+	// pre-user/status behaviour.
 	b.applyJobToken(map[string]interface{}{
 		"name": "u", "id": "1", "userType": "personal_standard",
 		"refreshToken": "r", "securityOauthToken": "s",
 		"expireTime": nil, // missing expiry
-	})
+	}, "")
 	if b.needsRefresh() {
 		t.Error("missing expireTime must fall back to TTL-based freshness, not always-refresh")
 	}
@@ -229,7 +231,7 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 	if b.currentIdentity() != nil {
 		t.Fatal("expected nil identity before bootstrap")
 	}
-	b.applyJobToken(map[string]interface{}{"name": "u", "id": "1", "expireTime": float64(1e15)})
+	b.applyJobToken(map[string]interface{}{"name": "u", "id": "1", "expireTime": float64(1e15)}, "")
 	id := b.currentIdentity()
 	if id == nil || id.Name != "u" {
 		t.Fatalf("expected identity snapshot, got %+v", id)

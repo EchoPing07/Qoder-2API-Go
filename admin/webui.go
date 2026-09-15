@@ -386,6 +386,12 @@ code, .mono, .num {
   color: var(--muted);
   margin-top: 6px;
 }
+.stat-sub .badge { margin-left: 6px; vertical-align: middle; }
+.stat-sub .badge.neutral {
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
 
 /* ---------- Cards ---------- */
 
@@ -841,7 +847,7 @@ input[readonly] {
         <div class="stat-card">
           <div class="stat-label"><span class="stat-dot success"></span>Token 总数</div>
           <div class="stat-value num" id="statTokens">0</div>
-          <div class="stat-sub num" id="statCredits">Credits 消耗 0</div>
+          <div class="stat-sub num" id="statCredits">本周期 Credits 0</div>
         </div>
         <div class="stat-card">
           <div class="stat-label"><span class="stat-dot rate"></span>总输入</div>
@@ -1196,7 +1202,7 @@ function loadStats() {
     document.getElementById('statTotal').textContent = fmt(d.total);
     document.getElementById('statReqSub').textContent = '成功率 ' + pct(d.success_rate);
     document.getElementById('statTokens').textContent = fmt(tokens);
-    document.getElementById('statCredits').textContent = 'Credits 消耗 ' + fmtCredits(d.credits);
+    renderCredits(d);
     document.getElementById('statPrompt').textContent = fmt(d.prompt_tokens);
     document.getElementById('statCached').textContent = '缓存命中 ' + fmt(d.cached_tokens);
     document.getElementById('statCompletion').textContent = fmt(d.completion_tokens);
@@ -1205,6 +1211,60 @@ function loadStats() {
     renderChart(d.hourly || []);
     renderStatsTable(d.by_model || []);
   }).catch(function(e) { showToast(e.message, 'error'); });
+}
+
+/*
+ * Credits are shown per billing cycle, not as a lifetime total: the gateway
+ * refreshes the subscription allowance monthly, so a cumulative figure keeps
+ * growing past the reset and stops meaning anything.
+ *
+ * The cycle boundary comes from the gateway's /user/status nextResetAt, so no
+ * anchor date has to be configured. The gateway reports no numeric allowance
+ * (quota is 0 for team plans), so there is deliberately no progress bar or
+ * percentage — only what is actually known.
+ */
+function renderCredits(d) {
+  var el = document.getElementById('statCredits');
+  var lifetime = Number(d.credits || 0);
+  var cycle = Number(d.cycle_credits || 0);
+  var resetMs = Number(d.next_reset_ms || 0);
+  var acct = d.account || {};
+
+  el.textContent = '';
+  el.title = '累计消耗 ' + fmtCredits(lifetime) + '（自服务启用以来）';
+
+  if (resetMs > 0) {
+    el.appendChild(document.createTextNode('本周期 ' + fmtCredits(cycle)));
+    var left = Math.ceil((resetMs - Date.now()) / 86400000);
+    el.appendChild(document.createTextNode(' · ' + fmtMonthDay(resetMs) + ' 重置'));
+    if (left > 0) {
+      el.appendChild(document.createTextNode(' · 剩 ' + left + ' 天'));
+    }
+  } else {
+    // No cycle boundary known (status endpoint never resolved): fall back to
+    // the lifetime total rather than showing a stale zero.
+    el.appendChild(document.createTextNode('Credits 消耗 ' + fmtCredits(lifetime)));
+  }
+
+  if (acct.is_quota_exceeded) {
+    el.appendChild(makeBadge('额度已超', 'bad'));
+  } else if (acct.tag) {
+    el.appendChild(makeBadge(acct.tag, 'neutral'));
+  }
+}
+
+function makeBadge(text, kind) {
+  var b = document.createElement('span');
+  b.className = 'badge ' + kind;
+  b.textContent = text;
+  return b;
+}
+
+function fmtMonthDay(ms) {
+  var t = new Date(ms);
+  var m = t.getMonth() + 1;
+  var day = t.getDate();
+  return (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
 }
 
 function fmtCredits(v) {

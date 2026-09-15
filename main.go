@@ -61,6 +61,11 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	return p.bridge
 }
 
+// accountRefreshCadence is how often the subscription state is re-checked. The
+// bridge caches the upstream result for an hour, so this only bounds how quickly
+// a billing rollover is noticed, not how often the gateway is called.
+const accountRefreshCadence = 10 * time.Minute
+
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
 // deliberately cheap (no upstream calls, no session bootstrap): the body
 // carries readiness details (PAT configured, effective stream timeouts)
@@ -165,6 +170,51 @@ func main() {
 		catalog := b.GetCatalog(ctx)
 		return catalog.Keys()
 	}
+
+	// Subscription account loop: refreshes the plan and billing-cycle boundary
+	// from the gateway's /user/status endpoint out of band, so the admin panel
+	// can render cycle-relative credits straight from the recorder instead of
+	// making an upstream call on every 15s poll.
+	//
+	// The cadence is intentionally shorter than the bridge's 1h account TTL:
+	// most ticks are served from cache, but a tick landing just after a reset
+	// boundary picks up the new cycle within minutes.
+	applyAccount := func(ctx context.Context) {
+		b := provider.currentBridge()
+		if b == nil {
+			return // no PAT configured yet
+		}
+		st := b.EnsureAccountStatus(ctx)
+		if st == nil {
+			return // upstream unreachable: keep the last known state
+		}
+		rec.SetBillingCycle(st.NextResetAtMs)
+		rec.SetAccount(&stats.Account{
+			Plan:            st.Plan,
+			Tag:             st.UserTag,
+			IsQuotaExceeded: st.IsQuotaExceeded,
+		})
+	}
+	go func() {
+		// Fetch once immediately so the panel is populated from the start
+		// rather than after the first tick.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		applyAccount(ctx)
+		cancel()
+
+		ticker := time.NewTicker(accountRefreshCadence)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				applyAccount(ctx)
+				cancel()
+			case <-statsStop:
+				return
+			}
+		}
+	}()
 
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec)

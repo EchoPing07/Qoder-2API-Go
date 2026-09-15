@@ -30,18 +30,45 @@ type HourStat struct {
 	Failed  int64  `json:"failed"`
 }
 
+// Account is the subscription metadata reported by the gateway's
+// /user/status endpoint. It is refreshed out of band (see main's account
+// loop) and persisted alongside the counters so the admin panel can render it
+// from memory instead of making a network call on every poll.
+type Account struct {
+	// Plan is the raw plan identifier ("PLAN_TIER_TEAM", ...).
+	Plan string `json:"plan,omitempty"`
+	// Tag is the human-facing plan label ("Teams", ...).
+	Tag string `json:"tag,omitempty"`
+	// IsQuotaExceeded is the gateway's own verdict on whether the allowance is
+	// exhausted — authoritative, unlike any locally computed estimate.
+	IsQuotaExceeded bool `json:"is_quota_exceeded"`
+}
+
 // Data is the persisted stats snapshot.
 type Data struct {
 	Total   int64 `json:"total"`
 	Success int64 `json:"success"`
 	Failed  int64 `json:"failed"`
 	// Token / billing totals aggregated from the gateway usage frames.
-	PromptTokens     int64                 `json:"prompt_tokens"`
-	CompletionTokens int64                 `json:"completion_tokens"`
-	CachedTokens     int64                 `json:"cached_tokens"`
-	Credits          float64               `json:"credits"`
-	ByModel          map[string]*ModelStat `json:"by_model,omitempty"`
-	Hourly           map[string]*HourStat  `json:"hourly,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	Credits          float64 `json:"credits"`
+	// Billing-cycle scope. The gateway refreshes the subscription allowance
+	// monthly, so the lifetime Credits total above says nothing about what is
+	// left this cycle. These fields make the displayed number cycle-relative.
+	//
+	// NextResetMs is the subscription refresh instant (epoch millis) as
+	// reported by /user/status; CycleStartMs is the start of the cycle that
+	// contains it; CycleCredits is credits consumed since CycleStartMs and is
+	// reset automatically when the cycle rolls over. All three stay 0 when the
+	// account status has never been resolved.
+	NextResetMs  int64                 `json:"next_reset_ms,omitempty"`
+	CycleStartMs int64                 `json:"cycle_start_ms,omitempty"`
+	CycleCredits float64               `json:"cycle_credits,omitempty"`
+	Account      *Account              `json:"account,omitempty"`
+	ByModel      map[string]*ModelStat `json:"by_model,omitempty"`
+	Hourly       map[string]*HourStat  `json:"hourly,omitempty"`
 }
 
 // ModelRow is a per-model report row served to the admin UI.
@@ -69,12 +96,19 @@ type Report struct {
 	Failed      int64   `json:"failed"`
 	SuccessRate float64 `json:"success_rate"`
 	// Token / billing totals.
-	PromptTokens     int64      `json:"prompt_tokens"`
-	CompletionTokens int64      `json:"completion_tokens"`
-	CachedTokens     int64      `json:"cached_tokens"`
-	Credits          float64    `json:"credits"`
-	ByModel          []ModelRow `json:"by_model"`
-	Hourly           []HourRow  `json:"hourly"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
+	Credits          float64 `json:"credits"`
+	// Billing-cycle view of the credits above (all zero when the account
+	// status is unknown).
+	CycleCredits float64 `json:"cycle_credits"`
+	CycleStartMs int64   `json:"cycle_start_ms"`
+	NextResetMs  int64   `json:"next_reset_ms"`
+	// Account is nil when the subscription state has never been resolved.
+	Account *Account   `json:"account,omitempty"`
+	ByModel []ModelRow `json:"by_model"`
+	Hourly  []HourRow  `json:"hourly"`
 }
 
 // Persister persists the stats data (implemented by store.Store).
@@ -136,8 +170,15 @@ func (d *Data) Clone() *Data {
 		CompletionTokens: d.CompletionTokens,
 		CachedTokens:     d.CachedTokens,
 		Credits:          d.Credits,
+		NextResetMs:      d.NextResetMs,
+		CycleStartMs:     d.CycleStartMs,
+		CycleCredits:     d.CycleCredits,
 		ByModel:          make(map[string]*ModelStat, len(d.ByModel)),
 		Hourly:           make(map[string]*HourStat, len(d.Hourly)),
+	}
+	if d.Account != nil {
+		acct := *d.Account
+		cp.Account = &acct
 	}
 	for k, v := range d.ByModel {
 		cp.ByModel[k] = &ModelStat{Model: v.Model, Total: v.Total, Success: v.Success, Failed: v.Failed}
@@ -190,6 +231,10 @@ func (r *Recorder) Record(model string, ok bool) {
 // RecordUsage adds token/billing totals extracted from a gateway usage frame.
 // Called once per successful request when the upstream supplies usage data;
 // missing frames (error-interrupted streams) simply skip this call.
+//
+// Tokens are counted for every frame, but credits only for billable ones: a
+// frame the gateway flags billable=false was not charged to the subscription,
+// so including it would overstate consumption against the cycle allowance.
 func (r *Recorder) RecordUsage(u *Usage) {
 	if u == nil {
 		return
@@ -200,7 +245,84 @@ func (r *Recorder) RecordUsage(u *Usage) {
 	r.data.PromptTokens += int64(u.PromptTokens)
 	r.data.CompletionTokens += int64(u.CompletionTokens)
 	r.data.CachedTokens += int64(u.CachedTokens)
+	if u.NonBillable {
+		return
+	}
 	r.data.Credits += u.Credits
+	r.rollCycleLocked(time.Now().UnixMilli())
+	r.data.CycleCredits += u.Credits
+}
+
+// SetBillingCycle records the subscription boundary reported by /user/status.
+//
+// nextResetMs is the refresh instant; the cycle start is derived by stepping
+// back one calendar month, which matches the gateway's monthly refresh
+// exactly (a fixed 30-day period would drift, e.g. reporting a cycle start of
+// Aug 26 for a Sep 25 reset).
+//
+// Passing 0 (status unavailable) leaves the existing cycle intact rather than
+// discarding accounting that may already be correct. A boundary that still
+// falls inside the cycle currently being tracked refines it without zeroing,
+// so repeated polls never lose accumulated credits.
+func (r *Recorder) SetBillingCycle(nextResetMs int64) {
+	if nextResetMs <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.data.NextResetMs == nextResetMs {
+		return
+	}
+	startMs := addMonthsMs(nextResetMs, -1)
+	if startMs != r.data.CycleStartMs {
+		// A genuinely different cycle: the allowance has been refreshed, so
+		// the previous cycle's credits are stale.
+		r.data.CycleCredits = 0
+	}
+	r.data.NextResetMs = nextResetMs
+	r.data.CycleStartMs = startMs
+	r.dirty = true
+}
+
+// SetAccount records the subscription metadata reported by /user/status.
+//
+// The panel reads this from memory, so storing it here (rather than fetching
+// on demand) keeps the 15s admin poll free of upstream calls. A nil account is
+// ignored so a transient status outage cannot wipe a previously known plan.
+func (r *Recorder) SetAccount(a *Account) {
+	if a == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Copy so a later mutation of the caller's struct cannot change the
+	// persisted snapshot behind the recorder's back.
+	acct := *a
+	r.data.Account = &acct
+	r.dirty = true
+}
+
+// addMonthsMs shifts an epoch-millis instant by n calendar months.
+func addMonthsMs(ms int64, n int) int64 {
+	return time.UnixMilli(ms).Local().AddDate(0, n, 0).UnixMilli()
+}
+
+// rollCycleLocked zeroes the cycle credits once the known reset boundary has
+// passed, then advances the boundary locally. Caller must hold the mutex.
+//
+// The advance is what makes the rollover happen exactly once: without it,
+// every subsequent request would still see nowMs >= NextResetMs and wipe the
+// fresh total. /user/status later supplies the authoritative boundary, which
+// SetBillingCycle reconciles without zeroing when it names the same cycle.
+//
+// A loop rather than a single step covers a service that stayed down across
+// several cycles.
+func (r *Recorder) rollCycleLocked(nowMs int64) {
+	for r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs {
+		r.data.CycleStartMs = r.data.NextResetMs
+		r.data.NextResetMs = addMonthsMs(r.data.NextResetMs, 1)
+		r.data.CycleCredits = 0
+	}
 }
 
 // Usage is the token accounting payload produced by transform.Usage.
@@ -210,6 +332,11 @@ type Usage struct {
 	CompletionTokens int
 	CachedTokens     int
 	Credits          float64
+	// NonBillable mirrors the gateway's charge flag, inverted on purpose: a
+	// bool field named Billable would zero to false, so any caller that forgot
+	// to set it would silently drop every credit. This way the zero value
+	// means "billable", which is both the common case and the safe one.
+	NonBillable bool
 }
 
 // Flush persists pending data if anything changed since the last flush.
@@ -255,6 +382,19 @@ func (r *Recorder) Report() *Report {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Roll the cycle on read as well as on write: the admin panel polls this
+	// every 15s, so an idle service would otherwise keep reporting the
+	// previous cycle's credits long after the boundary passed. The rollover is
+	// idempotent, so this costs nothing once it has already happened.
+	//
+	// Dirty is set only when the boundary actually moved, so a plain read poll
+	// never forces a disk write.
+	prevReset := r.data.NextResetMs
+	r.rollCycleLocked(time.Now().UnixMilli())
+	if r.data.NextResetMs != prevReset {
+		r.dirty = true
+	}
+
 	rep := &Report{
 		Total:            r.data.Total,
 		Success:          r.data.Success,
@@ -263,8 +403,15 @@ func (r *Recorder) Report() *Report {
 		CompletionTokens: r.data.CompletionTokens,
 		CachedTokens:     r.data.CachedTokens,
 		Credits:          r.data.Credits,
+		CycleCredits:     r.data.CycleCredits,
+		CycleStartMs:     r.data.CycleStartMs,
+		NextResetMs:      r.data.NextResetMs,
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
+	}
+	if r.data.Account != nil {
+		acct := *r.data.Account
+		rep.Account = &acct
 	}
 	if r.data.Total > 0 {
 		rep.SuccessRate = float64(r.data.Success) / float64(r.data.Total)

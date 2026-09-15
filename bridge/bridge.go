@@ -29,6 +29,11 @@ import (
 var (
 	refreshMarginMs = int64(2 * 3600 * 1000) // 2 hours
 	catalogTTL      = float64(600)           // 10 minutes
+	// accountTTL bounds how long a cached /user/status result is trusted.
+	// The subscription tier effectively never changes and the billing
+	// boundary moves once a month, so an hour is far tighter than needed
+	// while keeping the status endpoint off the chat path entirely.
+	accountTTL = float64(3600)
 )
 
 // chatMaxBodyBytes caps the /v1/chat/completions request body to bound memory
@@ -203,6 +208,12 @@ type OpenAiBridge struct {
 	catalogTs    float64
 	catalogInflt bool // single-flight: a fetch is already in progress
 
+	// account caches the /user/status result: the real subscription tier
+	// (which jobToken does not report) and the billing-cycle boundary.
+	accountMu sync.Mutex
+	account   *auth.AccountStatus
+	accountTs float64
+
 	// chatSlots bounds concurrent upstream chat requests per PAT. Exceeding
 	// the gateway's per-account admission window yields business code 10605
 	// ("gateway busy") over HTTP 401/403, so we queue locally instead.
@@ -255,19 +266,125 @@ func (b *OpenAiBridge) bootstrapSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	name, _ := jt["name"].(string)
 	id, _ := jt["id"].(string)
 	exp, _ := jt["expireTime"]
-	log.Printf("[bridge] session for %s (%s) [%s] exp=%v", name, id, b.Region.Name, exp)
-	b.applyJobToken(jt)
+	// The jobToken response carries no userType, so the authoritative tier has
+	// to come from /user/status. It must be resolved BEFORE the session is
+	// built because the value is AES-signed into the bearer payload and cannot
+	// be amended afterwards.
+	userType := b.resolveAccountStatus(ctx, id)
+	name, _ := jt["name"].(string)
+	log.Printf("[bridge] session for %s (%s) [%s] exp=%v userType=%s", name, id, b.Region.Name, exp, userType)
+	b.applyJobToken(jt, userType)
 	b.bootstrapped.Store(true)
 	return nil
 }
 
-func (b *OpenAiBridge) applyJobToken(jt map[string]interface{}) {
+// resolveAccountStatus fetches /user/status and returns the authoritative
+// subscription tier. On failure it degrades in order: last known tier (even if
+// stale) → empty, letting applyJobToken fall back to the jobToken value and
+// then the historical default.
+//
+// Preferring a stale tier over the default matters on the renewal path: a
+// transient status outage must not downgrade a team account to
+// personal_standard and change the signed bearer payload mid-session.
+func (b *OpenAiBridge) resolveAccountStatus(ctx context.Context, userID string) string {
+	st, err := b.fetchAccountStatus(ctx, userID)
+	if err == nil && st != nil && st.UserType != "" {
+		return st.UserType
+	}
+	if err != nil {
+		log.Printf("[bridge] WARN user/status failed (%v); reusing last known tier", err)
+	}
+	if cached := b.AccountStatus(); cached != nil && cached.UserType != "" {
+		return cached.UserType
+	}
+	return ""
+}
+
+// fetchAccountStatus queries /user/status with a TTL cache. Unlike the chat
+// path it performs no single-flight coordination: callers are the renewal
+// flows (already serialized by refreshMu) and the admin poll.
+func (b *OpenAiBridge) fetchAccountStatus(ctx context.Context, userID string) (*auth.AccountStatus, error) {
+	now := float64(time.Now().Unix())
+	b.accountMu.Lock()
+	if cached := b.account; cached != nil && now-b.accountTs < accountTTL {
+		b.accountMu.Unlock()
+		return cached, nil
+	}
+	b.accountMu.Unlock()
+
+	if userID == "" {
+		return nil, fmt.Errorf("no user id available for user/status")
+	}
+	raw, err := auth.FetchUserStatus(ctx, userID, b.machineID, b.machineToken, b.machineType, b.Region)
+	if err != nil {
+		return nil, err
+	}
+	st, ok := auth.ParseAccountStatus(raw)
+	if !ok {
+		return nil, fmt.Errorf("user/status response shape unexpected")
+	}
+	b.accountMu.Lock()
+	b.account = &st
+	b.accountTs = float64(time.Now().Unix())
+	b.accountMu.Unlock()
+	log.Printf("[bridge] account status: userType=%s plan=%s tag=%s nextReset=%s quotaExceeded=%t",
+		st.UserType, st.Plan, st.UserTag, fmtResetTime(st.NextResetAtMs), st.IsQuotaExceeded)
+	return &st, nil
+}
+
+// EnsureAccountStatus returns the subscription state, refreshing it from the
+// gateway when the cache has expired. It bootstraps the session first if
+// needed, so the admin panel can report the plan and billing boundary before
+// any chat request has been made. On failure it returns whatever was last
+// known (possibly nil) rather than erroring, so a status outage cannot break
+// the caller's accounting loop.
+func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountStatus {
+	if err := b.EnsureFreshSession(ctx); err != nil {
+		log.Printf("[bridge] WARN account status unavailable (session: %v)", err)
+		return b.AccountStatus()
+	}
+	userID := ""
+	if ident := b.currentIdentity(); ident != nil {
+		userID = ident.Aid
+	}
+	if st, err := b.fetchAccountStatus(ctx, userID); err == nil && st != nil {
+		return st
+	}
+	return b.AccountStatus()
+}
+
+// AccountStatus returns the cached subscription state, or nil when it has
+// never been resolved. It performs no network call, so it is safe to invoke
+// from a request handler at any cadence.
+func (b *OpenAiBridge) AccountStatus() *auth.AccountStatus {
+	b.accountMu.Lock()
+	defer b.accountMu.Unlock()
+	if b.account == nil {
+		return nil
+	}
+	cp := *b.account
+	return &cp
+}
+
+// fmtResetTime renders an epoch-millis reset instant for logs, or "unknown".
+func fmtResetTime(ms int64) string {
+	if ms <= 0 {
+		return "unknown"
+	}
+	return time.UnixMilli(ms).Local().Format("2006-01-02 15:04 MST")
+}
+
+// applyJobToken builds the signed session from a jobToken response. userType
+// is the tier resolved from /user/status; when empty the jobToken value is
+// used, and only then does the historical default apply.
+func (b *OpenAiBridge) applyJobToken(jt map[string]interface{}, userType string) {
 	name, _ := jt["name"].(string)
 	id, _ := jt["id"].(string)
-	userType, _ := jt["userType"].(string)
+	if userType == "" {
+		userType, _ = jt["userType"].(string)
+	}
 	if userType == "" {
 		userType = "personal_standard"
 	}
@@ -377,7 +494,8 @@ func (b *OpenAiBridge) doRenew(ctx context.Context, force bool) error {
 		}
 		log.Printf("[bridge] session %s (exp=%v)", label, jt["expireTime"])
 	}
-	b.applyJobToken(jt)
+	id, _ := jt["id"].(string)
+	b.applyJobToken(jt, b.resolveAccountStatus(ctx, id))
 	return nil
 }
 
@@ -918,6 +1036,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 					CompletionTokens: u.CompletionTokens,
 					CachedTokens:     u.CachedPromptTokens(),
 					Credits:          u.Credits,
+					NonBillable:      !u.Billable,
 				})
 			}
 		}

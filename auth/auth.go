@@ -550,6 +550,104 @@ func RefreshJobToken(ctx context.Context, personalToken, refreshToken, securityO
 	return requestJobToken(ctx, personalToken, refreshToken, securityOauthToken, true, machineID, machineToken, machineType, region)
 }
 
+// --- Account status (subscription tier + billing cycle) ---
+
+// userStatusInnerStruct is the /user/status payload. Field order MUST match
+// the official client's dict insertion order for signature compatibility.
+// Only userId is populated; the token fields are sent empty because this call
+// is authenticated by the machine-identity signature, not by the session.
+type userStatusInnerStruct struct {
+	UserID             string          `json:"userId"`
+	PersonalToken      string          `json:"personalToken"`
+	SecurityOauthToken string          `json:"securityOauthToken"`
+	RefreshToken       string          `json:"refreshToken"`
+	NeedRefresh        bool            `json:"needRefresh"`
+	AuthInfo           json.RawMessage `json:"authInfo"`
+}
+
+// AccountStatus is the subscription state of the account behind a PAT.
+//
+// It is the only place the gateway discloses the billing cycle: NextResetAtMs
+// is the authoritative moment the subscription allowance refreshes. Unlike the
+// per-request usage frame (which reports only what a single call cost), this
+// tells us where the current cycle ends, which is what makes cycle-scoped
+// credit accounting possible.
+type AccountStatus struct {
+	// UserType is the account's real tier as reported by the gateway
+	// ("teams", "personal_standard", ...). The jobToken response does NOT
+	// carry this field, so callers must not infer it from there.
+	UserType string
+	// Plan is the raw plan identifier ("PLAN_TIER_TEAM", ...).
+	Plan string
+	// UserTag is the human-facing plan label ("Teams", ...).
+	UserTag string
+	// OrgName is the organization the account belongs to ("" for personal).
+	OrgName string
+	// NextResetAtMs is the subscription refresh instant in epoch millis.
+	// 0 means the gateway did not report one.
+	NextResetAtMs int64
+	// IsQuotaExceeded reports whether the account is currently out of
+	// allowance. This is the gateway's own verdict, not a local estimate.
+	IsQuotaExceeded bool
+}
+
+// FetchUserStatus queries the account's subscription state.
+//
+// The endpoint is authenticated by the machine-identity signature only (no
+// bearer session), so it is safe to call right after a jobToken exchange and
+// before any session is constructed.
+func FetchUserStatus(ctx context.Context, userID, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
+	if region == nil {
+		region = CN
+	}
+	urlStr := AuthURL(region, "/algo/api/v3/user/status?Encode=1")
+	inner := userStatusInnerStruct{
+		UserID:      userID,
+		NeedRefresh: false,
+		AuthInfo:    emptyJSON,
+	}
+	innerJSON, err := marshalNoEscape(inner)
+	if err != nil {
+		return nil, err
+	}
+	outer := jobTokenOuterStruct{
+		Payload:       string(innerJSON),
+		EncodeVersion: "1",
+	}
+	return postEncoded(ctx, urlStr, outer, machineID, machineToken, machineType)
+}
+
+// ParseAccountStatus converts a raw /user/status response into AccountStatus.
+// It returns false when the response carries no recognizable account fields,
+// letting callers keep any previously cached state instead of zeroing it out.
+func ParseAccountStatus(raw map[string]interface{}) (AccountStatus, bool) {
+	if raw == nil {
+		return AccountStatus{}, false
+	}
+	userType, _ := raw["userType"].(string)
+	plan, _ := raw["plan"].(string)
+	if userType == "" && plan == "" && raw["nextResetAt"] == nil {
+		return AccountStatus{}, false
+	}
+	st := AccountStatus{
+		UserType: userType,
+		Plan:     plan,
+	}
+	st.UserTag, _ = raw["userTag"].(string)
+	st.OrgName, _ = raw["orgName"].(string)
+	st.NextResetAtMs = toInt64Ms(raw["nextResetAt"])
+	st.IsQuotaExceeded, _ = raw["isQuotaExceeded"].(bool)
+	return st, true
+}
+
+// toInt64Ms coerces an epoch-millis field arriving as a JSON number.
+func toInt64Ms(v interface{}) int64 {
+	if f, ok := v.(float64); ok {
+		return int64(f)
+	}
+	return 0
+}
+
 // drainBody reads and discards the remaining response body (up to a cap) so
 // the underlying TCP connection can be returned to the pool for reuse.
 // Must be called before resp.Body.Close() on error paths where the body was
