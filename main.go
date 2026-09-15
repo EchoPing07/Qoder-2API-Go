@@ -61,10 +61,9 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	return p.bridge
 }
 
-// accountRefreshCadence is how often the subscription state is re-checked. The
-// bridge caches the upstream result for an hour, so this only bounds how quickly
-// a billing rollover is noticed, not how often the gateway is called.
-const accountRefreshCadence = 10 * time.Minute
+// accountRefreshCadence keeps the authoritative allowance reasonably fresh
+// without coupling the admin panel's 15-second poll to an upstream request.
+const accountRefreshCadence = time.Minute
 
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
 // deliberately cheap (no upstream calls, no session bootstrap): the body
@@ -171,14 +170,9 @@ func main() {
 		return catalog.Keys()
 	}
 
-	// Subscription account loop: refreshes the plan and billing-cycle boundary
-	// from the gateway's /user/status endpoint out of band, so the admin panel
-	// can render cycle-relative credits straight from the recorder instead of
-	// making an upstream call on every 15s poll.
-	//
-	// The cadence is intentionally shorter than the bridge's 1h account TTL:
-	// most ticks are served from cache, but a tick landing just after a reset
-	// boundary picks up the new cycle within minutes.
+	// Subscription account loop: refreshes identity metadata from /user/status
+	// and authoritative allowance totals from OpenAPI /api/v2/quota/usage out
+	// of band. The admin panel's 15-second poll remains memory-only.
 	applyAccount := func(ctx context.Context) {
 		b := provider.currentBridge()
 		if b == nil {
@@ -189,11 +183,35 @@ func main() {
 			return // upstream unreachable: keep the last known state
 		}
 		rec.SetBillingCycle(st.NextResetAtMs)
-		rec.SetAccount(&stats.Account{
-			Plan:            st.Plan,
-			Tag:             st.UserTag,
-			IsQuotaExceeded: st.IsQuotaExceeded,
-		})
+		account := &stats.Account{
+			Plan:                 st.Plan,
+			Tag:                  st.UserTag,
+			OrgName:              st.OrgName,
+			IsQuotaExceeded:      st.IsQuotaExceeded,
+			TotalUsagePercentage: st.TotalUsagePercentage,
+		}
+		if st.UserQuota != nil {
+			account.UserQuota = &stats.Quota{
+				Total: st.UserQuota.Total, Used: st.UserQuota.Used,
+				Remaining: st.UserQuota.Remaining, Percentage: st.UserQuota.Percentage,
+				Unit: st.UserQuota.Unit, DetailURL: st.UserQuota.DetailURL,
+			}
+		}
+		if st.AddOnQuota != nil {
+			account.AddOnQuota = &stats.Quota{
+				Total: st.AddOnQuota.Total, Used: st.AddOnQuota.Used,
+				Remaining: st.AddOnQuota.Remaining, Percentage: st.AddOnQuota.Percentage,
+				Unit: st.AddOnQuota.Unit, DetailURL: st.AddOnQuota.DetailURL,
+			}
+		}
+		if st.OrgResourcePackage != nil {
+			account.OrgResourcePackage = &stats.OrgResourcePackage{
+				Used: st.OrgResourcePackage.Used, Cap: st.OrgResourcePackage.Cap,
+				Remaining: st.OrgResourcePackage.Remaining, Percentage: st.OrgResourcePackage.Percentage,
+				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
+			}
+		}
+		rec.SetAccount(account)
 	}
 	go func() {
 		// Fetch once immediately so the panel is populated from the start

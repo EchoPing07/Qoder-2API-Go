@@ -39,9 +39,35 @@ type Account struct {
 	Plan string `json:"plan,omitempty"`
 	// Tag is the human-facing plan label ("Teams", ...).
 	Tag string `json:"tag,omitempty"`
-	// IsQuotaExceeded is the gateway's own verdict on whether the allowance is
-	// exhausted — authoritative, unlike any locally computed estimate.
+	// OrgName identifies the organization that owns a shared resource package.
+	OrgName string `json:"org_name,omitempty"`
+	// IsQuotaExceeded is the OpenAPI verdict used by the official client.
 	IsQuotaExceeded bool `json:"is_quota_exceeded"`
+	// TotalUsagePercentage is the official aggregate ratio in [0,1].
+	TotalUsagePercentage float64             `json:"total_usage_percentage"`
+	UserQuota            *Quota              `json:"user_quota,omitempty"`
+	AddOnQuota           *Quota              `json:"add_on_quota,omitempty"`
+	OrgResourcePackage   *OrgResourcePackage `json:"org_resource_package,omitempty"`
+}
+
+// Quota is a cycle-scoped credit allowance reported by Qoder OpenAPI.
+type Quota struct {
+	Total      float64 `json:"total"`
+	Used       float64 `json:"used"`
+	Remaining  float64 `json:"remaining"`
+	Percentage float64 `json:"percentage"`
+	Unit       string  `json:"unit"`
+	DetailURL  string  `json:"detail_url,omitempty"`
+}
+
+// OrgResourcePackage is the shared organization credit pool.
+type OrgResourcePackage struct {
+	Used       float64 `json:"used"`
+	Cap        float64 `json:"cap"`
+	Remaining  float64 `json:"remaining"`
+	Percentage float64 `json:"percentage"`
+	Available  bool    `json:"available"`
+	Unit       string  `json:"unit"`
 }
 
 // Data is the persisted stats snapshot.
@@ -176,10 +202,7 @@ func (d *Data) Clone() *Data {
 		ByModel:          make(map[string]*ModelStat, len(d.ByModel)),
 		Hourly:           make(map[string]*HourStat, len(d.Hourly)),
 	}
-	if d.Account != nil {
-		acct := *d.Account
-		cp.Account = &acct
-	}
+	cp.Account = cloneAccount(d.Account)
 	for k, v := range d.ByModel {
 		cp.ByModel[k] = &ModelStat{Model: v.Model, Total: v.Total, Success: v.Success, Failed: v.Failed}
 	}
@@ -295,11 +318,30 @@ func (r *Recorder) SetAccount(a *Account) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Copy so a later mutation of the caller's struct cannot change the
-	// persisted snapshot behind the recorder's back.
-	acct := *a
-	r.data.Account = &acct
+	// Deep-copy nested quota objects so later caller mutations cannot change
+	// the persisted snapshot behind the recorder's back.
+	r.data.Account = cloneAccount(a)
 	r.dirty = true
+}
+
+func cloneAccount(a *Account) *Account {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	if a.UserQuota != nil {
+		q := *a.UserQuota
+		cp.UserQuota = &q
+	}
+	if a.AddOnQuota != nil {
+		q := *a.AddOnQuota
+		cp.AddOnQuota = &q
+	}
+	if a.OrgResourcePackage != nil {
+		q := *a.OrgResourcePackage
+		cp.OrgResourcePackage = &q
+	}
+	return &cp
 }
 
 // addMonthsMs shifts an epoch-millis instant by n calendar months.
@@ -409,10 +451,7 @@ func (r *Recorder) Report() *Report {
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
 	}
-	if r.data.Account != nil {
-		acct := *r.data.Account
-		rep.Account = &acct
-	}
+	rep.Account = cloneAccount(r.data.Account)
 	if r.data.Total > 0 {
 		rep.SuccessRate = float64(r.data.Success) / float64(r.data.Total)
 	}

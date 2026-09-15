@@ -826,6 +826,55 @@ func TestChatSlotsSerializeUpstreamCalls(t *testing.T) {
 	}
 }
 
+func TestEnsureAccountStatusMergesAuthoritativeQuota(t *testing.T) {
+	var quotaCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"id":"uid1","userType":"teams","plan":"PLAN_TIER_TEAM","userTag":"Teams","orgName":"Example Org","nextResetAt":1,"isQuotaExceeded":false}`)
+	})
+	mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sot" {
+			t.Errorf("quota Authorization = %q", got)
+		}
+		if quotaCalls.Add(1) > 1 {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		io.WriteString(w, `{"userId":"uid1","userType":"teams","totalUsagePercentage":0.98,"isQuotaExceeded":true,"expiresAt":1790265600000,"userQuota":{"total":3000,"used":2939,"remaining":61,"percentage":0.98,"unit":"credits"},"orgResourcePackage":{"used":0,"cap":4000,"remaining":0,"percentage":0,"available":false,"unit":"credits"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL}
+	b := NewOpenAiBridge("pt-test", region)
+	st := b.EnsureAccountStatus(context.Background())
+	if st == nil || st.UserQuota == nil {
+		t.Fatalf("expected authoritative quota, got %+v", st)
+	}
+	if st.UserQuota.Used != 2939 || st.UserQuota.Remaining != 61 || st.NextResetAtMs != 1790265600000 {
+		t.Errorf("unexpected quota merge: %+v", st)
+	}
+	if !st.IsQuotaExceeded || st.Plan != "PLAN_TIER_TEAM" || st.OrgName != "Example Org" {
+		t.Errorf("gateway metadata and OpenAPI verdict were not merged: %+v", st)
+	}
+	if st.OrgResourcePackage == nil || st.OrgResourcePackage.Cap != 4000 {
+		t.Errorf("organization package missing: %+v", st.OrgResourcePackage)
+	}
+
+	// Force the identity cache stale, then fail the next quota request. A fresh
+	// reduced /user/status response must not erase the last official snapshot.
+	b.accountMu.Lock()
+	b.accountTs = 0
+	b.accountMu.Unlock()
+	st = b.EnsureAccountStatus(context.Background())
+	if st == nil || st.UserQuota == nil || st.UserQuota.Used != 2939 || !st.IsQuotaExceeded {
+		t.Errorf("temporary quota outage erased the last authoritative snapshot: %+v", st)
+	}
+}
+
 func TestHandleChatSendsReasoningEffortToSignedGateway(t *testing.T) {
 	gw := &fakeGateway{chatLines: []string{
 		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),

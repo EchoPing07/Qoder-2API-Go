@@ -513,7 +513,12 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
 	rec := stats.NewRecorder(nil)
 	rec.SetBillingCycle(reset.UnixMilli())
-	rec.SetAccount(&stats.Account{Plan: "PLAN_TIER_TEAM", Tag: "Teams"})
+	rec.SetAccount(&stats.Account{
+		Plan: "PLAN_TIER_TEAM", Tag: "Teams", OrgName: "Example Org",
+		TotalUsagePercentage: 0.98,
+		UserQuota:            &stats.Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
+		OrgResourcePackage:   &stats.OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
+	})
 	rec.RecordUsage(&stats.Usage{PromptTokens: 5, Credits: 1.25})
 
 	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
@@ -525,9 +530,19 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 		CycleStartMs int64   `json:"cycle_start_ms"`
 		NextResetMs  int64   `json:"next_reset_ms"`
 		Account      *struct {
-			Plan            string `json:"plan"`
-			Tag             string `json:"tag"`
-			IsQuotaExceeded bool   `json:"is_quota_exceeded"`
+			Plan                 string  `json:"plan"`
+			Tag                  string  `json:"tag"`
+			OrgName              string  `json:"org_name"`
+			TotalUsagePercentage float64 `json:"total_usage_percentage"`
+			UserQuota            *struct {
+				Total     float64 `json:"total"`
+				Used      float64 `json:"used"`
+				Remaining float64 `json:"remaining"`
+			} `json:"user_quota"`
+			OrgResourcePackage *struct {
+				Cap       float64 `json:"cap"`
+				Available bool    `json:"available"`
+			} `json:"org_resource_package"`
 		} `json:"account"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
@@ -545,6 +560,12 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 	}
 	if resp.Account == nil || resp.Account.Tag != "Teams" || resp.Account.Plan != "PLAN_TIER_TEAM" {
 		t.Errorf("expected account metadata in the response, got %+v", resp.Account)
+	}
+	if resp.Account.UserQuota == nil || resp.Account.UserQuota.Total != 3000 || resp.Account.UserQuota.Used != 2939 || resp.Account.UserQuota.Remaining != 61 {
+		t.Errorf("expected authoritative user quota in the response, got %+v", resp.Account.UserQuota)
+	}
+	if resp.Account.OrgResourcePackage == nil || resp.Account.OrgResourcePackage.Cap != 4000 || resp.Account.OrgResourcePackage.Available {
+		t.Errorf("expected organization resource package in the response, got %+v", resp.Account.OrgResourcePackage)
 	}
 }
 

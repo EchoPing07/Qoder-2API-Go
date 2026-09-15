@@ -1214,14 +1214,10 @@ function loadStats() {
 }
 
 /*
- * Credits are shown per billing cycle, not as a lifetime total: the gateway
- * refreshes the subscription allowance monthly, so a cumulative figure keeps
- * growing past the reset and stops meaning anything.
- *
- * The cycle boundary comes from the gateway's /user/status nextResetAt, so no
- * anchor date has to be configured. The gateway reports no numeric allowance
- * (quota is 0 for team plans), so there is deliberately no progress bar or
- * percentage — only what is actually known.
+ * Prefer the authoritative cycle allowance used by Qoder's official /usage
+ * view. Local cycle_credits remains a fallback for temporary OpenAPI outages;
+ * it only covers traffic observed by this bridge and is therefore never mixed
+ * with the account-wide official value.
  */
 function renderCredits(d) {
   var el = document.getElementById('statCredits');
@@ -1229,22 +1225,45 @@ function renderCredits(d) {
   var cycle = Number(d.cycle_credits || 0);
   var resetMs = Number(d.next_reset_ms || 0);
   var acct = d.account || {};
+  var quota = acct.user_quota || null;
+  var title = ['本服务累计消耗 ' + fmtCredits(lifetime)];
 
   el.textContent = '';
-  el.title = '累计消耗 ' + fmtCredits(lifetime) + '（自服务启用以来）';
+  if (quota) {
+    el.appendChild(document.createTextNode(
+      '套餐 ' + fmtCredits(Number(quota.used || 0)) + ' / ' + fmtCredits(Number(quota.total || 0)) +
+      ' · 剩 ' + fmtCredits(Number(quota.remaining || 0))
+    ));
+    title.push('套餐额度：已用 ' + fmtCredits(Number(quota.used || 0)) +
+      ' / ' + fmtCredits(Number(quota.total || 0)) +
+      '，剩余 ' + fmtCredits(Number(quota.remaining || 0)));
+    if (acct.add_on_quota) {
+      title.push('加购额度：已用 ' + fmtCredits(Number(acct.add_on_quota.used || 0)) +
+        ' / ' + fmtCredits(Number(acct.add_on_quota.total || 0)) +
+        '，剩余 ' + fmtCredits(Number(acct.add_on_quota.remaining || 0)));
+    }
+    if (acct.org_resource_package) {
+      var org = acct.org_resource_package;
+      title.push('组织资源包：已用 ' + fmtCredits(Number(org.used || 0)) +
+        ' / ' + fmtCredits(Number(org.cap || 0)) +
+        '，剩余 ' + fmtCredits(Number(org.remaining || 0)) +
+        (org.available ? '（可用）' : '（不可用）'));
+    }
+  } else if (resetMs > 0) {
+    el.appendChild(document.createTextNode('本服务周期内 ' + fmtCredits(cycle)));
+    title.push('官方额度暂不可用；当前数字仅统计本服务观察到的请求');
+  } else {
+    el.appendChild(document.createTextNode('Credits 消耗 ' + fmtCredits(lifetime)));
+  }
 
   if (resetMs > 0) {
-    el.appendChild(document.createTextNode('本周期 ' + fmtCredits(cycle)));
     var left = Math.ceil((resetMs - Date.now()) / 86400000);
     el.appendChild(document.createTextNode(' · ' + fmtMonthDay(resetMs) + ' 重置'));
     if (left > 0) {
       el.appendChild(document.createTextNode(' · 剩 ' + left + ' 天'));
     }
-  } else {
-    // No cycle boundary known (status endpoint never resolved): fall back to
-    // the lifetime total rather than showing a stale zero.
-    el.appendChild(document.createTextNode('Credits 消耗 ' + fmtCredits(lifetime)));
   }
+  el.title = title.join('\n');
 
   if (acct.is_quota_exceeded) {
     el.appendChild(makeBadge('额度已超', 'bad'));

@@ -386,9 +386,15 @@ func TestCycleRolloverHappensOnce(t *testing.T) {
 // later mutation reach the persisted snapshot.
 func TestSetAccountCopiesAndIsExposed(t *testing.T) {
 	r := NewRecorder(nil)
-	acct := &Account{Plan: "PLAN_TIER_TEAM", Tag: "Teams", IsQuotaExceeded: false}
+	acct := &Account{
+		Plan: "PLAN_TIER_TEAM", Tag: "Teams", IsQuotaExceeded: false,
+		UserQuota:          &Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
+		OrgResourcePackage: &OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
+	}
 	r.SetAccount(acct)
 	acct.Tag = "mutated"
+	acct.UserQuota.Used = 1
+	acct.OrgResourcePackage.Cap = 1
 
 	rep := r.Report()
 	if rep.Account == nil {
@@ -396,6 +402,12 @@ func TestSetAccountCopiesAndIsExposed(t *testing.T) {
 	}
 	if rep.Account.Tag != "Teams" {
 		t.Errorf("expected the snapshot to be insulated from caller mutation, got %q", rep.Account.Tag)
+	}
+	if rep.Account.UserQuota == nil || rep.Account.UserQuota.Used != 2939 {
+		t.Errorf("expected a deep copy of user quota, got %+v", rep.Account.UserQuota)
+	}
+	if rep.Account.OrgResourcePackage == nil || rep.Account.OrgResourcePackage.Cap != 4000 {
+		t.Errorf("expected a deep copy of organization quota, got %+v", rep.Account.OrgResourcePackage)
 	}
 
 	// A nil account must not wipe a known one.

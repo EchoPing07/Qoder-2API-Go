@@ -326,7 +326,19 @@ func (b *OpenAiBridge) fetchAccountStatus(ctx context.Context, userID string) (*
 		return nil, fmt.Errorf("user/status response shape unexpected")
 	}
 	b.accountMu.Lock()
-	b.account = &st
+	// A successful identity refresh must not erase the last authoritative
+	// quota snapshot if the immediately following OpenAPI call fails. Preserve
+	// only quota-owned fields; plan/tag/org metadata comes from this fresh
+	// gateway response.
+	if previous := b.account; previous != nil && previous.UserQuota != nil {
+		st.NextResetAtMs = previous.NextResetAtMs
+		st.IsQuotaExceeded = previous.IsQuotaExceeded
+		st.TotalUsagePercentage = previous.TotalUsagePercentage
+		st.UserQuota = previous.UserQuota
+		st.AddOnQuota = previous.AddOnQuota
+		st.OrgResourcePackage = previous.OrgResourcePackage
+	}
+	b.account = cloneAccountStatus(&st)
 	b.accountTs = float64(time.Now().Unix())
 	b.accountMu.Unlock()
 	log.Printf("[bridge] account status: userType=%s plan=%s tag=%s nextReset=%s quotaExceeded=%t",
@@ -334,12 +346,11 @@ func (b *OpenAiBridge) fetchAccountStatus(ctx context.Context, userID string) (*
 	return &st, nil
 }
 
-// EnsureAccountStatus returns the subscription state, refreshing it from the
-// gateway when the cache has expired. It bootstraps the session first if
-// needed, so the admin panel can report the plan and billing boundary before
-// any chat request has been made. On failure it returns whatever was last
-// known (possibly nil) rather than erroring, so a status outage cannot break
-// the caller's accounting loop.
+// EnsureAccountStatus returns the subscription state, refreshing both the
+// gateway identity metadata and the authoritative OpenAPI quota snapshot. It
+// bootstraps the session first because OpenAPI uses the securityOauthToken
+// produced by that exchange. Failures preserve the last known snapshot so a
+// temporary account-service outage never breaks the caller's accounting loop.
 func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountStatus {
 	if err := b.EnsureFreshSession(ctx); err != nil {
 		log.Printf("[bridge] WARN account status unavailable (session: %v)", err)
@@ -349,10 +360,39 @@ func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountSta
 	if ident := b.currentIdentity(); ident != nil {
 		userID = ident.Aid
 	}
-	if st, err := b.fetchAccountStatus(ctx, userID); err == nil && st != nil {
+	st, err := b.fetchAccountStatus(ctx, userID)
+	if err != nil {
+		log.Printf("[bridge] WARN user/status refresh failed: %v", err)
+		st = b.AccountStatus()
+	}
+
+	quota, err := auth.FetchQuotaUsage(ctx, b.currentSecurityOauth(), b.Region)
+	if err != nil {
+		log.Printf("[bridge] WARN quota/usage refresh failed: %v", err)
 		return st
 	}
-	return b.AccountStatus()
+	if st == nil {
+		st = &auth.AccountStatus{}
+	} else {
+		st = cloneAccountStatus(st)
+	}
+	if quota.UserType != "" {
+		st.UserType = quota.UserType
+	}
+	st.NextResetAtMs = quota.ExpiresAtMs
+	st.IsQuotaExceeded = quota.IsQuotaExceeded
+	st.TotalUsagePercentage = quota.TotalUsagePercentage
+	st.UserQuota = quota.UserQuota
+	st.AddOnQuota = quota.AddOnQuota
+	st.OrgResourcePackage = quota.OrgResourcePackage
+
+	b.accountMu.Lock()
+	b.account = cloneAccountStatus(st)
+	b.accountMu.Unlock()
+	log.Printf("[bridge] quota usage: userType=%s used=%.2f total=%.2f remaining=%.2f reset=%s quotaExceeded=%t",
+		st.UserType, st.UserQuota.Used, st.UserQuota.Total, st.UserQuota.Remaining,
+		fmtResetTime(st.NextResetAtMs), st.IsQuotaExceeded)
+	return cloneAccountStatus(st)
 }
 
 // AccountStatus returns the cached subscription state, or nil when it has
@@ -361,10 +401,26 @@ func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountSta
 func (b *OpenAiBridge) AccountStatus() *auth.AccountStatus {
 	b.accountMu.Lock()
 	defer b.accountMu.Unlock()
-	if b.account == nil {
+	return cloneAccountStatus(b.account)
+}
+
+func cloneAccountStatus(st *auth.AccountStatus) *auth.AccountStatus {
+	if st == nil {
 		return nil
 	}
-	cp := *b.account
+	cp := *st
+	if st.UserQuota != nil {
+		q := *st.UserQuota
+		cp.UserQuota = &q
+	}
+	if st.AddOnQuota != nil {
+		q := *st.AddOnQuota
+		cp.AddOnQuota = &q
+	}
+	if st.OrgResourcePackage != nil {
+		q := *st.OrgResourcePackage
+		cp.OrgResourcePackage = &q
+	}
 	return &cp
 }
 
@@ -467,6 +523,13 @@ func (b *OpenAiBridge) currentIdentity() *auth.AuthIdentity {
 	id := b.identity
 	b.mu.Unlock()
 	return id
+}
+
+func (b *OpenAiBridge) currentSecurityOauth() string {
+	b.mu.Lock()
+	token := b.securityOauth
+	b.mu.Unlock()
+	return token
 }
 
 // doRenew renews the session token via refreshToken.
