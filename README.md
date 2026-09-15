@@ -152,7 +152,7 @@ curl http://localhost:10081/v1/models \
 
 ### 5. 控制思考强度（`reasoning_effort`）
 
-请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位会作为顶层字段写入原有的 COSY 签名网关请求；**无需**额外的 device token、Bearer token 或模型服务域名配置，未携带该字段的请求保持原有行为。
+请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位写入网关请求的 `parameters` 对象（与官方客户端一致），**无需**额外的 device token、Bearer token 或模型服务域名配置；未携带该字段的请求保持原有行为。
 
 ```json
 {
@@ -163,6 +163,25 @@ curl http://localhost:10081/v1/models \
 ```
 
 桥接层从动态模型目录读取每个模型的 `efforts` 与 `supports_disabled` 后校验档位：有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度；不会发送可能导致上游拒绝的无效值。
+
+> **注意**：档位必须放在 `parameters` 内才会生效。网关不读取请求体顶层的 `reasoning_effort`，写在该位置会被静默忽略，模型一律按默认强度思考。此外 `parameters` 还承载 `max_tokens`、`tool_choice` 等字段，桥接层会自动组装，调用方无需关心。
+
+#### `none` 档：完全关闭思考
+
+`none` 是二值开关而非强度档位，需要额外配合才能真正关闭思考。桥接层在档位解析为 `none` 时会同时做三件事（与官方客户端行为一致）：
+
+1. `parameters.reasoning_effort` 置为 `"none"`
+2. `parameters.max_thinking_tokens` 显式置为 `0`（该字段用指针承载，以保证 `0` 不被 JSON 序列化省略）
+3. `model_config.is_reasoning` 与 `chat_context.extra.modelConfig.is_reasoning` 均置为 `false`
+
+其余档位不会写入 `max_thinking_tokens`：官方客户端仅在技能 / 子代理覆盖场景才把档位换算为思考预算，主交互路径只发送档位字符串。
+
+#### `is_reasoning` 与 `max_tokens` 的来源
+
+两项能力信息来自网关模型目录，与官方客户端的解析方式一致：
+
+- `is_reasoning`：取目录的 `is_reasoning` 字段，缺失时为 `false`。动态目录不可用时回退为 `true`，以保持桥接层原有的"默认开启思考"行为，避免静默关闭所有模型的思考能力。
+- `max_tokens`：取目录的 `max_output_tokens`，缺失或非法（非正整数）时回退为 `32000`，与官方客户端的 `LS()` 归一化结果相同。
 
 **pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
 
@@ -178,7 +197,7 @@ curl http://localhost:10081/v1/models \
 }
 ```
 
-以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型：
+以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型（`max` 映射到目录实际支持的最高档位，避免发送被上游丢弃的无效值）：
 
 ```json
 {

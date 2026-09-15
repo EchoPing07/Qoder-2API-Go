@@ -3,6 +3,7 @@ package models
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -61,6 +62,12 @@ const PreferredDefaultKey = "qmodel_latest"
 // DefaultScene is the catalog scene to extract.
 const DefaultScene = "chat"
 
+// DefaultMaxOutputTokens is the completion-token cap the official client falls
+// back to whenever a catalog entry carries no usable max_output_tokens. It
+// mirrors the client's LS() coercion, which returns 32000 for any value that is
+// not a positive safe integer.
+const DefaultMaxOutputTokens = 32000
+
 // ModelCatalog holds display_name → qoder key mapping and capability metadata.
 type ModelCatalog struct {
 	ModelMap     map[string]string // display_name -> key
@@ -72,6 +79,53 @@ type ModelCatalog struct {
 	// catalog record carried effort metadata; a missing entry means "unknown",
 	// and callers fall back to the global effort vocabulary.
 	Reasoning map[string]*ModelReasoning
+
+	// Caps carries the per-model limits the official client reads from the
+	// catalog before building a gateway request, keyed by the qoder internal
+	// key. A missing entry means the catalog was unavailable, and callers fall
+	// back to their own defaults.
+	Caps map[string]*ModelCaps
+}
+
+// ModelCaps mirrors the limits of a model/list entry that the official client
+// resolves in oJI before assembling the request body.
+type ModelCaps struct {
+	// IsReasoning reports whether the gateway says this model can think. The
+	// official client defaults a missing field to false (T?.is_reasoning ?? !1).
+	IsReasoning bool
+	// MaxOutputTokens is the default completion cap, already normalized to
+	// DefaultMaxOutputTokens when the catalog value was absent or unusable.
+	MaxOutputTokens int
+}
+
+// flagValue coerces an optional boolean catalog field. Unlike enableFlag it
+// treats a missing value as false, matching the official client's defaults for
+// capability flags such as is_reasoning.
+func flagValue(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	return enableFlag(v)
+}
+
+// positiveInt parses a catalog numeric field that may arrive as a JSON number
+// or a numeric string, mirroring the official client's LS() coercion.
+func positiveInt(v interface{}) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		if n := int(x); float64(n) == x && n > 0 {
+			return n, true
+		}
+	case int:
+		if x > 0 {
+			return x, true
+		}
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(x)); err == nil && n > 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // ModelReasoning mirrors the reasoning-related fields of a model/list entry.
@@ -96,6 +150,26 @@ func (c *ModelCatalog) Keys() []string {
 // GetKey returns the qoder key for a display_name, or "" if not found.
 func (c *ModelCatalog) GetKey(displayName string) string {
 	return c.ModelMap[displayName]
+}
+
+// MaxOutputTokens returns the gateway's default completion cap for a qoder key,
+// falling back to DefaultMaxOutputTokens when the catalog carries no entry.
+func (c *ModelCatalog) MaxOutputTokens(qoderKey string) int {
+	if caps, ok := c.Caps[qoderKey]; ok && caps.MaxOutputTokens > 0 {
+		return caps.MaxOutputTokens
+	}
+	return DefaultMaxOutputTokens
+}
+
+// ReasoningDefault reports whether the gateway says a model can think. A catalog
+// with no caps entry for the key reports true, preserving the bridge's
+// long-standing always-on behaviour when the dynamic catalog is unavailable and
+// the gateway's own is_reasoning flag cannot be consulted.
+func (c *ModelCatalog) ReasoningDefault(qoderKey string) bool {
+	if caps, ok := c.Caps[qoderKey]; ok {
+		return caps.IsReasoning
+	}
+	return true
 }
 
 // DefaultCatalog returns the built-in fallback catalog.
@@ -136,6 +210,7 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 	modelMap := map[string]string{}
 	vision := map[string]bool{}
 	reasoning := map[string]*ModelReasoning{}
+	caps := map[string]*ModelCaps{}
 	for _, item := range sceneList {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -158,6 +233,14 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 		if ri := parseReasoningMeta(m); ri != nil {
 			reasoning[key] = ri
 		}
+		maxOut, ok := positiveInt(m["max_output_tokens"])
+		if !ok {
+			maxOut = DefaultMaxOutputTokens
+		}
+		caps[key] = &ModelCaps{
+			IsReasoning:     flagValue(m["is_reasoning"]),
+			MaxOutputTokens: maxOut,
+		}
 	}
 	if len(modelMap) == 0 {
 		return nil
@@ -166,6 +249,7 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 		ModelMap:     modelMap,
 		VisionModels: vision,
 		Reasoning:    reasoning,
+		Caps:         caps,
 		DefaultName:  nameForKey(modelMap, PreferredDefaultKey),
 	}
 }

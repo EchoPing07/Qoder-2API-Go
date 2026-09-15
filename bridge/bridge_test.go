@@ -265,7 +265,7 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"efforts":["low","medium","xhigh"],"supports_disabled":true}]}`)
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"is_reasoning":true,"max_output_tokens":4096,"efforts":["low","medium","xhigh"],"supports_disabled":true}]}`)
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -849,11 +849,107 @@ func TestHandleChatSendsReasoningEffortToSignedGateway(t *testing.T) {
 	if err := json.Unmarshal(plain, &payload); err != nil {
 		t.Fatalf("decode JSON gateway request: %v", err)
 	}
-	if got := payload["reasoning_effort"]; got != "xhigh" {
-		t.Errorf("reasoning_effort = %#v, want xhigh", got)
+	if got := payload["reasoning_effort"]; got != nil {
+		t.Errorf("reasoning_effort must not be a top-level body field, got %#v", got)
+	}
+	params, ok := payload["parameters"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters object missing from gateway request: %s", plain)
+	}
+	if got := params["reasoning_effort"]; got != "xhigh" {
+		t.Errorf("parameters.reasoning_effort = %#v, want xhigh", got)
+	}
+	if got, ok := params["max_tokens"].(float64); !ok || got <= 0 {
+		t.Errorf("parameters.max_tokens = %#v, want a positive cap", params["max_tokens"])
+	}
+	if _, present := params["max_thinking_tokens"]; present {
+		t.Errorf("max_thinking_tokens must be omitted for a non-none tier, got %#v", params["max_thinking_tokens"])
 	}
 	if got := payload["model_config"].(map[string]interface{})["key"]; got != "qmodel_latest" {
 		t.Errorf("model_config.key = %#v, want qmodel_latest", got)
+	}
+}
+
+// A "none" tier must disable thinking the way the official client does: set
+// is_reasoning=false on both model_config copies AND send an explicit
+// max_thinking_tokens of 0. Serializing 0 (rather than omitting it) is the
+// whole point, so the pointer field is asserted here.
+func TestHandleChatDisablesReasoningForNoneTier(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "none",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["reasoning_effort"]; got != "none" {
+		t.Errorf("parameters.reasoning_effort = %#v, want none", got)
+	}
+	if got, ok := params["max_thinking_tokens"].(float64); !ok || got != 0 {
+		t.Errorf("parameters.max_thinking_tokens = %#v, want explicit 0", params["max_thinking_tokens"])
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != false {
+		t.Errorf("model_config.is_reasoning = %#v, want false", got)
+	}
+	extra := payload["chat_context"].(map[string]interface{})["extra"].(map[string]interface{})
+	if got := extra["modelConfig"].(map[string]interface{})["is_reasoning"]; got != false {
+		t.Errorf("chat_context.extra.modelConfig.is_reasoning = %#v, want false", got)
+	}
+}
+
+// A tier the model does not support is dropped entirely, and the model keeps
+// whatever reasoning capability the catalog advertised for it.
+func TestHandleChatUnsupportedTierKeepsCatalogReasoning(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "high",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+
+	params := payload["parameters"].(map[string]interface{})
+	if got, present := params["reasoning_effort"]; present {
+		t.Errorf("unsupported tier must be omitted, got %#v", got)
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
+		t.Errorf("model_config.is_reasoning = %#v, want true (catalog capability preserved)", got)
 	}
 }
 
@@ -864,5 +960,70 @@ func TestResolveReasoningEffortRejectsUnsupportedModelTier(t *testing.T) {
 	}
 	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, qwen); got != "none" {
 		t.Errorf("supported disabled tier = %q, want none", got)
+	}
+}
+
+// The caller's cap must win over the catalog default, otherwise models with a
+// small advertised cap (the built-in BYOK table lists one at 2048) would have
+// their responses silently truncated.
+func TestResolveMaxTokensPrefersCallerValue(t *testing.T) {
+	const catalogDefault = 2048
+
+	cases := []struct {
+		name    string
+		reqBody map[string]interface{}
+		want    int
+	}{
+		{"caller cap wins over smaller catalog cap",
+			map[string]interface{}{"max_tokens": float64(16000)}, 16000},
+		{"newer max_completion_tokens is honored",
+			map[string]interface{}{"max_completion_tokens": float64(9000)}, 9000},
+		{"max_tokens takes precedence over max_completion_tokens",
+			map[string]interface{}{"max_tokens": float64(4096), "max_completion_tokens": float64(9000)}, 4096},
+		{"absent falls back to catalog", map[string]interface{}{}, catalogDefault},
+		{"zero is not a usable cap", map[string]interface{}{"max_tokens": float64(0)}, catalogDefault},
+		{"negative is not a usable cap", map[string]interface{}{"max_tokens": float64(-5)}, catalogDefault},
+		{"fractional is not a usable cap", map[string]interface{}{"max_tokens": 100.5}, catalogDefault},
+		{"string is not a usable cap", map[string]interface{}{"max_tokens": "8000"}, catalogDefault},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMaxTokens(tc.reqBody, catalogDefault); got != tc.want {
+				t.Errorf("resolveMaxTokens(%v, %d) = %d, want %d", tc.reqBody, catalogDefault, got, tc.want)
+			}
+		})
+	}
+}
+
+// The resolved cap must reach the signed gateway body inside "parameters".
+func TestHandleChatForwardsCallerMaxTokens(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":      "Fake-Model",
+		"messages":   []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":     true,
+		"max_tokens": float64(16000),
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["max_tokens"].(float64); got != 16000 {
+		t.Errorf("parameters.max_tokens = %v, want 16000 (catalog cap is 4096)", got)
 	}
 }

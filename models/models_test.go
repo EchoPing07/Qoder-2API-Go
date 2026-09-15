@@ -200,3 +200,92 @@ func TestDefaultCatalogHasNoReasoningMetadata(t *testing.T) {
 		t.Errorf("fallback catalog must not claim per-model effort knowledge, got %v", cat.Reasoning)
 	}
 }
+
+// The bridge reads is_reasoning and max_output_tokens out of the catalog the
+// same way the official client does, so both must survive parsing, including
+// their fallbacks for missing or malformed values.
+func TestExtractCatalogParsesModelCaps(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			// Reasoning model with an explicit cap.
+			map[string]interface{}{"key": "a", "display_name": "ModelA", "enable": true,
+				"is_reasoning": true, "max_output_tokens": 8000},
+			// Non-reasoning model; cap arrives as a numeric string.
+			map[string]interface{}{"key": "b", "display_name": "ModelB", "enable": true,
+				"is_reasoning": false, "max_output_tokens": "6000"},
+			// No caps at all: is_reasoning defaults to false, cap to the fallback.
+			map[string]interface{}{"key": "c", "display_name": "ModelC", "enable": true},
+			// Unusable cap must fall back, not leak a zero that would truncate output.
+			map[string]interface{}{"key": "d", "display_name": "ModelD", "enable": true,
+				"is_reasoning": true, "max_output_tokens": 0},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat == nil {
+		t.Fatal("expected non-nil catalog")
+	}
+
+	a := cat.Caps["a"]
+	if a == nil {
+		t.Fatal("ModelA caps missing")
+	}
+	if !a.IsReasoning {
+		t.Error("ModelA is_reasoning should be true")
+	}
+	if a.MaxOutputTokens != 8000 {
+		t.Errorf("ModelA max_output_tokens = %d, want 8000", a.MaxOutputTokens)
+	}
+
+	b := cat.Caps["b"]
+	if b == nil {
+		t.Fatal("ModelB caps missing")
+	}
+	if b.IsReasoning {
+		t.Error("ModelB is_reasoning should be false")
+	}
+	if b.MaxOutputTokens != 6000 {
+		t.Errorf("ModelB max_output_tokens = %d, want 6000 (parsed from string)", b.MaxOutputTokens)
+	}
+
+	c := cat.Caps["c"]
+	if c == nil {
+		t.Fatal("ModelC caps missing")
+	}
+	if c.IsReasoning {
+		t.Error("ModelC is_reasoning should default to false, matching the official client")
+	}
+	if c.MaxOutputTokens != DefaultMaxOutputTokens {
+		t.Errorf("ModelC max_output_tokens = %d, want %d", c.MaxOutputTokens, DefaultMaxOutputTokens)
+	}
+
+	if got := cat.MaxOutputTokens("d"); got != DefaultMaxOutputTokens {
+		t.Errorf("MaxOutputTokens(d) = %d, want %d for an unusable cap", got, DefaultMaxOutputTokens)
+	}
+	if got := cat.MaxOutputTokens("missing"); got != DefaultMaxOutputTokens {
+		t.Errorf("MaxOutputTokens(missing) = %d, want %d", got, DefaultMaxOutputTokens)
+	}
+	if got := cat.ReasoningDefault("a"); !got {
+		t.Error("ReasoningDefault(a) = false, want true")
+	}
+	if got := cat.ReasoningDefault("c"); got {
+		t.Error("ReasoningDefault(c) = true, want false")
+	}
+	// A model absent from caps must not silently lose thinking; the bridge only
+	// reaches this branch when the dynamic catalog is unavailable.
+	if got := cat.ReasoningDefault("missing"); !got {
+		t.Error("ReasoningDefault(missing) = false, want true (preserve always-on fallback)")
+	}
+}
+
+func TestDefaultCatalogCapsFallBack(t *testing.T) {
+	cat := DefaultCatalog()
+	if cat.Caps != nil {
+		t.Errorf("fallback catalog must not claim per-model caps, got %v", cat.Caps)
+	}
+	if got := cat.MaxOutputTokens(PreferredDefaultKey); got != DefaultMaxOutputTokens {
+		t.Errorf("MaxOutputTokens = %d, want %d", got, DefaultMaxOutputTokens)
+	}
+	if got := cat.ReasoningDefault(PreferredDefaultKey); !got {
+		t.Error("ReasoningDefault = false, want true when the catalog carries no caps")
+	}
+}

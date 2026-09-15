@@ -70,6 +70,24 @@ type modelConfig struct {
 	Source      string `json:"source"`
 }
 
+// chatParameters mirrors the gateway's "parameters" object. The official client
+// builds this map first and always attaches it to the request body; the gateway
+// reads completion caps, thinking control and tool selection from here and never
+// from the top level of the body.
+type chatParameters struct {
+	// MaxTokens caps completion tokens. Always sent, matching the official
+	// client's unconditional max_tokens entry.
+	MaxTokens int `json:"max_tokens"`
+	// MaxThinkingTokens caps thinking tokens. A pointer so that an explicit 0
+	// survives serialization: 0 is how the official client disables thinking.
+	MaxThinkingTokens *int `json:"max_thinking_tokens,omitempty"`
+	// ReasoningEffort is the canonical thinking tier (none/low/medium/high/
+	// xhigh/max) validated against the model's catalog metadata.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ToolChoice carries the OpenAI tool_choice value verbatim.
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+}
+
 type business struct {
 	ID      string      `json:"id"`
 	Name    string      `json:"name"`
@@ -79,26 +97,28 @@ type business struct {
 // ChatRequestBody is the Qoder chat request body sent to the gateway.
 // Field order matches baseprompt.json for consistent JSON serialization.
 type ChatRequestBody struct {
-	RequestID         string                   `json:"request_id"`
-	RequestSetID      string                   `json:"request_set_id"`
-	ChatRecordID      string                   `json:"chat_record_id"`
-	Stream            bool                     `json:"stream"`
-	ChatTask          string                   `json:"chat_task"`
-	ChatContext       chatContext              `json:"chat_context"`
-	SessionID         string                   `json:"session_id"`
-	Source            int                      `json:"source"`
-	Version           string                   `json:"version"`
-	AliyunUserType    string                   `json:"aliyun_user_type"`
-	SessionType       string                   `json:"session_type"`
-	AgentID           string                   `json:"agent_id"`
-	TaskID            string                   `json:"task_id"`
-	ModelConfig       modelConfig              `json:"model_config"`
-	Messages          []transform.QoderMessage `json:"messages"`
-	Business          business                 `json:"business"`
-	ReasoningEffort   string                   `json:"reasoning_effort,omitempty"`
-	Tools             json.RawMessage          `json:"tools,omitempty"`
-	ToolChoice        json.RawMessage          `json:"tool_choice,omitempty"`
-	ParallelToolCalls json.RawMessage          `json:"parallel_tool_calls,omitempty"`
+	RequestID      string                   `json:"request_id"`
+	RequestSetID   string                   `json:"request_set_id"`
+	ChatRecordID   string                   `json:"chat_record_id"`
+	Stream         bool                     `json:"stream"`
+	ChatTask       string                   `json:"chat_task"`
+	ChatContext    chatContext              `json:"chat_context"`
+	SessionID      string                   `json:"session_id"`
+	Source         int                      `json:"source"`
+	Version        string                   `json:"version"`
+	AliyunUserType string                   `json:"aliyun_user_type"`
+	SessionType    string                   `json:"session_type"`
+	AgentID        string                   `json:"agent_id"`
+	TaskID         string                   `json:"task_id"`
+	ModelConfig    modelConfig              `json:"model_config"`
+	Messages       []transform.QoderMessage `json:"messages"`
+	Business       business                 `json:"business"`
+	Parameters     chatParameters           `json:"parameters"`
+	Tools          json.RawMessage          `json:"tools,omitempty"`
+	// ParallelToolCalls has no equivalent in the native gateway contract: the
+	// official client only forwards it on the external OpenAI-compatible path.
+	// It is passed through for clients that send it, but the gateway ignores it.
+	ParallelToolCalls json.RawMessage `json:"parallel_tool_calls,omitempty"`
 }
 
 // newRequestBody creates a ChatRequestBody with hardcoded defaults that
@@ -139,6 +159,9 @@ func newRequestBody() *ChatRequestBody {
 		Messages: []transform.QoderMessage{},
 		Business: business{
 			Name: "hi",
+		},
+		Parameters: chatParameters{
+			MaxTokens: models.DefaultMaxOutputTokens,
 		},
 	}
 }
@@ -530,9 +553,18 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	body.Stream = true
 	body.AliyunUserType = identity.UserType
 	body.ModelConfig.Key = qoderModel
-	body.ModelConfig.IsReasoning = true
 	body.ChatContext.Extra.ModelConfig.Key = qoderModel
-	body.ChatContext.Extra.ModelConfig.IsReasoning = true
+
+	// Thinking capability comes from the gateway catalog the way the official
+	// client resolves it (is_reasoning ?? false), instead of being forced on.
+	// A resolved "none" tier overrides both copies further below.
+	reasoningOn := catalog.ReasoningDefault(qoderModel)
+	body.ModelConfig.IsReasoning = reasoningOn
+	body.ChatContext.Extra.ModelConfig.IsReasoning = reasoningOn
+	// Completion cap follows the official precedence: a caller-supplied value
+	// wins, the catalog default is only the fallback. Clamping to the catalog
+	// would silently truncate models whose advertised cap is small.
+	body.Parameters.MaxTokens = resolveMaxTokens(reqBody, catalog.MaxOutputTokens(qoderModel))
 	body.Business.ID = uuid.New().String()
 	body.Business.BeginAt = time.Now().UnixMilli()
 
@@ -576,10 +608,23 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	}
 
 	if effort := resolveReasoningEffort(reqBody, catalog.Reasoning[qoderModel]); effort != "" {
-		body.ReasoningEffort = effort
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s", len(prompt), openaiModel, effort)
+		// The gateway reads the tier from "parameters", never from the top level
+		// of the body. The official client assembles it the same way.
+		body.Parameters.ReasoningEffort = effort
+		if effort == "none" {
+			// Disable thinking explicitly: the client sets is_reasoning=false and
+			// max_thinking_tokens=0 together. The pointer field is what lets an
+			// explicit 0 survive serialization instead of being omitted.
+			zero := 0
+			body.Parameters.MaxThinkingTokens = &zero
+			body.ModelConfig.IsReasoning = false
+			body.ChatContext.Extra.ModelConfig.IsReasoning = false
+		}
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s is_reasoning=%t max_tokens=%d",
+			len(prompt), openaiModel, effort, body.ModelConfig.IsReasoning, body.Parameters.MaxTokens)
 	} else {
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default(on)", len(prompt), openaiModel)
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default(on) is_reasoning=%t max_tokens=%d",
+			len(prompt), openaiModel, body.ModelConfig.IsReasoning, body.Parameters.MaxTokens)
 	}
 
 	url := auth.ChatURL(b.Region)
@@ -972,6 +1017,28 @@ func statsModelLabel(reqBody map[string]interface{}, b *OpenAiBridge, ctx contex
 	return model
 }
 
+// resolveMaxTokens picks the completion cap for the gateway request. A positive
+// integer from the client wins, matching the official client's
+// LS(maxOutputTokens ?? catalogDefault); otherwise the catalog value applies.
+// OpenAI clients may use either max_tokens or the newer max_completion_tokens.
+func resolveMaxTokens(reqBody map[string]interface{}, catalogDefault int) int {
+	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
+		if n, ok := positiveJSONInt(reqBody[key]); ok {
+			return n
+		}
+	}
+	return catalogDefault
+}
+
+// positiveJSONInt parses a decoded JSON number into a positive int.
+func positiveJSONInt(v interface{}) (int, bool) {
+	n, ok := v.(float64)
+	if !ok || n != float64(int(n)) || int(n) <= 0 {
+		return 0, false
+	}
+	return int(n), true
+}
+
 func extractMessages(raw interface{}) []map[string]interface{} {
 	list, ok := raw.([]interface{})
 	if !ok {
@@ -1034,7 +1101,7 @@ func applyToolConfig(body *ChatRequestBody, reqBody map[string]interface{}) bool
 	}
 	if tc, ok := reqBody["tool_choice"]; ok {
 		b, _ := marshalNoEscape(tc)
-		body.ToolChoice = b
+		body.Parameters.ToolChoice = b
 	}
 	if ptc, ok := reqBody["parallel_tool_calls"]; ok {
 		b, _ := marshalNoEscape(ptc)
