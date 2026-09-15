@@ -17,18 +17,18 @@
 
 ## 支持的模型
 
-| 显示名称            | 内部 Key         |
+| 显示名称 | 内部 Key |
 | ----------------- | -------------- |
-| Qwen3.8-Max       | qmodel_38max   |
-| Qwen3.7-Max       | qmodel_latest  |
-| Qwen3.7-Plus      | qmodel         |
-| Qwen3.6-Flash     | q36fmodel      |
-| DeepSeek-V4-Pro   | dmodel         |
-| DeepSeek-V4-Flash | dfmodel        |
-| GLM-5.3           | gmodel         |
-| GLM-5.2           | gm51model      |
-| Kimi-K2.7-Code    | kmodel         |
-| MiniMax-M2.7      | mmodel         |
+| Qwen3.8-Max | qmodel_38max |
+| Qwen3.7-Max | qmodel_latest |
+| Qwen3.7-Plus | qmodel |
+| Qwen3.6-Flash | q36fmodel |
+| DeepSeek-V4-Pro | dmodel |
+| DeepSeek-V4-Flash | dfmodel |
+| GLM-5.3 | gmodel |
+| GLM-5.2 | gm51model |
+| Kimi-K2.7-Code | kmodel |
+| MiniMax-M2.7 | mmodel |
 
 > 以上为内置默认列表（catalog-v6，2026-08-15），实际可用模型以网关动态返回为准。
 >
@@ -68,7 +68,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 ### 环境变量
 
 | 变量名 | 默认值 | 说明 |
-|-------|--------|------|
+| ------- | -------- | ------ |
 | `QODER_HOST` | `0.0.0.0` | 监听地址 |
 | `QODER_PORT` | `10081` | 监听端口 |
 | `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
@@ -150,10 +150,56 @@ curl http://localhost:10081/v1/models \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx"
 ```
 
+### 5. 控制思考强度（`reasoning_effort`）
+
+请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位会作为顶层字段写入原有的 COSY 签名网关请求；**无需**额外的 device token、Bearer token 或模型服务域名配置，未携带该字段的请求保持原有行为。
+
+```json
+{
+  "model": "Qwen3.8-Max",
+  "messages": [{"role": "user", "content": "你好"}],
+  "reasoning_effort": "xhigh"
+}
+```
+
+桥接层从动态模型目录读取每个模型的 `efforts` 与 `supports_disabled` 后校验档位：有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度；不会发送可能导致上游拒绝的无效值。
+
+**pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
+
+```json
+{
+  "providers": {
+    "qoder-local": {
+      "compat": {
+        "supportsDeveloperRole": false
+      }
+    }
+  }
+}
+```
+
+以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型：
+
+```json
+{
+  "id": "Qwen3.8-Max",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "off": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  }
+}
+```
+
 ## API 端点
 
 | 端点 | 方法 | 说明 |
-|------|------|------|
+| ------ | ------ | ------ |
 | `/v1/chat/completions` | POST | 聊天补全（兼容 OpenAI 格式） |
 | `/v1/models` | GET | 获取模型列表 |
 | `/admin` | GET | Web 管理面板 |

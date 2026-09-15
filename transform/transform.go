@@ -284,6 +284,11 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 	if role == "" {
 		role = "user"
 	}
+	// Qoder's upstream chat protocol accepts system messages but rejects the
+	// OpenAI-only developer role that Pi uses for its agent instruction.
+	if role == "developer" {
+		role = "system"
+	}
 	text := normalizeMessageText(message)
 	anyToolCalls := extractAnyToolCalls(message, text, toolsEnabled)
 	var structuredToolCalls []NormalizedToolCall

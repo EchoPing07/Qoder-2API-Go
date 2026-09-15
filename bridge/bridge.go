@@ -95,6 +95,7 @@ type ChatRequestBody struct {
 	ModelConfig       modelConfig              `json:"model_config"`
 	Messages          []transform.QoderMessage `json:"messages"`
 	Business          business                 `json:"business"`
+	ReasoningEffort   string                   `json:"reasoning_effort,omitempty"`
 	Tools             json.RawMessage          `json:"tools,omitempty"`
 	ToolChoice        json.RawMessage          `json:"tool_choice,omitempty"`
 	ParallelToolCalls json.RawMessage          `json:"parallel_tool_calls,omitempty"`
@@ -574,7 +575,12 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 		log.Printf("[bridge] multimodal: %d image(s) attached [%s]", imgCount, openaiModel)
 	}
 
-	log.Printf("[bridge] chat req: prompt_len=%d model=%s", len(prompt), openaiModel)
+	if effort := resolveReasoningEffort(reqBody, catalog.Reasoning[qoderModel]); effort != "" {
+		body.ReasoningEffort = effort
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s", len(prompt), openaiModel, effort)
+	} else {
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default(on)", len(prompt), openaiModel)
+	}
 
 	url := auth.ChatURL(b.Region)
 	extraHeaders := map[string]string{
@@ -978,6 +984,44 @@ func extractMessages(raw interface{}) []map[string]interface{} {
 		}
 	}
 	return result
+}
+
+// resolveReasoningEffort validates the OpenAI-style reasoning_effort against
+// the selected model's catalog metadata. Empty means preserve the gateway's
+// existing default reasoning behaviour by omitting the optional field.
+func resolveReasoningEffort(reqBody map[string]interface{}, ri *models.ModelReasoning) string {
+	raw, _ := reqBody["reasoning_effort"].(string)
+	effort := normalizeReasoningEffort(raw)
+	if effort == "" {
+		if strings.TrimSpace(raw) != "" {
+			log.Printf("[bridge] ignoring unsupported reasoning_effort %q; keeping reasoning enabled", raw)
+		}
+		return ""
+	}
+	if ri == nil || !ri.Known {
+		return effort
+	}
+	if effort == "none" && ri.SupportsDisabled {
+		return effort
+	}
+	for _, supported := range ri.Efforts {
+		if effort == supported {
+			return effort
+		}
+	}
+	log.Printf("[bridge] reasoning_effort %q not supported by model; keeping model default", effort)
+	return ""
+}
+
+func normalizeReasoningEffort(value string) string {
+	switch effort := strings.ToLower(strings.TrimSpace(value)); effort {
+	case "none", "low", "medium", "high", "xhigh", "max":
+		return effort
+	case "minimal":
+		return "low"
+	default:
+		return ""
+	}
 }
 
 // applyToolConfig applies tool configuration from the client request to the body struct.

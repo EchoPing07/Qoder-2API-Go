@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"qoder2api/auth"
+	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/transform"
 )
@@ -243,6 +245,15 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 // region pointing at this test server).
 type fakeGateway struct {
 	chatLines []string // raw SSE lines ("data: {...}")
+
+	mu       sync.Mutex
+	chatBody []byte
+}
+
+func (g *fakeGateway) lastChatBody() []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]byte(nil), g.chatBody...)
 }
 
 func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
@@ -254,9 +265,13 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"efforts":["low","medium","xhigh"],"supports_disabled":true}]}`)
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gw.mu.Lock()
+		gw.chatBody = body
+		gw.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
 		for _, l := range gw.chatLines {
@@ -806,5 +821,48 @@ func TestChatSlotsSerializeUpstreamCalls(t *testing.T) {
 	}
 	if got := maxInFlight.Load(); got != 1 {
 		t.Errorf("max concurrent upstream calls = %d, want 1 (default slot limit)", got)
+	}
+}
+
+func TestHandleChatSendsReasoningEffortToSignedGateway(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "xhigh",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	if got := payload["reasoning_effort"]; got != "xhigh" {
+		t.Errorf("reasoning_effort = %#v, want xhigh", got)
+	}
+	if got := payload["model_config"].(map[string]interface{})["key"]; got != "qmodel_latest" {
+		t.Errorf("model_config.key = %#v, want qmodel_latest", got)
+	}
+}
+
+func TestResolveReasoningEffortRejectsUnsupportedModelTier(t *testing.T) {
+	qwen := &models.ModelReasoning{Efforts: []string{"low", "medium", "xhigh"}, SupportsDisabled: true, Known: true}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, qwen); got != "" {
+		t.Errorf("unsupported tier = %q, want omitted", got)
+	}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, qwen); got != "none" {
+		t.Errorf("supported disabled tier = %q, want none", got)
 	}
 }

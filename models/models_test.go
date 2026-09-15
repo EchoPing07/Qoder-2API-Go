@@ -111,3 +111,92 @@ func TestFallbackDefaultPrefersCheapTier(t *testing.T) {
 		t.Errorf("expected deterministic A-Lite, got %q", got)
 	}
 }
+
+// --- Per-model reasoning metadata parsing (efforts / supports_disabled) ---
+
+func TestExtractCatalogParsesReasoningMetadata(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			// Array shape with aliases and junk entries.
+			map[string]interface{}{"key": "a", "display_name": "ModelA", "enable": true,
+				"efforts":           []interface{}{"low", " Medium ", "xhigh", "off", "turbo", 42},
+				"supports_disabled": true},
+			// Comma/space separated string shape.
+			map[string]interface{}{"key": "b", "display_name": "ModelB", "enable": true,
+				"efforts": "high, max"},
+			// Object-map shape (keys are the efforts, values are descriptors).
+			map[string]interface{}{"key": "c", "display_name": "ModelC", "enable": true,
+				"efforts": map[string]interface{}{"low": map[string]interface{}{}, "xhigh": map[string]interface{}{"is_default": true}}},
+			// No reasoning metadata at all: must be absent from the map.
+			map[string]interface{}{"key": "d", "display_name": "ModelD", "enable": true},
+			// Only supports_disabled: on/off switch without effort tiers.
+			map[string]interface{}{"key": "e", "display_name": "ModelE", "enable": true,
+				"supports_disabled": "true"},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat == nil {
+		t.Fatal("expected non-nil catalog")
+	}
+
+	a := cat.Reasoning["a"]
+	if a == nil {
+		t.Fatal("ModelA reasoning metadata missing")
+	}
+	wantA := []string{"low", "medium", "xhigh", "none"}
+	if len(a.Efforts) != len(wantA) {
+		t.Fatalf("ModelA efforts = %v, want %v", a.Efforts, wantA)
+	}
+	for i, e := range wantA {
+		if a.Efforts[i] != e {
+			t.Errorf("ModelA efforts[%d] = %q, want %q", i, a.Efforts[i], e)
+		}
+	}
+	if !a.SupportsDisabled {
+		t.Error("ModelA supports_disabled should be true")
+	}
+	if !a.Known {
+		t.Error("ModelA should be Known")
+	}
+
+	b := cat.Reasoning["b"]
+	if b == nil {
+		t.Fatal("ModelB reasoning metadata missing")
+	}
+	if len(b.Efforts) != 2 || b.Efforts[0] != "high" || b.Efforts[1] != "max" {
+		t.Errorf("ModelB efforts = %v, want [high max]", b.Efforts)
+	}
+	if b.SupportsDisabled {
+		t.Error("ModelB supports_disabled should default to false")
+	}
+
+	c := cat.Reasoning["c"]
+	if c == nil {
+		t.Fatal("ModelC reasoning metadata missing")
+	}
+	if len(c.Efforts) != 2 || c.Efforts[0] != "low" || c.Efforts[1] != "xhigh" {
+		t.Errorf("ModelC efforts = %v, want [low xhigh]", c.Efforts)
+	}
+
+	if _, ok := cat.Reasoning["d"]; ok {
+		t.Error("ModelD without metadata should not appear in Reasoning")
+	}
+
+	e := cat.Reasoning["e"]
+	if e == nil {
+		t.Fatal("ModelE reasoning metadata missing")
+	}
+	if len(e.Efforts) != 0 {
+		t.Errorf("ModelE efforts = %v, want empty", e.Efforts)
+	}
+	if !e.SupportsDisabled {
+		t.Error("ModelE supports_disabled should be coerced from \"true\"")
+	}
+}
+
+func TestDefaultCatalogHasNoReasoningMetadata(t *testing.T) {
+	cat := DefaultCatalog()
+	if cat.Reasoning != nil {
+		t.Errorf("fallback catalog must not claim per-model effort knowledge, got %v", cat.Reasoning)
+	}
+}
