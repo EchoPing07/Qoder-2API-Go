@@ -299,6 +299,44 @@ func TestServeIndex(t *testing.T) {
 	}
 }
 
+// The panel's headline must reflect the allowance the account actually holds.
+// A free account reports userQuota.total=0 while the usable budget sits in
+// addOnQuota; keying the headline off userQuota rendered "套餐 8 / 0 · 剩 0"
+// for an account that still had credits, and hid the pool that really mattered.
+func TestQuotaSourceSelectionIgnoresEmptyPools(t *testing.T) {
+	start := strings.Index(indexHTML, "function quotaPools(acct) {")
+	if start < 0 {
+		t.Fatal("quotaPools not found in the embedded UI")
+	}
+	end := strings.Index(indexHTML[start:], "\n/*\n * Prefer the authoritative")
+	if end < 0 {
+		t.Fatal("could not delimit quotaPools")
+	}
+	pools := indexHTML[start : start+end]
+
+	// A zero-total pool carries no allowance and must not be offered as one.
+	for _, guard := range []string{
+		"acct.user_quota && Number(acct.user_quota.total || 0) > 0",
+		"acct.add_on_quota && Number(acct.add_on_quota.total || 0) > 0",
+		"acct.org_resource_package && Number(acct.org_resource_package.cap || 0) > 0",
+	} {
+		if !strings.Contains(pools, guard) {
+			t.Errorf("quotaPools must skip zero-capacity pools; missing guard %q", guard)
+		}
+	}
+
+	// Both renderers must share that selection instead of hand-rolling their
+	// own, otherwise the headline and the detail card can disagree.
+	renderCredits := indexHTML[strings.Index(indexHTML, "function renderCredits(d) {"):]
+	renderCredits = renderCredits[:strings.Index(renderCredits, "function renderQuotaDetails(d) {")]
+	if !strings.Contains(renderCredits, "quotaPools(acct)") {
+		t.Error("renderCredits must select its pools via quotaPools(acct)")
+	}
+	if strings.Contains(renderCredits, "acct.user_quota ||") {
+		t.Error("renderCredits must not hardcode user_quota as the headline source")
+	}
+}
+
 // Repeated wrong passwords trigger per-IP rate limiting (HTTP 429).
 func TestLoginRateLimit(t *testing.T) {
 	a, _ := newAdmin(t)

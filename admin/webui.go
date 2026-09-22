@@ -1230,6 +1230,33 @@ function loadStats() {
 }
 
 /*
+ * Collect the allowance pools the account actually holds. A pool with a zero
+ * total carries no allowance at all: the free tier reports userQuota.total=0
+ * while the real budget sits in addOnQuota. Treating it as absent (instead of
+ * as an exhausted pool) is what keeps the panel from rendering "8 / 0 · 剩 0"
+ * plus a bogus out-of-quota verdict for an account that still has credits.
+ */
+function quotaPools(acct) {
+  var pools = [];
+  if (acct.user_quota && Number(acct.user_quota.total || 0) > 0) {
+    pools.push({ name: '套餐额度', quota: acct.user_quota, totalKey: 'total', available: true });
+  }
+  if (acct.add_on_quota && Number(acct.add_on_quota.total || 0) > 0) {
+    pools.push({ name: '加购额度', quota: acct.add_on_quota, totalKey: 'total', available: true });
+  }
+  if (acct.org_resource_package && Number(acct.org_resource_package.cap || 0) > 0) {
+    pools.push({
+      name: '组织资源包',
+      quota: acct.org_resource_package,
+      totalKey: 'cap',
+      available: Boolean(acct.org_resource_package.available),
+      checkAvailability: true
+    });
+  }
+  return pools;
+}
+
+/*
  * Prefer the authoritative cycle allowance used by Qoder's official /usage
  * view. Local cycle_credits remains a fallback for temporary OpenAPI outages;
  * it only covers traffic observed by this bridge and is therefore never mixed
@@ -1241,30 +1268,31 @@ function renderCredits(d) {
   var cycle = Number(d.cycle_credits || 0);
   var resetMs = Number(d.next_reset_ms || 0);
   var acct = d.account || {};
-  var quota = acct.user_quota || null;
+  var pools = quotaPools(acct);
   var title = ['本服务累计消耗 ' + fmtCredits(lifetime)];
 
   el.textContent = '';
-  if (quota) {
+  if (pools.length > 0) {
+    // The headline describes the pool that actually carries the allowance.
+    // Naming it explicitly keeps a free account (whose budget lives in the
+    // add-on pool) from reading as the plan pool being exhausted.
+    var primary = pools[0];
+    var used = Number(primary.quota.used || 0);
+    var total = Number(primary.quota[primary.totalKey] || 0);
+    var remaining = Number(primary.quota.remaining || 0);
     el.appendChild(document.createTextNode(
-      '套餐 ' + fmtCredits(Number(quota.used || 0)) + ' / ' + fmtCredits(Number(quota.total || 0)) +
-      ' · 剩 ' + fmtCredits(Number(quota.remaining || 0))
+      primary.name + ' ' + fmtCredits(used) + ' / ' + fmtCredits(total) +
+      ' · 剩 ' + fmtCredits(remaining)
     ));
-    title.push('套餐额度：已用 ' + fmtCredits(Number(quota.used || 0)) +
-      ' / ' + fmtCredits(Number(quota.total || 0)) +
-      '，剩余 ' + fmtCredits(Number(quota.remaining || 0)));
-    if (acct.add_on_quota) {
-      title.push('加购额度：已用 ' + fmtCredits(Number(acct.add_on_quota.used || 0)) +
-        ' / ' + fmtCredits(Number(acct.add_on_quota.total || 0)) +
-        '，剩余 ' + fmtCredits(Number(acct.add_on_quota.remaining || 0)));
-    }
-    if (acct.org_resource_package) {
-      var org = acct.org_resource_package;
-      title.push('组织资源包：已用 ' + fmtCredits(Number(org.used || 0)) +
-        ' / ' + fmtCredits(Number(org.cap || 0)) +
-        '，剩余 ' + fmtCredits(Number(org.remaining || 0)) +
-        (org.available ? '（可用）' : '（不可用）'));
-    }
+    pools.forEach(function(pool) {
+      var line = pool.name + '：已用 ' + fmtCredits(Number(pool.quota.used || 0)) +
+        ' / ' + fmtCredits(Number(pool.quota[pool.totalKey] || 0)) +
+        '，剩余 ' + fmtCredits(Number(pool.quota.remaining || 0));
+      if (pool.checkAvailability) {
+        line += pool.available ? '（可用）' : '（不可用）';
+      }
+      title.push(line);
+    });
   } else if (resetMs > 0) {
     el.appendChild(document.createTextNode('本服务周期内 ' + fmtCredits(cycle)));
     title.push('官方额度暂不可用；当前数字仅统计本服务观察到的请求');
@@ -1298,22 +1326,7 @@ function renderQuotaDetails(d) {
   var table = document.getElementById('quotaTable');
   var summary = document.getElementById('quotaSummary');
   var acct = d.account || {};
-  var pools = [];
-
-  if (acct.user_quota) {
-    pools.push({ name: '套餐额度', quota: acct.user_quota, totalKey: 'total', available: true });
-  }
-  if (acct.add_on_quota) {
-    pools.push({ name: '加购额度', quota: acct.add_on_quota, totalKey: 'total', available: true });
-  }
-  if (acct.org_resource_package) {
-    pools.push({
-      name: '组织资源包',
-      quota: acct.org_resource_package,
-      totalKey: 'cap',
-      available: Boolean(acct.org_resource_package.available)
-    });
-  }
+  var pools = quotaPools(acct);
 
   if (pools.length === 0) {
     card.classList.add('hidden');

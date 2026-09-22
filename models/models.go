@@ -258,12 +258,30 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 // catalog entry. It returns nil when the entry carries no usable effort
 // information at all, letting callers fall back to the global vocabulary.
 //
-// The gateway serializes "efforts" in several shapes (array of strings,
-// comma/space separated string, or an object map keyed by effort); all are
-// normalized here the same way the official client normalizes them.
+// The live gateway nests the metadata under "thinking_config", keyed by the
+// tier names the model accepts:
+//
+//	"thinking_config": {
+//	  "disabled": {},                                   // present => may switch thinking off
+//	  "enabled": {"efforts": {"low": {}, "xhigh": {}}} // keys are the accepted tiers
+//	}
+//
+// A flat payload carrying "efforts"/"supports_disabled" at the top level is
+// still accepted; the tier names are normalized the same way either way.
 func parseReasoningMeta(m map[string]interface{}) *ModelReasoning {
+	if tc, ok := m["thinking_config"].(map[string]interface{}); ok {
+		supportsDisabled := false
+		if v, present := tc["disabled"]; present && v != nil {
+			supportsDisabled = true
+		}
+		return &ModelReasoning{
+			Efforts:          normalizeEfforts(thinkingEfforts(tc)),
+			SupportsDisabled: supportsDisabled,
+			Known:            true,
+		}
+	}
+
 	effortsRaw, hasEfforts := m["efforts"]
-	efforts := normalizeEfforts(effortsRaw)
 	supportsDisabled := false
 	if v, ok := m["supports_disabled"]; ok && enableFlag(v) {
 		supportsDisabled = true
@@ -272,10 +290,20 @@ func parseReasoningMeta(m map[string]interface{}) *ModelReasoning {
 		return nil
 	}
 	return &ModelReasoning{
-		Efforts:          efforts,
+		Efforts:          normalizeEfforts(effortsRaw),
 		SupportsDisabled: supportsDisabled,
 		Known:            true,
 	}
+}
+
+// thinkingEfforts returns the raw "thinking_config.enabled.efforts" value, in
+// whichever of the supported shapes the gateway serialized it.
+func thinkingEfforts(tc map[string]interface{}) interface{} {
+	enabled, ok := tc["enabled"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return enabled["efforts"]
 }
 
 // normalizeEfforts coerces any supported "efforts" shape into the canonical

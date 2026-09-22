@@ -267,7 +267,11 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"is_reasoning":true,"max_output_tokens":4096,"efforts":["low","medium","xhigh"],"supports_disabled":true}]}`)
+		// Fixture deliberately mirrors the live catalog shape: thinking metadata
+		// is nested under thinking_config, not flattened onto the entry. A flat
+		// fixture is what let the original parser pass tests while reading a
+		// field path the gateway never emits.
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"is_reasoning":true,"max_output_tokens":4096,"thinking_config":{"disabled":{},"enabled":{"efforts":{"low":{},"medium":{"is_default":true},"xhigh":{}},"is_default":true}}}]}`)
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -833,7 +837,7 @@ func TestEnsureAccountStatusMergesAuthoritativeQuota(t *testing.T) {
 		fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
 	})
 	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"id":"uid1","userType":"teams","plan":"PLAN_TIER_TEAM","userTag":"Teams","orgName":"Example Org","nextResetAt":1,"isQuotaExceeded":false}`)
+		io.WriteString(w, `{"id":"uid1","userType":"teams","plan":"PLAN_TIER_TEAM","userTag":"Teams","orgName":"Example Org","nextResetAt":1790265600000,"isQuotaExceeded":false}`)
 	})
 	mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer sot" {
@@ -843,7 +847,9 @@ func TestEnsureAccountStatusMergesAuthoritativeQuota(t *testing.T) {
 			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
 			return
 		}
-		io.WriteString(w, `{"userId":"uid1","userType":"teams","totalUsagePercentage":0.98,"isQuotaExceeded":true,"expiresAt":1790265600000,"userQuota":{"total":3000,"used":2939,"remaining":61,"percentage":0.98,"unit":"credits"},"orgResourcePackage":{"used":0,"cap":4000,"remaining":0,"percentage":0,"available":false,"unit":"credits"}}`)
+		// expiresAt is deliberately a different (and implausibly distant) value:
+		// the gateway's nextResetAt must win over it.
+		io.WriteString(w, `{"userId":"uid1","userType":"teams","totalUsagePercentage":0.98,"isQuotaExceeded":true,"expiresAt":253402214400000,"userQuota":{"total":3000,"used":2939,"remaining":61,"percentage":0.98,"unit":"credits"},"orgResourcePackage":{"used":0,"cap":4000,"remaining":0,"percentage":0,"available":false,"unit":"credits"}}`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -854,8 +860,12 @@ func TestEnsureAccountStatusMergesAuthoritativeQuota(t *testing.T) {
 	if st == nil || st.UserQuota == nil {
 		t.Fatalf("expected authoritative quota, got %+v", st)
 	}
-	if st.UserQuota.Used != 2939 || st.UserQuota.Remaining != 61 || st.NextResetAtMs != 1790265600000 {
+	if st.UserQuota.Used != 2939 || st.UserQuota.Remaining != 61 {
 		t.Errorf("unexpected quota merge: %+v", st)
+	}
+	// The gateway boundary wins; the far-future expiresAt sentinel is ignored.
+	if st.NextResetAtMs != 1790265600000 {
+		t.Errorf("NextResetAtMs = %d, want the /user/status nextResetAt (1790265600000)", st.NextResetAtMs)
 	}
 	if !st.IsQuotaExceeded || st.Plan != "PLAN_TIER_TEAM" || st.OrgName != "Example Org" {
 		t.Errorf("gateway metadata and OpenAPI verdict were not merged: %+v", st)
@@ -1011,6 +1021,135 @@ func TestResolveReasoningEffortRejectsUnsupportedModelTier(t *testing.T) {
 	}
 	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, qwen); got != "none" {
 		t.Errorf("supported disabled tier = %q, want none", got)
+	}
+}
+
+// Forwarding "none" to a model that does not declare thinking_config.disabled
+// makes the upstream reject the whole request with HTTP 400. When the catalog
+// carries no usable metadata for the key the tier cannot be validated, so it
+// must be omitted rather than passed through.
+func TestResolveReasoningEffortOmitsUnverifiedNone(t *testing.T) {
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, nil); got != "" {
+		t.Errorf("none without catalog metadata = %q, want omitted", got)
+	}
+	unknown := &models.ModelReasoning{}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, unknown); got != "" {
+		t.Errorf("none with unknown metadata = %q, want omitted", got)
+	}
+	// ...while other tiers keep their historical pass-through.
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, nil); got != "high" {
+		t.Errorf("high without catalog metadata = %q, want high", got)
+	}
+	// A model that declares the switch but no tiers still accepts "none".
+	switchOnly := &models.ModelReasoning{SupportsDisabled: true, Known: true}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, switchOnly); got != "none" {
+		t.Errorf("none for a model declaring disabled = %q, want none", got)
+	}
+}
+
+// A model whose catalog entry has no thinking_config.disabled must not receive
+// "none" on the wire, and must keep its reasoning enabled.
+func TestHandleChatOmitsNoneForModelWithoutDisabled(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+	// Replace the fixture catalog with one that has no thinking_config.disabled,
+	// mirroring the models that reject "none" upstream (gmodel/gfmodel). The
+	// timestamp must be refreshed too, otherwise the cache is considered stale
+	// and the fake gateway's own catalog is fetched over it.
+	bridge.catalogMu.Lock()
+	bridge.catalog = models.ExtractCatalog(map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "qmodel_latest", "display_name": "Fake-Model", "enable": true,
+				"is_reasoning": true,
+				"thinking_config": map[string]interface{}{
+					"enabled": map[string]interface{}{
+						"efforts": map[string]interface{}{"low": map[string]interface{}{}, "high": map[string]interface{}{}},
+					},
+				}},
+		},
+	})
+	bridge.catalogTs = float64(time.Now().Unix())
+	bridge.catalogMu.Unlock()
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "none",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got, present := params["reasoning_effort"]; present {
+		t.Errorf("none must be omitted for a model without thinking_config.disabled, got %#v", got)
+	}
+	if _, present := params["max_thinking_tokens"]; present {
+		t.Error("max_thinking_tokens must not be sent when the tier is omitted")
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
+		t.Errorf("model_config.is_reasoning = %#v, want true (thinking stays on)", got)
+	}
+}
+
+// A far-future expiresAt sentinel (9999-12-31, used by plans without an
+// expiry) must never override the gateway's real nextResetAt, and must never
+// be adopted as the boundary when nextResetAt is missing.
+func TestEnsureAccountStatusRejectsSentinelResetBoundary(t *testing.T) {
+	const sentinel = int64(253402214400000)
+	const real = int64(1790265600000)
+
+	newBridge := func(t *testing.T, statusBody, quotaBody string) *OpenAiBridge {
+		t.Helper()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+		})
+		mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, statusBody)
+		})
+		mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, quotaBody)
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return NewOpenAiBridge("pt-test", &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL})
+	}
+
+	quota := func(expiresAt int64) string {
+		return fmt.Sprintf(`{"userId":"uid1","userType":"personal_standard","expiresAt":%d,"userQuota":{"total":0,"used":8,"remaining":0,"unit":"credits"},"addOnQuota":{"total":300,"used":36,"remaining":264,"unit":"credits"}}`, expiresAt)
+	}
+
+	// The gateway boundary wins over an OpenAPI sentinel.
+	b := newBridge(t,
+		fmt.Sprintf(`{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE","nextResetAt":%d}`, real),
+		quota(sentinel))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != real {
+		t.Errorf("NextResetAtMs = %v, want the gateway boundary %d", st, real)
+	}
+
+	// With no gateway boundary, the sentinel must be dropped rather than adopted.
+	b = newBridge(t, `{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE"}`, quota(sentinel))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != 0 {
+		t.Errorf("NextResetAtMs = %v, want 0 (sentinel rejected)", st)
+	}
+
+	// A plausible expiresAt still serves as the fallback.
+	b = newBridge(t, `{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE"}`, quota(real))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != real {
+		t.Errorf("NextResetAtMs = %v, want the expiresAt fallback %d", st, real)
 	}
 }
 

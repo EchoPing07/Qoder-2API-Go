@@ -194,6 +194,111 @@ func TestExtractCatalogParsesReasoningMetadata(t *testing.T) {
 	}
 }
 
+// The live gateway nests reasoning metadata under thinking_config. Parsing only
+// the flat form made every model look like it advertised nothing, which in turn
+// let unsupported tiers (notably "none") reach the upstream and fail with 400.
+func TestExtractCatalogParsesNestedThinkingConfig(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			// Tiered model that may also switch thinking off.
+			map[string]interface{}{"key": "tiered", "display_name": "Tiered", "enable": true,
+				"is_reasoning": true,
+				"thinking_config": map[string]interface{}{
+					"disabled": map[string]interface{}{},
+					"enabled": map[string]interface{}{
+						"efforts": map[string]interface{}{
+							"low":     map[string]interface{}{},
+							"medium":  map[string]interface{}{"is_default": true},
+							"xhigh":   map[string]interface{}{},
+							"quantum": map[string]interface{}{},
+						},
+						"is_default": true,
+					},
+				}},
+			// On/off only: enabled has no efforts block and disabled is absent, so
+			// "none" must NOT be forwarded to this model.
+			map[string]interface{}{"key": "toggle", "display_name": "Toggle", "enable": true,
+				"is_reasoning": true,
+				"thinking_config": map[string]interface{}{
+					"enabled": map[string]interface{}{"description": "Enable thinking", "is_default": true},
+				}},
+			// thinking_config explicitly null (as q37fmodel/mmodel ship it).
+			map[string]interface{}{"key": "nullcfg", "display_name": "NullCfg", "enable": true,
+				"is_reasoning": true, "thinking_config": nil},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat == nil {
+		t.Fatal("expected non-nil catalog")
+	}
+
+	tiered := cat.Reasoning["tiered"]
+	if tiered == nil {
+		t.Fatal("nested thinking_config was not parsed")
+	}
+	if !tiered.Known {
+		t.Error("tiered model should be Known")
+	}
+	if !tiered.SupportsDisabled {
+		t.Error("tiered model declares thinking_config.disabled and should support none")
+	}
+	for _, want := range []string{"low", "medium", "xhigh"} {
+		found := false
+		for _, got := range tiered.Efforts {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("tiered efforts = %v, missing %q", tiered.Efforts, want)
+		}
+	}
+	for _, got := range tiered.Efforts {
+		if got == "quantum" {
+			t.Errorf("tiered efforts = %v, unknown tier must be dropped", tiered.Efforts)
+		}
+	}
+
+	toggle := cat.Reasoning["toggle"]
+	if toggle == nil {
+		t.Fatal("thinking_config without disabled must still produce metadata")
+	}
+	if toggle.SupportsDisabled {
+		t.Error("toggle model has no thinking_config.disabled; none must not be forwarded")
+	}
+	if len(toggle.Efforts) != 0 {
+		t.Errorf("toggle efforts = %v, want empty", toggle.Efforts)
+	}
+
+	// thinking_config explicitly null (as q37fmodel/mmodel ship it): no
+	// metadata at all, which is what makes the bridge omit an unverified tier.
+	nullcfg := cat.Reasoning["nullcfg"]
+	if nullcfg != nil {
+		t.Errorf("null thinking_config should advertise nothing, got %+v", nullcfg)
+	}
+}
+
+// The flat legacy shape must keep working alongside the nested one.
+func TestExtractCatalogStillAcceptsFlatReasoningMetadata(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "flat", "display_name": "Flat", "enable": true,
+				"efforts": []interface{}{"low", "xhigh"}, "supports_disabled": true},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat == nil {
+		t.Fatal("expected non-nil catalog")
+	}
+	flat := cat.Reasoning["flat"]
+	if flat == nil || !flat.SupportsDisabled {
+		t.Fatalf("flat metadata regressed: %+v", flat)
+	}
+	if len(flat.Efforts) != 2 || flat.Efforts[0] != "low" || flat.Efforts[1] != "xhigh" {
+		t.Errorf("flat efforts = %v, want [low xhigh]", flat.Efforts)
+	}
+}
+
 func TestDefaultCatalogHasNoReasoningMetadata(t *testing.T) {
 	cat := DefaultCatalog()
 	if cat.Reasoning != nil {

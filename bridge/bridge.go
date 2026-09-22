@@ -36,6 +36,18 @@ var (
 	accountTTL = float64(3600)
 )
 
+// maxPlausibleResetMs bounds a believable subscription boundary. The OpenAPI
+// quota endpoint reports 9999-12-31 (253402214400000) as a "never expires"
+// sentinel for plans without an expiry; that value must not be mistaken for
+// the instant the allowance actually refreshes.
+const maxPlausibleResetMs = int64(4102444800000) // 2100-01-01T00:00:00Z
+
+// plausibleResetMs reports whether ms is a real subscription boundary rather
+// than a missing value or the far-future sentinel.
+func plausibleResetMs(ms int64) bool {
+	return ms > 0 && ms < maxPlausibleResetMs
+}
+
 // chatMaxBodyBytes caps the /v1/chat/completions request body to bound memory
 // use against oversized payloads (DoS hardening).
 const chatMaxBodyBytes = 10 << 20 // 10 MiB
@@ -379,7 +391,16 @@ func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountSta
 	if quota.UserType != "" {
 		st.UserType = quota.UserType
 	}
-	st.NextResetAtMs = quota.ExpiresAtMs
+	// Boundary precedence: the gateway's nextResetAt is authoritative, and the
+	// OpenAPI expiresAt is only a fallback for when it is missing. Plans without
+	// an expiry report the far-future 9999-12-31 sentinel in expiresAt, which
+	// must never be mistaken for the instant the allowance actually refreshes.
+	if !plausibleResetMs(st.NextResetAtMs) {
+		st.NextResetAtMs = 0
+	}
+	if st.NextResetAtMs == 0 && plausibleResetMs(quota.ExpiresAtMs) {
+		st.NextResetAtMs = quota.ExpiresAtMs
+	}
 	st.IsQuotaExceeded = quota.IsQuotaExceeded
 	st.TotalUsagePercentage = quota.TotalUsagePercentage
 	st.UserQuota = quota.UserQuota
@@ -1248,6 +1269,14 @@ func resolveReasoningEffort(reqBody map[string]interface{}, ri *models.ModelReas
 		return ""
 	}
 	if ri == nil || !ri.Known {
+		// Without catalog metadata the tier cannot be validated. Forwarding
+		// "none" is still not safe: models that do not declare
+		// thinking_config.disabled reject it with an upstream 400, so it is
+		// omitted. Other tiers keep the historical pass-through.
+		if effort == "none" {
+			log.Printf("[bridge] reasoning_effort %q not declared by model; leaving thinking on", effort)
+			return ""
+		}
 		return effort
 	}
 	if effort == "none" && ri.SupportsDisabled {

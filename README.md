@@ -163,13 +163,15 @@ curl http://localhost:10081/v1/models \
 }
 ```
 
-桥接层从动态模型目录读取每个模型的 `efforts` 与 `supports_disabled` 后校验档位：有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度；不会发送可能导致上游拒绝的无效值。
+桥接层从动态模型目录的 `thinking_config` 读取校验信息：档位列表来自 `thinking_config.enabled.efforts`（对象 map），`none` 是否允许则取决于 `thinking_config.disabled` 是否声明。有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度。
+
+其中 `none` 的判据是**就紧不就松**：只有在模型目录明确声明 `thinking_config.disabled` 时才转发；目录元数据缺失（模型没有 `thinking_config` 或其为 `null`）时同样省略，因为上游对未声明支持的模型会以一个 HTTP 400 拒绝整个请求。其余档位在元数据缺失时保持原有的直接透传行为。
 
 > **注意**：档位必须放在 `parameters` 内才会生效。网关不读取请求体顶层的 `reasoning_effort`，写在该位置会被静默忽略，模型一律按默认强度思考。此外 `parameters` 还承载 `max_tokens`、`tool_choice` 等字段，桥接层会自动组装，调用方无需关心。
 
 #### `none` 档：完全关闭思考
 
-`none` 是二值开关而非强度档位，需要额外配合才能真正关闭思考。桥接层在档位解析为 `none` 时会同时做三件事（与官方客户端行为一致）：
+`none` 是二值开关而非强度档位，需要额外配合才能真正关闭思考。当模型目录声明了 `thinking_config.disabled` 时，桥接层在档位解析为 `none` 时会同时做三件事（与官方客户端行为一致）：
 
 1. `parameters.reasoning_effort` 置为 `"none"`
 2. `parameters.max_thinking_tokens` 显式置为 `0`（该字段用指针承载，以保证 `0` 不被 JSON 序列化省略）
@@ -244,17 +246,19 @@ curl http://localhost:10081/v1/models \
 合计剩余      4,941 · 09-25 重置
 ```
 
+> 免费账号的套餐池为 `userQuota.total = 0`（套餐本身不含额度），此时面板首行直接展示真正持有额度的池子（通常是加购额度），而不是渲染成「套餐 0 / 0 · 已用尽」。`total`/`cap` 为 0 的池子视为不存在，不会出现在额度明细卡中。
+
 ### 数据来源
 
 主数据来自 `GET https://openapi.qoder.com.cn/api/v2/quota/usage`，使用现有 jobToken 交换返回的 `securityOauthToken` 作为 Bearer。该接口与官方客户端 `/usage` 面板相同，提供：
 
 | 字段 | 含义 | 用途 |
 | ------ | ------ | ------ |
-| `userQuota.total/used/remaining` | 套餐总额、已用及剩余 Credits | 面板主要额度数字 |
+| `userQuota.total/used/remaining` | 套餐总额、已用及剩余 Credits | 面板额度行（`total = 0` 时该池不参与展示） |
 | `userQuota.percentage` | 套餐使用比例 | 管理 API 输出及详细信息 |
 | `addOnQuota` | 加购额度包（存在时） | 管理 API 输出及额度明细卡 |
 | `orgResourcePackage` | 组织资源包容量、已用、剩余及可用状态 | 管理 API 输出及额度明细卡 |
-| `expiresAt` | 当前额度周期结束时刻 | 重置日期与倒计时 |
+| `expiresAt` | 当前额度周期结束时刻（仅兜底） | 重置日期与倒计时 |
 | `isQuotaExceeded` | 官方客户端采用的超额判定 | 面板红色告警徽标 |
 
 网关 `POST /algo/api/v3/user/status?Encode=1` 仍负责提供 `plan`、`userTag`、组织名称和真实 `userType`。它的 `quota: 0` 是精简字段，**不能解释为套餐没有数字上限**；额度必须以 OpenAPI 的 `userQuota` 为准。
@@ -264,7 +268,7 @@ curl http://localhost:10081/v1/models \
 - **官方额度优先**：面板的套餐用量来自账号级 OpenAPI，包含 IDE、CLI 和本服务产生的全部消耗，也能覆盖服务启动前的当期用量。
 - **额度来源分别展示**：套餐额度、加购额度和组织资源包在额度明细卡中分别成行展示，并汇总各额度来源返回的剩余 Credits；组织资源包的“可用/不可用”状态以 OpenAPI 返回值为准。
 - **本地累计仅作降级**：usage 帧中 `billable=false` 的请求仍计入 token，但不计入本地 credits；OpenAPI 从未成功时，面板才显示本服务观察到的周期消耗，并明确标注口径。
-- **周期边界权威同步**：优先使用 OpenAPI `expiresAt`；本地周期起点按自然月回退推导，断网期间仍可完成一次性滚动。
+- **周期边界权威同步**：重置时刻以网关 `/user/status` 的 `nextResetAt` 为权威，OpenAPI `expiresAt` 仅在其缺失时兜底；且 `expiresAt` 必须小于 `2100-01-01` 才会被采纳——无期限套餐会把它填成 `9999-12-31` 哨兵值，该值会被忽略。本地周期起点按自然月回退推导，断网期间仍可完成一次性滚动。
 - **累计值仍保留**：`stats.credits` 保存本服务历史累计扣费，鼠标悬停在额度行可查看。
 
 ### 刷新时机
