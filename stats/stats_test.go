@@ -303,17 +303,60 @@ func TestRecordUsageDefaultsToBillable(t *testing.T) {
 // For the observed Sep 25 reset that is Aug 25, not Aug 26.
 func TestSetBillingCycleDerivesCalendarStart(t *testing.T) {
 	r := NewRecorder(nil)
-	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
+	// Kept in the future so the report's cycle projection never advances it.
+	year := time.Now().Year() + 4
+	reset := time.Date(year, time.September, 25, 0, 0, 0, 0, time.Local)
 	r.SetBillingCycle(reset.UnixMilli())
 
 	rep := r.Report()
 	if rep.NextResetMs != reset.UnixMilli() {
 		t.Fatalf("expected next reset %d, got %d", reset.UnixMilli(), rep.NextResetMs)
 	}
-	wantStart := time.Date(2026, time.August, 25, 0, 0, 0, 0, time.Local)
+	wantStart := time.Date(year, time.August, 25, 0, 0, 0, 0, time.Local)
 	if rep.CycleStartMs != wantStart.UnixMilli() {
 		t.Errorf("expected cycle start %s, got %s",
 			wantStart.Format(time.RFC3339), time.UnixMilli(rep.CycleStartMs).Format(time.RFC3339))
+	}
+}
+
+// addMonthsMs must clamp the day to the target month's length instead of
+// normalizing the overflow (AddDate turned Mar 31 minus one month into Mar 3);
+// a derived cycle start near the beginning of the month made every 29th-31st
+// reset look like a new cycle.
+func TestAddMonthsMsClampsMonthEnd(t *testing.T) {
+	cases := []struct {
+		name string
+		in   time.Time
+		n    int
+		want time.Time
+	}{
+		{"mar-31-minus-1", time.Date(2026, time.March, 31, 12, 30, 45, 0, time.Local), -1,
+			time.Date(2026, time.February, 28, 12, 30, 45, 0, time.Local)},
+		{"mar-30-minus-1", time.Date(2026, time.March, 30, 0, 0, 0, 0, time.Local), -1,
+			time.Date(2026, time.February, 28, 0, 0, 0, 0, time.Local)},
+		{"mar-29-minus-1", time.Date(2026, time.March, 29, 0, 0, 0, 0, time.Local), -1,
+			time.Date(2026, time.February, 28, 0, 0, 0, 0, time.Local)},
+		{"may-31-minus-1", time.Date(2026, time.May, 31, 8, 0, 0, 0, time.Local), -1,
+			time.Date(2026, time.April, 30, 8, 0, 0, 0, time.Local)},
+		{"jan-31-plus-1", time.Date(2026, time.January, 31, 8, 0, 0, 0, time.Local), 1,
+			time.Date(2026, time.February, 28, 8, 0, 0, 0, time.Local)},
+		{"aug-31-plus-1", time.Date(2026, time.August, 31, 8, 0, 0, 0, time.Local), 1,
+			time.Date(2026, time.September, 30, 8, 0, 0, 0, time.Local)},
+		{"leap-mar-31-minus-1", time.Date(2028, time.March, 31, 8, 0, 0, 0, time.Local), -1,
+			time.Date(2028, time.February, 29, 8, 0, 0, 0, time.Local)},
+		// A non-month-end instant keeps its day-of-month and time-of-day.
+		{"mid-month-plus-1", time.Date(2026, time.February, 15, 23, 59, 59, 123456789, time.Local), 1,
+			time.Date(2026, time.March, 15, 23, 59, 59, 123456789, time.Local)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := addMonthsMs(tc.in.UnixMilli(), tc.n)
+			if got != tc.want.UnixMilli() {
+				t.Errorf("addMonthsMs(%s, %d) = %s, want %s",
+					tc.in.Format(time.RFC3339), tc.n,
+					time.UnixMilli(got).Format(time.RFC3339), tc.want.Format(time.RFC3339))
+			}
+		})
 	}
 }
 
@@ -328,6 +371,381 @@ func TestSetBillingCycleIdempotent(t *testing.T) {
 
 	if got := r.Report().CycleCredits; got < 2-1e-9 || got > 2+1e-9 {
 		t.Errorf("expected cycle credits to survive a redundant boundary set, got %v", got)
+	}
+}
+
+// A boundary drifting inside the live cycle (the gateway recomputes the reset
+// instant from "last reset + 1 month") still describes the same subscription
+// period and must keep the accumulated credits.
+//
+// The instants are fixed (with an explicit clock) so this cannot become
+// calendar-dependent: a wall-clock anchor near a month end clamps the derived
+// start and would double-count the month-end case below.
+func TestSetBillingCycleKeepsCreditsOnBoundaryDrift(t *testing.T) {
+	base := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.Local)
+	now := base.Add(-72 * time.Hour).UnixMilli()
+	for _, drift := range []time.Duration{time.Hour, 6 * time.Hour, 48 * time.Hour} {
+		t.Run(drift.String(), func(t *testing.T) {
+			r := NewRecorder(nil)
+			r.setBillingCycleAt(base.UnixMilli(), now)
+			oldStart := r.data.CycleStartMs
+			// Seed directly and pin the report clock: RecordUsage and Report read
+			// the wall clock, which would roll this fixed instant once the suite
+			// runs past Sep 25 2026.
+			r.data.CycleCredits = 3
+
+			drifted := base.Add(drift)
+			r.setBillingCycleAt(drifted.UnixMilli(), now)
+
+			rep := r.reportAt(now)
+			// The drift moves both end points, so the new interval is neither
+			// equal nor contained in the old one, yet it names the same period.
+			if r.data.CycleStartMs == oldStart {
+				t.Fatal("expected the stored cycle start to drift as well")
+			}
+			if rep.CycleCredits < 3-1e-9 || rep.CycleCredits > 3+1e-9 {
+				t.Errorf("expected a same-cycle drift to keep 3 credits, got %v", rep.CycleCredits)
+			}
+			if rep.NextResetMs != drifted.UnixMilli() || rep.CycleStartMs != addMonthsMs(drifted.UnixMilli(), -1) {
+				t.Errorf("expected the drifted boundaries to be stored, got start=%d next=%d",
+					rep.CycleStartMs, rep.NextResetMs)
+			}
+		})
+	}
+}
+
+// A genuine refresh advances the boundary by about a month and must zero the
+// previous cycle's credits, including for the month-end anchors whose derived
+// start clamps backwards (Jul 31 -> Aug 31 -> Sep 30 derived Aug 30, which sits
+// BEFORE the tracked boundary and used to make the overlap test keep stale
+// credits).
+func TestSetBillingCycleNextCycleZeroesCredits(t *testing.T) {
+	cases := []struct {
+		name      string
+		stored    time.Time
+		reported  time.Time
+		wantStart time.Time
+	}{
+		{"month-end-31st", time.Date(2026, time.August, 31, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.September, 30, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.August, 30, 8, 0, 0, 0, time.Local)},
+		{"month-end-30th", time.Date(2026, time.August, 30, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.September, 30, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.August, 30, 8, 0, 0, 0, time.Local)},
+		// 29th/30th anchors whose derived start clamps to Jan 28, i.e. BEFORE the
+		// stored Jan 29/30 boundary: exactly the B2 shape the overlap test missed.
+		{"month-end-29th-clamped", time.Date(2026, time.January, 29, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.February, 28, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.January, 28, 8, 0, 0, 0, time.Local)},
+		{"month-end-30th-clamped", time.Date(2026, time.January, 30, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.February, 28, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.January, 28, 8, 0, 0, 0, time.Local)},
+		{"leap-year", time.Date(2028, time.February, 29, 8, 0, 0, 0, time.Local),
+			time.Date(2028, time.March, 29, 8, 0, 0, 0, time.Local),
+			time.Date(2028, time.February, 29, 8, 0, 0, 0, time.Local)},
+		{"mid-month", time.Date(2026, time.September, 25, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.October, 25, 8, 0, 0, 0, time.Local),
+			time.Date(2026, time.September, 25, 8, 0, 0, 0, time.Local)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRecorder(nil)
+			// The clock is pinned before the tracked boundary so adopting it is a
+			// pure first observation; the credits are seeded directly for the
+			// same reason (RecordUsage reads the wall clock).
+			now := tc.stored.Add(-72 * time.Hour).UnixMilli()
+			r.setBillingCycleAt(tc.stored.UnixMilli(), now)
+			r.data.CycleCredits = 42
+
+			r.setBillingCycleAt(tc.reported.UnixMilli(), now)
+
+			// Pin the report clock: the stored boundary sits in the past half of
+			// the table, which a bare Report would roll once real time passes it.
+			rep := r.reportAt(now)
+			if rep.CycleCredits != 0 {
+				t.Errorf("expected a genuine refresh to zero the old credits, got %v", rep.CycleCredits)
+			}
+			if rep.NextResetMs != tc.reported.UnixMilli() {
+				t.Errorf("expected the new boundary %d, got %d", tc.reported.UnixMilli(), rep.NextResetMs)
+			}
+			if rep.CycleStartMs != tc.wantStart.UnixMilli() {
+				t.Errorf("expected cycle start %s, got %s",
+					tc.wantStart.Format(time.RFC3339), time.UnixMilli(rep.CycleStartMs).Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+// Credits accumulated before the first successful /user/status sync (no tracked
+// boundary yet) are genuinely part of the period: adopting the boundary must not
+// discard them, otherwise a fresh install reports 0 for everything billed since
+// boot.
+func TestSetBillingCycleKeepsPreSyncCredits(t *testing.T) {
+	r := NewRecorder(nil)
+	r.RecordUsage(&Usage{Credits: 2})
+	r.RecordUsage(&Usage{Credits: 2})
+	if got := r.Report().CycleCredits; got != 4 {
+		t.Fatalf("expected the pre-sync credits to accumulate, got %v", got)
+	}
+
+	reset := time.Date(2026, time.October, 25, 8, 0, 0, 0, time.Local)
+	now := reset.Add(-72 * time.Hour).UnixMilli()
+	r.setBillingCycleAt(reset.UnixMilli(), now)
+
+	rep := r.reportAt(now)
+	if rep.CycleCredits != 4 {
+		t.Errorf("the first boundary observation discarded pre-sync credits: %v", rep.CycleCredits)
+	}
+	if rep.NextResetMs != reset.UnixMilli() {
+		t.Errorf("expected the boundary to be adopted, got %d", rep.NextResetMs)
+	}
+	if rep.CycleStartMs != addMonthsMs(reset.UnixMilli(), -1) {
+		t.Errorf("expected the derived cycle start, got %d", rep.CycleStartMs)
+	}
+}
+
+// /user/status is cached for an hour, so a report can name a boundary the service
+// already rolled past. That stale report must not move the tracked boundary
+// backwards nor wipe the fresh cycle's credits.
+func TestSetBillingCycleIgnoresStaleBoundary(t *testing.T) {
+	r := NewRecorder(nil)
+	stale := time.Now().Add(-time.Hour).UnixMilli()
+	r.setBillingCycleAt(stale, stale)
+	// A request after the boundary rolls into the new cycle and bills against it.
+	r.RecordUsage(&Usage{Credits: 2})
+	if got := r.Report().CycleCredits; got != 2 {
+		t.Fatalf("expected 2 credits in the rolled cycle, got %v", got)
+	}
+
+	// The cached status still reports the boundary that already passed.
+	r.dirty = false
+	r.SetBillingCycle(stale)
+	if r.dirty {
+		t.Error("a stale boundary must be ignored without marking the data dirty")
+	}
+
+	rep := r.Report()
+	if rep.CycleCredits != 2 {
+		t.Errorf("a stale cached boundary wiped the new cycle's credits: %v", rep.CycleCredits)
+	}
+	if rep.NextResetMs <= time.Now().UnixMilli() {
+		t.Errorf("a stale cached boundary moved the tracked boundary backwards: %d", rep.NextResetMs)
+	}
+}
+
+// TestSetBillingCycleRecoversFromPersistedSentinel covers the upgrade path: an
+// earlier build adopted the OpenAPI "never expires" sentinel (9999-12-31) as the
+// cycle boundary. The fixed bridge stops reporting it, but the sentinel is still
+// in data.json, and it lies beyond every genuine boundary — so the forward-only
+// rule would reject all real reports and leave the rollover permanently dead.
+// Adopting the real boundary must restore both the boundary and the rollover,
+// while keeping the credits (the sentinel cycle never really ended, so the
+// accumulated total still belongs to the period now being adopted).
+func TestSetBillingCycleRecoversFromPersistedSentinel(t *testing.T) {
+	const sentinel = int64(253402214400000) // 9999-12-31, written by the old build
+	r := NewRecorder(nil)
+	r.setBillingCycleAt(sentinel, 1000)
+	r.RecordUsage(&Usage{Credits: 10})
+	if got := r.Report().CycleCredits; got != 10 {
+		t.Fatalf("expected the sentinel cycle to accumulate, got %v", got)
+	}
+
+	real := time.Date(2026, time.July, 16, 17, 27, 0, 0, time.Local)
+	now := real.Add(-24 * time.Hour).UnixMilli()
+	r.setBillingCycleAt(real.UnixMilli(), now)
+
+	rep := r.reportAt(now)
+	if rep.NextResetMs != real.UnixMilli() {
+		t.Errorf("the sentinel still masks the real boundary: got %d, want %d",
+			rep.NextResetMs, real.UnixMilli())
+	}
+	if rep.CycleStartMs != addMonthsMs(real.UnixMilli(), -1) {
+		t.Errorf("expected the derived cycle start %d, got %d", addMonthsMs(real.UnixMilli(), -1), rep.CycleStartMs)
+	}
+	if rep.CycleCredits != 10 {
+		t.Errorf("recovering from the sentinel discarded live credits: %v", rep.CycleCredits)
+	}
+
+	// The rollover must work again: a request past the real boundary moves the
+	// tracked boundary forward instead of being zeroed forever.
+	r.RecordUsage(&Usage{Credits: 1})
+	after := r.reportAt(real.Add(time.Hour).UnixMilli())
+	if after.CycleCredits != 1 {
+		t.Errorf("expected the rollover to resume after recovery, got %v", after.CycleCredits)
+	}
+	if after.NextResetMs <= real.UnixMilli() {
+		t.Errorf("expected the boundary to advance past the adopted one, got %d", after.NextResetMs)
+	}
+}
+
+// Report projects the rolled view while the stored state still holds the old
+// cycle. A later boundary refinement must not resurrect credits the panel has
+// already reported as zero.
+func TestReportAndSetBillingCycleDoNotResurrectCredits(t *testing.T) {
+	r := NewRecorder(nil)
+	boundary := time.Now().Add(-time.Hour).UnixMilli()
+	r.setBillingCycleAt(boundary, boundary)
+	r.data.CycleCredits = 5
+
+	if got := r.Report().CycleCredits; got != 0 {
+		t.Fatalf("expected the passed boundary to project 0 credits, got %v", got)
+	}
+
+	// A refinement that still names the same (future) period must not bring the
+	// already-projected credits back.
+	r.SetBillingCycle(addMonthsMs(boundary, 1) + int64(30*time.Minute/time.Millisecond))
+	if got := r.Report().CycleCredits; got != 0 {
+		t.Errorf("a refinement resurrected credits already reported as 0: %v", got)
+	}
+}
+
+// A non-advancing monthly step (a few historical DST-anomalous zones consume an
+// entire month's offset change in one step) must not be treated as a valid
+// advance: the roll loops would spin forever holding the recorder lock, hanging
+// every request. nextCycleBoundary refuses it, and the loops stop.
+func TestNextCycleBoundaryRejectsNonAdvancingStep(t *testing.T) {
+	loc, bad := nonAdvancingInstant(t)
+	if adv := advanceBoundaryMs(bad, loc); adv != 0 {
+		t.Errorf("expected a non-advancing step to be rejected, got %d", adv)
+	}
+
+	// An ordinary instant in the same zone still advances, so the guard does
+	// not disable the roll.
+	normal := time.Date(2026, time.June, 15, 12, 0, 0, 0, loc).UnixMilli()
+	want := addMonthsMsIn(normal, 1, loc)
+	if want <= normal {
+		t.Fatalf("test setup: %s does not advance normally", time.UnixMilli(normal).In(loc))
+	}
+	if adv := advanceBoundaryMs(normal, loc); adv != want {
+		t.Errorf("expected an ordinary monthly step to advance to %d, got %d", want, adv)
+	}
+}
+
+// The roll loops must terminate even for a boundary that can never be advanced
+// into the future (the historical anomaly above, or a corrupt persisted value).
+// Holding the recorder lock forever would hang every chat request.
+func TestCycleRollTerminatesOnUnadvanceableBoundary(t *testing.T) {
+	loc, bad := nonAdvancingInstant(t)
+
+	t.Run("dst-anomaly", func(t *testing.T) {
+		// Production helpers always step time.Local, so point it at the anomalous
+		// zone for this subtest. Tests in a package run sequentially, and the
+		// subtest restores the zone before the next one starts.
+		restore := time.Local
+		time.Local = loc
+		defer func() { time.Local = restore }()
+
+		r := NewRecorder(nil)
+		r.data.NextResetMs = bad
+		r.data.CycleStartMs = addMonthsMsIn(bad, -1, loc)
+		r.data.CycleCredits = 9
+
+		// The read path must terminate and drop the undecodable boundary instead
+		// of keeping a past instant that re-zeros every later write.
+		rep := reportWithTimeout(t, r)
+		if rep.CycleCredits != 0 {
+			t.Errorf("expected the passed cycle to project 0 credits, got %v", rep.CycleCredits)
+		}
+		if rep.NextResetMs != 0 {
+			t.Errorf("expected the undecodable boundary to project as unset, got %d", rep.NextResetMs)
+		}
+
+		// The write path must terminate too, and the credits of the new cycle
+		// must survive instead of being wiped by the stale boundary on every
+		// request.
+		r.RecordUsage(&Usage{Credits: 3})
+		if r.data.NextResetMs != 0 {
+			t.Errorf("expected the write path to drop the boundary, got %d", r.data.NextResetMs)
+		}
+		if got := r.Report().CycleCredits; got != 3 {
+			t.Errorf("expected the new cycle to accumulate 3 credits, got %v", got)
+		}
+
+		// Recovery: once the boundary is dropped, the next /user/status report is
+		// a first observation again. It must be adopted and must KEEP the credits
+		// accumulated while no boundary was known, otherwise every recovery would
+		// silently reset the panel to 0.
+		fresh := time.Now().Add(72 * time.Hour).UnixMilli()
+		r.setBillingCycleAt(fresh, time.Now().UnixMilli())
+		if r.data.NextResetMs != fresh {
+			t.Errorf("expected the dropped boundary to be re-adopted, got %d", r.data.NextResetMs)
+		}
+		if got := r.Report().CycleCredits; got != 3 {
+			t.Errorf("re-adopting the boundary discarded the credits: got %v, want 3", got)
+		}
+	})
+
+	t.Run("corrupt-far-past", func(t *testing.T) {
+		// A corrupt boundary far in the past exercises the catch-up cap instead.
+		r := NewRecorder(nil)
+		r.data.NextResetMs = int64(1) // 1970
+		r.data.CycleCredits = 5
+		if rep := reportWithTimeout(t, r); rep.NextResetMs <= time.Now().UnixMilli() {
+			t.Errorf("expected the catch-up to reach the present, got %d", rep.NextResetMs)
+		}
+	})
+}
+
+// reportWithTimeout calls Report in a goroutine so a spinning loop fails the
+// test instead of hanging the whole run.
+func reportWithTimeout(t *testing.T, r *Recorder) *Report {
+	t.Helper()
+	done := make(chan *Report, 1)
+	go func() { done <- r.Report() }()
+	select {
+	case rep := <-done:
+		return rep
+	case <-time.After(10 * time.Second):
+		t.Fatal("Report hung (the roll loop spun holding the recorder lock)")
+		return nil
+	}
+}
+
+// nonAdvancingInstant finds the first zone and instant where a one-month step
+// does not advance: a few historical DST transitions consume a whole month's
+// offset change in a single step. It scans each zone with its own calendar, not
+// time.Local. It skips when the host tzdata has no such transition rather than
+// hard-coding an assumption about the zone database.
+func nonAdvancingInstant(t *testing.T) (*time.Location, int64) {
+	t.Helper()
+	for _, name := range []string{"America/Asuncion", "America/Havana", "America/St_Johns"} {
+		loc, err := time.LoadLocation(name)
+		if err != nil {
+			continue
+		}
+		// Hourly scan over a wide window: the anomalies are whole-month offset
+		// changes, so anything narrower can miss them.
+		start := time.Date(1960, time.January, 1, 0, 0, 0, 0, loc).UnixMilli()
+		end := time.Date(2000, time.January, 1, 0, 0, 0, 0, loc).UnixMilli()
+		for ms := start; ms < end; ms += int64(time.Hour / time.Millisecond) {
+			if addMonthsMsIn(ms, 1, loc) <= ms {
+				return loc, ms
+			}
+		}
+	}
+	t.Skip("host tzdata has no non-advancing month step; the guard is untestable here")
+	return nil, 0
+}
+
+// A persisted boundary far in the past must not cost an unbounded loop under the
+// recorder lock: the panel polls every 15s and every chat request records usage.
+func TestReportBoundsFarPastCatchUp(t *testing.T) {
+	r := NewRecorder(nil)
+	r.data.NextResetMs = int64(1) // 1970
+	r.data.CycleCredits = 7
+
+	done := make(chan *Report, 1)
+	go func() { done <- r.Report() }()
+	select {
+	case rep := <-done:
+		if rep.NextResetMs <= time.Now().UnixMilli() {
+			t.Errorf("expected a bounded projection to move past now, got %d", rep.NextResetMs)
+		}
+		if rep.CycleCredits != 0 {
+			t.Errorf("expected the stale cycle to project 0 credits, got %v", rep.CycleCredits)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Report did not terminate for a far-past boundary")
 	}
 }
 
@@ -417,29 +835,98 @@ func TestSetAccountCopiesAndIsExposed(t *testing.T) {
 	}
 }
 
-// A read must roll the cycle too, not just a write: the panel polls every 15s,
-// so a service sitting idle across the reset boundary would otherwise keep
-// reporting the previous cycle's credits.
-func TestReportRollsCycleOnRead(t *testing.T) {
+// ClearAccount drops the cached snapshot (e.g. after a PAT change), unlike
+// SetAccount(nil), which is a no-op so an outage cannot wipe a known plan.
+func TestClearAccount(t *testing.T) {
 	r := NewRecorder(nil)
-	r.SetBillingCycle(time.Now().Add(-time.Hour).UnixMilli())
-	// Seed a cycle total as if it had been accumulated before the boundary.
-	r.data.CycleCredits = 9
+	r.SetAccount(&Account{Plan: "PLAN_TIER_TEAM", Tag: "Teams"})
+	r.dirty = false
 
-	rep := r.Report()
-	if rep.CycleCredits != 0 {
-		t.Errorf("expected the stale cycle total to be cleared on read, got %v", rep.CycleCredits)
-	}
-	if rep.NextResetMs <= time.Now().UnixMilli() {
-		t.Errorf("expected the boundary to advance into the future, got %d", rep.NextResetMs)
+	r.ClearAccount()
+	if r.Report().Account != nil {
+		t.Error("expected the account snapshot to be cleared")
 	}
 	if !r.dirty {
-		t.Error("expected the rollover to mark data dirty so it gets persisted")
+		t.Error("expected clearing the account to mark the data dirty")
+	}
+
+	// Idempotent: an already nil account must not mark the data dirty again.
+	r.dirty = false
+	r.ClearAccount()
+	if r.dirty {
+		t.Error("clearing an already nil account must not mark the data dirty")
 	}
 }
 
-// A read that does not cross a boundary must not mark the data dirty, otherwise
-// every 15s poll would force a disk write.
+// A read across a boundary must project the rolled cycle instead of mutating
+// the recorder, otherwise an admin poll landing just after the boundary would
+// persist a rollover that discarded the previous cycle's credits.
+func TestReportProjectsCycleOnRead(t *testing.T) {
+	r := NewRecorder(nil)
+	past := time.Now().Add(-time.Hour).UnixMilli()
+	r.SetBillingCycle(past)
+	// Seed a cycle total as if it had been accumulated before the boundary.
+	r.data.CycleCredits = 9
+	r.dirty = false
+
+	rep := r.Report()
+	if rep.CycleCredits != 0 {
+		t.Errorf("expected the stale cycle total to be projected as 0, got %v", rep.CycleCredits)
+	}
+	if rep.CycleStartMs != past {
+		t.Errorf("expected the projected cycle start %d, got %d", past, rep.CycleStartMs)
+	}
+	if rep.NextResetMs <= time.Now().UnixMilli() {
+		t.Errorf("expected the projected boundary to advance into the future, got %d", rep.NextResetMs)
+	}
+
+	// The recorder itself must be untouched: stored values and dirty state.
+	if r.data.CycleCredits != 9 {
+		t.Errorf("a read mutated the stored cycle credits: %v", r.data.CycleCredits)
+	}
+	if r.data.NextResetMs != past {
+		t.Errorf("a read mutated the stored boundary: %d", r.data.NextResetMs)
+	}
+	if r.dirty {
+		t.Error("a read must not mark the data dirty")
+	}
+
+	// A second read must project the same values, not a double advance.
+	rep2 := r.Report()
+	if rep2.CycleCredits != rep.CycleCredits || rep2.CycleStartMs != rep.CycleStartMs || rep2.NextResetMs != rep.NextResetMs {
+		t.Errorf("repeated reads diverged: %+v vs %+v", rep, rep2)
+	}
+}
+
+// A boundary-crossing read must not force a disk write: a Report right after a
+// Flush must not trigger a second SaveStats.
+func TestReportAfterFlushDoesNotPersist(t *testing.T) {
+	p := &fakePersister{}
+	r := NewRecorder(p)
+	// A boundary that passed after the last write: the stored cycle still holds
+	// credits until the next RecordUsage rolls it.
+	r.data.NextResetMs = time.Now().Add(-time.Hour).UnixMilli()
+	r.data.CycleStartMs = addMonthsMs(r.data.NextResetMs, -1)
+	r.data.CycleCredits = 4
+	r.dirty = true
+	if err := r.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	rep := r.Report()
+	if rep.CycleCredits != 0 {
+		t.Errorf("expected the read to project 0 credits for the passed boundary, got %v", rep.CycleCredits)
+	}
+	if err := r.Flush(); err != nil {
+		t.Fatalf("second Flush failed: %v", err)
+	}
+	if p.saveCalls != 1 {
+		t.Errorf("a boundary-crossing read forced a second save: %d", p.saveCalls)
+	}
+}
+
+// A read must never mark the data dirty, otherwise every 15s poll would force a
+// disk write.
 func TestReportStaysCleanWithoutRollover(t *testing.T) {
 	r := NewRecorder(nil)
 	r.SetBillingCycle(time.Now().Add(72 * time.Hour).UnixMilli())
@@ -448,5 +935,63 @@ func TestReportStaysCleanWithoutRollover(t *testing.T) {
 	r.Report()
 	if r.dirty {
 		t.Error("a rollover-free read must not mark the data dirty")
+	}
+}
+
+// memoryPersister round-trips stats like store.Store does, so a "restart" can
+// be modelled as constructing a second Recorder over the same persister.
+type memoryPersister struct {
+	mu   sync.Mutex
+	data *Data
+}
+
+func (m *memoryPersister) LoadStats() *Data {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data == nil {
+		return nil
+	}
+	return m.data.Clone()
+}
+
+func (m *memoryPersister) SaveStats(d *Data) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = d.Clone()
+	return nil
+}
+
+// A persisted account snapshot outlives the process, so a restart with a
+// different (or cleared) PAT would keep showing the previous account: the
+// PAT-change hook only fires on an in-process change. main.go therefore clears
+// once at startup, and this locks the behaviour that makes that sufficient.
+func TestPersistedAccountSurvivesRestartUntilCleared(t *testing.T) {
+	p := &memoryPersister{}
+	r := NewRecorder(p)
+	r.SetAccount(&Account{Plan: "PLAN_A", Tag: "A"})
+	if err := r.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart loads the snapshot: without an explicit clear it is still shown.
+	restarted := NewRecorder(p)
+	if got := restarted.Report().Account; got == nil || got.Tag != "A" {
+		t.Fatalf("expected the persisted account to be restored, got %+v", got)
+	}
+
+	// main.go's startup clear drops it, so a cleared/changed PAT cannot keep
+	// serving the previous account's plan and allowance.
+	restarted.ClearAccount()
+	if got := restarted.Report().Account; got != nil {
+		t.Errorf("startup clear left the previous account visible: %+v", got)
+	}
+
+	// The clear must be persisted too, or the next restart resurrects it.
+	if err := restarted.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	again := NewRecorder(p)
+	if got := again.Report().Account; got != nil {
+		t.Errorf("the cleared snapshot came back after a second restart: %+v", got)
 	}
 }

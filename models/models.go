@@ -68,6 +68,11 @@ const DefaultScene = "chat"
 // not a positive safe integer.
 const DefaultMaxOutputTokens = 32000
 
+// MaxRequestedOutputTokens bounds a caller-supplied completion cap. It matches
+// the largest context window the gateway catalog advertises (1M) and keeps
+// absurd values (1e18 and friends) out of the upstream request.
+const MaxRequestedOutputTokens = 1000000
+
 // ModelCatalog holds display_name → qoder key mapping and capability metadata.
 type ModelCatalog struct {
 	ModelMap     map[string]string // display_name -> key
@@ -90,22 +95,47 @@ type ModelCatalog struct {
 // ModelCaps mirrors the limits of a model/list entry that the official client
 // resolves in oJI before assembling the request body.
 type ModelCaps struct {
-	// IsReasoning reports whether the gateway says this model can think. The
-	// official client defaults a missing field to false (T?.is_reasoning ?? !1).
+	// IsReasoning reports whether this model can think. It is resolved with
+	// the official client's precedence: a present thinking_config.enabled
+	// block wins (the efforts block is what actually lets the model think),
+	// then the top-level is_reasoning flag; an entry carrying neither is
+	// treated as capable, preserving the bridge's always-on behaviour.
 	IsReasoning bool
 	// MaxOutputTokens is the default completion cap, already normalized to
 	// DefaultMaxOutputTokens when the catalog value was absent or unusable.
 	MaxOutputTokens int
 }
 
-// flagValue coerces an optional boolean catalog field. Unlike enableFlag it
-// treats a missing value as false, matching the official client's defaults for
-// capability flags such as is_reasoning.
-func flagValue(v interface{}) bool {
-	if v == nil {
-		return false
+// reasoningCapability resolves a catalog entry's thinking capability with the
+// official client's precedence:
+//
+//  1. thinking_config present as an object: the entry can think iff its
+//     "enabled" block is present and non-null (the efforts block inside it is
+//     what actually lets the model think). The live gateway contradicts the
+//     top-level flag here (dfmodel / kmodel_latest ship is_reasoning=false
+//     alongside a fully populated enabled block), so the nested block wins.
+//  2. thinking_config present but malformed (not an object, not null): the shape
+//     is unknown, so fall back to true. Trusting the top-level flag here could
+//     silently disable thinking for an entry that demonstrably advertises it.
+//  3. Otherwise the top-level is_reasoning flag, truthy-coerced.
+//  4. Otherwise true, preserving the always-on behaviour the bridge had
+//     before it consulted the catalog at all.
+func reasoningCapability(m map[string]interface{}) bool {
+	if tc, ok := m["thinking_config"]; ok {
+		if tcMap, isMap := tc.(map[string]interface{}); isMap {
+			enabled, present := tcMap["enabled"]
+			return present && enabled != nil
+		}
+		if tc != nil {
+			// Unrecognised shape: treat it as "cannot rule thinking out".
+			return true
+		}
+		// Explicit null: fall through to the flag.
 	}
-	return enableFlag(v)
+	if v, present := m["is_reasoning"]; present {
+		return enableFlag(v)
+	}
+	return true
 }
 
 // positiveInt parses a catalog numeric field that may arrive as a JSON number
@@ -161,10 +191,11 @@ func (c *ModelCatalog) MaxOutputTokens(qoderKey string) int {
 	return DefaultMaxOutputTokens
 }
 
-// ReasoningDefault reports whether the gateway says a model can think. A catalog
-// with no caps entry for the key reports true, preserving the bridge's
-// long-standing always-on behaviour when the dynamic catalog is unavailable and
-// the gateway's own is_reasoning flag cannot be consulted.
+// ReasoningDefault reports whether a model can think, using the capability
+// resolved by reasoningCapability when the catalog carries an entry for the
+// key. A catalog with no caps entry for the key reports true, the same
+// fallback reasoningCapability uses for a flagless entry: thinking stays on
+// whenever the gateway has not demonstrably disabled it.
 func (c *ModelCatalog) ReasoningDefault(qoderKey string) bool {
 	if caps, ok := c.Caps[qoderKey]; ok {
 		return caps.IsReasoning
@@ -238,7 +269,7 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 			maxOut = DefaultMaxOutputTokens
 		}
 		caps[key] = &ModelCaps{
-			IsReasoning:     flagValue(m["is_reasoning"]),
+			IsReasoning:     reasoningCapability(m),
 			MaxOutputTokens: maxOut,
 		}
 	}
@@ -306,10 +337,12 @@ func thinkingEfforts(tc map[string]interface{}) interface{} {
 	return enabled["efforts"]
 }
 
-// normalizeEfforts coerces any supported "efforts" shape into the canonical
-// lowercase vocabulary (none/low/medium/high/xhigh/max), preserving order and
-// dropping duplicates or unrecognized values. "off"/"disabled" are folded
-// into "none", matching the official client's normalization.
+// normalizeEfforts turns the several shapes the gateway uses for the accepted
+// tiers (a list, a comma/space separated string, or the efforts object whose keys
+// are the tier names) into a deterministic, canonical list. Map iteration order
+// is random in Go, so the keys are sorted before canonicalization: callers (and
+// the tests locking them) must not depend on iteration order. "off"/"disabled"
+// are folded into "none", matching the official client's normalization.
 func normalizeEfforts(v interface{}) []string {
 	var raw []string
 	switch x := v.(type) {
@@ -327,6 +360,7 @@ func normalizeEfforts(v interface{}) []string {
 		for k := range x {
 			raw = append(raw, k)
 		}
+		sort.Strings(raw)
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(raw))

@@ -153,7 +153,7 @@ curl http://localhost:10081/v1/models \
 
 ### 5. 控制思考强度（`reasoning_effort`）
 
-请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位写入网关请求的 `parameters` 对象（与官方客户端一致），**无需**额外的 device token、Bearer token 或模型服务域名配置；未携带该字段的请求保持原有行为。
+请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位写入网关请求的 `parameters` 对象（与官方客户端一致），**无需**额外的 device token、Bearer token 或模型服务域名配置；未携带 `reasoning_effort` 的请求不改变思考档位，保持模型默认强度（但请求体仍会带上 `parameters.max_tokens`，见下文「`is_reasoning` 与 `max_tokens` 的来源」）。
 
 ```json
 {
@@ -179,12 +179,16 @@ curl http://localhost:10081/v1/models \
 
 其余档位不会写入 `max_thinking_tokens`：官方客户端仅在技能 / 子代理覆盖场景才把档位换算为思考预算，主交互路径只发送档位字符串。
 
+> 档位之间的区别在上游是否可观测仍存疑（见下方「档位实效说明」）：`none` 是唯一实测稳定生效的档位，其余档位不应被当作可靠的强度旋钮。
+
 #### `is_reasoning` 与 `max_tokens` 的来源
 
 两项能力信息来自网关模型目录，与官方客户端的解析方式一致：
 
-- `is_reasoning`：取目录的 `is_reasoning` 字段，缺失时为 `false`。动态目录不可用时回退为 `true`，以保持桥接层原有的"默认开启思考"行为，避免静默关闭所有模型的思考能力。
-- `max_tokens`：取目录的 `max_output_tokens`，缺失或非法（非正整数）时回退为 `32000`，与官方客户端的 `LS()` 归一化结果相同。
+- `is_reasoning`：优先看目录条目是否存在 `thinking_config.enabled`（存在且非 null 即视为"可思考"——这是目录真正声明可思考能力的位置；`dfmodel` / `kmodel_latest` 的顶层 `is_reasoning=false` 与嵌套块矛盾，故以嵌套块为准），其次才看顶层 `is_reasoning`；两者都缺失时回退为 `true`。动态目录整体不可用时同样回退为 `true`（保持原有"默认开启思考"）。
+- `max_tokens`：调用方传入的 `max_tokens` / `max_completion_tokens` 优先，但被钳制在 1,000,000 上限（避免 `1e18` 之类异常值直达上游）；未传或非法时才取目录的 `max_output_tokens`，目录缺失时为 `32000`。该值总是写入网关请求的 `parameters.max_tokens`，这是本 PR 引入的行为变更：此前版本的请求体不含该字段，客户端传入的 `max_tokens` 会被静默丢弃。
+
+> **档位实效说明**：实测显示，除 `none`（且仅当目录声明了 `thinking_config.disabled` 时）外，各档位字符串对 `reasoning_tokens` 的影响落在采样噪声内。档位仍会经目录校验后透传，但不应据此期待精细的思考强度控制；下面的 pi `thinkingLevelMap` 示例只用于显式表达调用方意图。
 
 **pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
 
@@ -246,6 +250,8 @@ curl http://localhost:10081/v1/models \
 合计剩余      4,941 · 09-25 重置
 ```
 
+> **合计口径**：`合计剩余` 只累加可消费的额度——标记为「不可用」的池子（如组织资源包的 `available=false`）虽仍会单独成行展示，但不计入合计，否则汇总数字会与紧上方那一行的「不可用」自相矛盾。
+
 > 免费账号的套餐池为 `userQuota.total = 0`（套餐本身不含额度），此时面板首行直接展示真正持有额度的池子（通常是加购额度），而不是渲染成「套餐 0 / 0 · 已用尽」。`total`/`cap` 为 0 的池子视为不存在，不会出现在额度明细卡中。
 
 ### 数据来源
@@ -268,7 +274,8 @@ curl http://localhost:10081/v1/models \
 - **官方额度优先**：面板的套餐用量来自账号级 OpenAPI，包含 IDE、CLI 和本服务产生的全部消耗，也能覆盖服务启动前的当期用量。
 - **额度来源分别展示**：套餐额度、加购额度和组织资源包在额度明细卡中分别成行展示，并汇总各额度来源返回的剩余 Credits；组织资源包的“可用/不可用”状态以 OpenAPI 返回值为准。
 - **本地累计仅作降级**：usage 帧中 `billable=false` 的请求仍计入 token，但不计入本地 credits；OpenAPI 从未成功时，面板才显示本服务观察到的周期消耗，并明确标注口径。
-- **周期边界权威同步**：重置时刻以网关 `/user/status` 的 `nextResetAt` 为权威，OpenAPI `expiresAt` 仅在其缺失时兜底；且 `expiresAt` 必须小于 `2100-01-01` 才会被采纳——无期限套餐会把它填成 `9999-12-31` 哨兵值，该值会被忽略。本地周期起点按自然月回退推导，断网期间仍可完成一次性滚动。
+- **周期边界权威同步**：重置时刻以网关 `/user/status` 的 `nextResetAt` 为权威，OpenAPI `expiresAt` 仅在其缺失时兜底；且 `expiresAt` 必须小于 `2100-01-01` 才会被采纳——无期限套餐会把它填成 `9999-12-31` 哨兵值，该值会被忽略。本地周期起点按自然月回退推导（月末会夹取到目标月最后一天，3/31 → 2/28），断网期间仍可完成一次性滚动。
+- **边界变更的接受规则**（防止累计值被抖动或陈旧缓存误清）：首次拿到边界时**保留**已累计的 credits；边界**未向前推进**（`/user/status` 缓存 1 小时，可能上报已滚过的旧值）则直接忽略；前进幅度小于 7 天时视为同一周期，不清零；达到 7 天以上才判定为真实续期并清零上一周期。
 - **累计值仍保留**：`stats.credits` 保存本服务历史累计扣费，鼠标悬停在额度行可查看。
 
 ### 刷新时机

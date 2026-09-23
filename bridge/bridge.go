@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -34,6 +35,14 @@ var (
 	// boundary moves once a month, so an hour is far tighter than needed
 	// while keeping the status endpoint off the chat path entirely.
 	accountTTL = float64(3600)
+	// accountStatusTimeout bounds the /user/status lookup performed by
+	// resolveAccountStatus. That lookup runs while refreshMu is held
+	// (bootstrapSession / doRenew), so a slow status endpoint would serialize
+	// every queued chat request behind it. The lookup is best-effort
+	// enrichment only — the cached/last-known tier already covers the failure
+	// case — so it must not hold the session lock for the full 15s request
+	// timeout.
+	accountStatusTimeout = 5 * time.Second
 )
 
 // maxPlausibleResetMs bounds a believable subscription boundary. The OpenAPI
@@ -132,9 +141,10 @@ type ChatRequestBody struct {
 	Business       business                 `json:"business"`
 	Parameters     chatParameters           `json:"parameters"`
 	Tools          json.RawMessage          `json:"tools,omitempty"`
-	// ParallelToolCalls has no equivalent in the native gateway contract: the
-	// official client only forwards it on the external OpenAI-compatible path.
-	// It is passed through for clients that send it, but the gateway ignores it.
+	// ParallelToolCalls is forwarded at the top level exactly as it was before
+	// the parameters object existed: no parameters equivalent is known, and
+	// whether the gateway reads it from either position has not been verified,
+	// so moving or deleting it would be an unverified behaviour change.
 	ParallelToolCalls json.RawMessage `json:"parallel_tool_calls,omitempty"`
 }
 
@@ -293,19 +303,29 @@ func (b *OpenAiBridge) bootstrapSession(ctx context.Context) error {
 }
 
 // resolveAccountStatus fetches /user/status and returns the authoritative
-// subscription tier. On failure it degrades in order: last known tier (even if
-// stale) → empty, letting applyJobToken fall back to the jobToken value and
-// then the historical default.
+// subscription tier. The lookup is bounded by accountStatusTimeout because it
+// runs under refreshMu (bootstrap/renewal): it is best-effort enrichment, and
+// the last known tier already covers the failure case. On failure it degrades
+// in order: last known tier (even if stale) → empty, letting applyJobToken
+// fall back to the jobToken value and then the historical default.
 //
 // Preferring a stale tier over the default matters on the renewal path: a
 // transient status outage must not downgrade a team account to
 // personal_standard and change the signed bearer payload mid-session.
 func (b *OpenAiBridge) resolveAccountStatus(ctx context.Context, userID string) string {
-	st, err := b.fetchAccountStatus(ctx, userID)
+	// Best-effort enrichment with a bounded deadline: this runs under
+	// refreshMu, so it gets its own short context instead of inheriting the
+	// caller's (potentially much longer) one. See accountStatusTimeout.
+	lookupCtx, cancel := context.WithTimeout(ctx, accountStatusTimeout)
+	defer cancel()
+	st, err := b.fetchAccountStatus(lookupCtx, userID)
 	if err == nil && st != nil && st.UserType != "" {
 		return st.UserType
 	}
-	if err != nil {
+	// errNoUserID is the expected degradation of the first jobToken exchange
+	// (which carries no user id), not a failure: fall back silently. Genuine
+	// lookup failures still deserve the WARN.
+	if err != nil && !errors.Is(err, errNoUserID) {
 		log.Printf("[bridge] WARN user/status failed (%v); reusing last known tier", err)
 	}
 	if cached := b.AccountStatus(); cached != nil && cached.UserType != "" {
@@ -313,6 +333,11 @@ func (b *OpenAiBridge) resolveAccountStatus(ctx context.Context, userID string) 
 	}
 	return ""
 }
+
+// errNoUserID marks the expected degradation where the first jobToken
+// exchange does not carry a user id and /user/status cannot be queried yet.
+// Callers match it with errors.Is to skip the WARN that genuine failures get.
+var errNoUserID = errors.New("no user id available for user/status")
 
 // fetchAccountStatus queries /user/status with a TTL cache. Unlike the chat
 // path it performs no single-flight coordination: callers are the renewal
@@ -322,12 +347,14 @@ func (b *OpenAiBridge) fetchAccountStatus(ctx context.Context, userID string) (*
 	b.accountMu.Lock()
 	if cached := b.account; cached != nil && now-b.accountTs < accountTTL {
 		b.accountMu.Unlock()
-		return cached, nil
+		// Every return path hands out a clone: exposing the internal pointer
+		// would let a mutating caller rewrite the cache without accountMu.
+		return cloneAccountStatus(cached), nil
 	}
 	b.accountMu.Unlock()
 
 	if userID == "" {
-		return nil, fmt.Errorf("no user id available for user/status")
+		return nil, errNoUserID
 	}
 	raw, err := auth.FetchUserStatus(ctx, userID, b.machineID, b.machineToken, b.machineType, b.Region)
 	if err != nil {
@@ -1222,12 +1249,26 @@ func statsModelLabel(reqBody map[string]interface{}, b *OpenAiBridge, ctx contex
 
 // resolveMaxTokens picks the completion cap for the gateway request. A positive
 // integer from the client wins, matching the official client's
-// LS(maxOutputTokens ?? catalogDefault); otherwise the catalog value applies.
-// OpenAI clients may use either max_tokens or the newer max_completion_tokens.
+// LS(maxOutputTokens ?? catalogDefault), but is clamped to
+// models.MaxRequestedOutputTokens so absurd values never reach the gateway
+// verbatim. Otherwise the catalog value applies; the clamp is only a ceiling,
+// never a default. OpenAI clients may use either max_tokens or the newer
+// max_completion_tokens.
 func resolveMaxTokens(reqBody map[string]interface{}, catalogDefault int) int {
 	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
 		if n, ok := positiveJSONInt(reqBody[key]); ok {
 			return n
+		}
+		if n, ok := positiveJSONFloat(reqBody[key]); ok {
+			// Compared in float64 before any int conversion: on a 32-bit build
+			// int(1e18) wraps (often to 0, which positiveJSONInt then rejects),
+			// so the clamp must not depend on int first. Values beyond
+			// math.MaxInt64 are caught here too, where an int conversion would
+			// have silently fallen back to the catalog default.
+			if n > float64(models.MaxRequestedOutputTokens) {
+				return models.MaxRequestedOutputTokens
+			}
+			return int(n)
 		}
 	}
 	return catalogDefault
@@ -1235,11 +1276,25 @@ func resolveMaxTokens(reqBody map[string]interface{}, catalogDefault int) int {
 
 // positiveJSONInt parses a decoded JSON number into a positive int.
 func positiveJSONInt(v interface{}) (int, bool) {
-	n, ok := v.(float64)
-	if !ok || n != float64(int(n)) || int(n) <= 0 {
+	f, ok := positiveJSONFloat(v)
+	if !ok || f > float64(models.MaxRequestedOutputTokens) {
+		// Values above the ceiling are handled by resolveMaxTokens, which clamps
+		// them without an int conversion; anything still here is unusable.
 		return 0, false
 	}
-	return int(n), true
+	return int(f), true
+}
+
+// positiveJSONFloat parses a decoded JSON number into a positive integral
+// float64, without narrowing to int. Callers that need the exact magnitude (the
+// clamp) use this directly so the result is identical on 32-bit and 64-bit
+// builds.
+func positiveJSONFloat(v interface{}) (float64, bool) {
+	n, ok := v.(float64)
+	if !ok || n <= 0 || n != math.Trunc(n) {
+		return 0, false
+	}
+	return n, true
 }
 
 func extractMessages(raw interface{}) []map[string]interface{} {

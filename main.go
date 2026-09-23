@@ -29,10 +29,22 @@ type bridgeProvider struct {
 	bridge *bridge.OpenAiBridge
 	pat    string
 	store  *store.Store
+	// onPatChange is fired after a different non-empty PAT was replaced or the
+	// PAT was cleared. It runs without the provider lock held: the callback
+	// takes the recorder lock, and nesting the two risks a lock-order stall.
+	onPatChange func()
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
 	return &bridgeProvider{store: st}
+}
+
+// setOnPatChange installs the callback fired when the configured PAT changes.
+// Wiring happens before the provider is used by any goroutine.
+func (p *bridgeProvider) setOnPatChange(fn func()) {
+	p.mu.Lock()
+	p.onPatChange = fn
+	p.mu.Unlock()
 }
 
 // resolveBridge validates the API key and returns the bridge for the current PAT.
@@ -45,25 +57,70 @@ func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.OpenAiBridge {
 }
 
 // currentBridge returns the bridge for the current PAT, creating or recreating
-// the bridge when the PAT changes.
+// the bridge when the PAT changes. A PAT change (including clearing it) also
+// fires onPatChange after the provider lock is released, so the cached account
+// snapshot of the previous PAT can be dropped.
 func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	pat := p.store.GetPAT()
-	if pat == "" {
-		return nil
-	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.bridge == nil || p.pat != pat {
+	changed := p.pat != "" && p.pat != pat
+	var b *bridge.OpenAiBridge
+	if pat == "" {
+		if changed {
+			// The old PAT/session must not linger once it is cleared.
+			p.bridge = nil
+			p.pat = ""
+		}
+	} else if p.bridge == nil || p.pat != pat {
 		realPAT, region := auth.Resolve(pat)
 		p.bridge = bridge.NewOpenAiBridge(realPAT, region)
 		p.pat = pat
+		b = p.bridge
+	} else {
+		b = p.bridge
 	}
-	return p.bridge
+	hook := p.onPatChange
+	p.mu.Unlock()
+
+	if changed && hook != nil {
+		hook()
+	}
+	return b
 }
 
 // accountRefreshCadence keeps the authoritative allowance reasonably fresh
 // without coupling the admin panel's 15-second poll to an upstream request.
 const accountRefreshCadence = time.Minute
+
+// patWriteMu serializes the recorder writes of the account loop against the
+// PAT-change clear. Without it, an in-flight refresh could pass its PAT
+// re-check, be preempted by an admin PAT change, and then write the previous
+// account's snapshot after the hook had already cleared it. The lock is never
+// held across the upstream fetch.
+var patWriteMu sync.Mutex
+
+// applyAccountWrite persists one account snapshot under patWriteMu, re-checking
+// the PAT inside the lock so a snapshot belonging to a replaced or cleared PAT
+// can never be written. It returns false when the snapshot was dropped.
+func applyAccountWrite(rec *stats.Recorder, provider *bridgeProvider, pat string, nextResetMs int64, account *stats.Account) bool {
+	patWriteMu.Lock()
+	defer patWriteMu.Unlock()
+	if provider.store.GetPAT() != pat {
+		return false // the PAT changed while the fetch was in flight
+	}
+	rec.SetBillingCycle(nextResetMs)
+	rec.SetAccount(account)
+	return true
+}
+
+// clearAccountOnPatChange drops the cached account snapshot when the configured
+// PAT changed. It shares patWriteMu with applyAccountWrite so the clear and the
+// writes are mutually exclusive.
+func clearAccountOnPatChange(rec *stats.Recorder) {
+	patWriteMu.Lock()
+	defer patWriteMu.Unlock()
+	rec.ClearAccount()
+}
 
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
 // deliberately cheap (no upstream calls, no session bootstrap): the body
@@ -139,6 +196,15 @@ func main() {
 	// The loop also drains a stop channel so graceful shutdown can trigger a
 	// final flush, avoiding loss of the last <=30s of stats.
 	rec := stats.NewRecorder(st)
+	// A PAT change invalidates the previous account's plan and allowance; drop
+	// the cached snapshot so the panel cannot keep showing it. The clear shares
+	// patWriteMu with the account loop's writes.
+	provider.setOnPatChange(func() { clearAccountOnPatChange(rec) })
+	// The snapshot is persisted, so a restart with a different or cleared PAT
+	// would otherwise keep showing the previous account (the hook only fires on
+	// an in-process change). Drop it once here; the account loop repopulates the
+	// panel from the first successful refresh.
+	rec.ClearAccount()
 	statsStop := make(chan struct{})
 	statsDone := make(chan struct{})
 	go func() {
@@ -173,7 +239,17 @@ func main() {
 	// Subscription account loop: refreshes identity metadata from /user/status
 	// and authoritative allowance totals from OpenAPI /api/v2/quota/usage out
 	// of band. The admin panel's 15-second poll remains memory-only.
+	//
+	// The loop has its own stop/done pair so shutdown can join it before the
+	// final stats flush: its last SetAccount/SetBillingCycle would otherwise
+	// land after that flush and be lost on exit.
+	accountStop := make(chan struct{})
+	accountDone := make(chan struct{})
 	applyAccount := func(ctx context.Context) {
+		// Capture the PAT this refresh belongs to: if it changes while the
+		// fetch is in flight, the snapshot must be dropped rather than written
+		// after the PAT-change hook cleared the previous account.
+		pat := provider.store.GetPAT()
 		b := provider.currentBridge()
 		if b == nil {
 			return // no PAT configured yet
@@ -182,7 +258,6 @@ func main() {
 		if st == nil {
 			return // upstream unreachable: keep the last known state
 		}
-		rec.SetBillingCycle(st.NextResetAtMs)
 		account := &stats.Account{
 			Plan:                 st.Plan,
 			Tag:                  st.UserTag,
@@ -211,9 +286,14 @@ func main() {
 				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
 			}
 		}
-		rec.SetAccount(account)
+		// The write section runs under patWriteMu and re-checks the PAT inside it:
+		// the PAT-change hook clears the recorder under the same lock, so a
+		// snapshot fetched for the previous PAT can no longer land after that
+		// clear. The fetch above stays outside the lock (it can take 30s).
+		applyAccountWrite(rec, provider, pat, st.NextResetAtMs, account)
 	}
 	go func() {
+		defer close(accountDone)
 		// Fetch once immediately so the panel is populated from the start
 		// rather than after the first tick.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -228,7 +308,7 @@ func main() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				applyAccount(ctx)
 				cancel()
-			case <-statsStop:
+			case <-accountStop:
 				return
 			}
 		}
@@ -268,18 +348,26 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM: stop the stats ticker (final
-	// flush) and drain in-flight requests with a bounded deadline.
+	// Graceful shutdown on SIGINT/SIGTERM: stop the account refresher and join
+	// it, trigger the final stats flush, and drain in-flight requests with a
+	// bounded deadline.
+	//
+	// stopOnce is shared by every caller of shutdown/stopBackgroundLoops so a
+	// second signal (or a future forced-exit path) cannot panic on a double
+	// close of the stop channels.
+	stopOnce := &sync.Once{}
 	shutdownErr := make(chan error, 1)
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
+		// Unregister before tearing down: restoring the default disposition
+		// means a second signal terminates the process immediately instead of
+		// being queued into a handler that has already run. The stop channels
+		// themselves are guarded by sync.Once, so a duplicate teardown is safe.
+		signal.Stop(sigCh)
 		log.Printf("[server] received %s, shutting down...", sig)
-		close(statsStop)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		shutdownErr <- srv.Shutdown(ctx)
+		shutdown(shutdownErr, srv, stopOnce, accountStop, statsStop, accountDone, statsDone)
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -291,4 +379,36 @@ func main() {
 	// Wait for the stats goroutine to finish its final flush before exiting.
 	<-statsDone
 	log.Printf("[server] stopped")
+}
+
+// shutdown stops the background loops and drains in-flight requests. The drain
+// runs concurrently with the join so a slow account refresh cannot delay it, but
+// it is still awaited before this returns: cancelling the drain's context early
+// would abort every in-flight streaming response on SIGTERM, which is what a
+// previous version of this function did. The stop channels are closed through
+// stopOnce, so a repeated shutdown call cannot panic.
+func shutdown(shutdownErr chan<- error, srv *http.Server, stopOnce *sync.Once, accountStop, statsStop chan<- struct{}, accountDone, statsDone <-chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	drain := make(chan error, 1)
+	go func() { drain <- srv.Shutdown(ctx) }()
+	stopBackgroundLoops(stopOnce, accountStop, statsStop, accountDone, statsDone)
+	shutdownErr <- <-drain
+	cancel()
+}
+
+// stopBackgroundLoops joins the account refresher before triggering the stats
+// loop's final flush: the account loop may be mid-fetch for up to 30s, and a
+// SetAccount/SetBillingCycle landing after that flush would be lost on exit.
+//
+// once guards every stop-channel close, so a second caller (a future
+// "second signal forces exit" path, or a duplicate call) blocks until the
+// first stop completes and then returns instead of panicking on a double
+// close. Callers supply the Once so independent instances stay independent.
+func stopBackgroundLoops(once *sync.Once, accountStop, statsStop chan<- struct{}, accountDone, statsDone <-chan struct{}) {
+	once.Do(func() {
+		close(accountStop)
+		<-accountDone
+		close(statsStop)
+		<-statsDone
+	})
 }

@@ -40,7 +40,9 @@ type Usage struct {
 	// Billable reports whether the gateway charged this request. Frames that
 	// omit the field are treated as billable so pre-existing models keep
 	// contributing to the credits total instead of silently zeroing it.
-	Billable bool `json:"billable"`
+	// Internal-only: never serialized to clients (json:"-"); the bridge
+	// derives stats.Usage.NonBillable from it.
+	Billable bool `json:"-"`
 }
 
 // Detail is a token breakdown (cached prompt tokens / reasoning tokens).

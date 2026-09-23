@@ -14,6 +14,33 @@ const HourKeyFormat = "2006-01-02T15"
 // BucketRetention is how long hourly buckets are kept before pruning.
 const BucketRetention = 96 * time.Hour
 
+// cycleDriftToleranceMs is how far the reported boundary may move while still
+// naming the same subscription period. The gateway recomputes the reset instant
+// as "last reset + 1 month", so it drifts by hours to a couple of days; a
+// genuine refresh advances the boundary by roughly a whole month. Anything in
+// between is treated as the same cycle, which is what keeps an accumulated
+// total from being discarded by a clock adjustment.
+const cycleDriftToleranceMs = int64(7 * 24 * 60 * 60 * 1000)
+
+// maxCycleCatchUps bounds the monthly catch-up loops: a corrupt or very old
+// persisted boundary (e.g. a cold data.json from 1970) must not spend an
+// unbounded number of time.Date calls under the mutex. 2400 steps is two
+// centuries of monthly cycles, far more than any real deployment misses.
+const maxCycleCatchUps = 2400
+
+// maxPlausibleResetMs bounds a believable subscription boundary. It mirrors the
+// guard the bridge applies when reading /user/status and the OpenAPI quota: that
+// endpoint reports 9999-12-31 (253402214400000) as a "never expires" sentinel for
+// plans without an expiry, and an earlier build persisted it as the cycle
+// boundary.
+const maxPlausibleResetMs = int64(4102444800000) // 2100-01-01T00:00:00Z
+
+// plausibleResetMs reports whether ms can be a real subscription boundary rather
+// than a missing value or a persisted sentinel.
+func plausibleResetMs(ms int64) bool {
+	return ms > 0 && ms < maxPlausibleResetMs
+}
+
 // ModelStat aggregates request counters for a single model.
 type ModelStat struct {
 	Model   string `json:"model"`
@@ -284,26 +311,71 @@ func (r *Recorder) RecordUsage(u *Usage) {
 // Aug 26 for a Sep 25 reset).
 //
 // Passing 0 (status unavailable) leaves the existing cycle intact rather than
-// discarding accounting that may already be correct. A boundary that still
-// falls inside the cycle currently being tracked refines it without zeroing,
-// so repeated polls never lose accumulated credits.
+// discarding accounting that may already be correct.
+//
+// The acceptance rule is forward-only, with a drift tolerance:
+//
+//  1. The tracked boundary is advanced locally first, so a boundary the
+//     service already rolled past (the gateway's /user/status is cached for an
+//     hour, so it can report a stale instant) can never move it backwards.
+//  2. A boundary that does not move forward is stale: it is ignored outright,
+//     keeping both the tracked cycle and its credits. This is what stops a
+//     stale cached report from wiping the fresh cycle's total.
+//  3. The first observation (no tracked boundary yet) adopts the boundary and
+//     KEEPS the credits accumulated since boot. Credits only accumulate from
+//     real requests, so they are genuinely part of this period; zeroing here
+//     would discard a whole cycle's accounting on a fresh install.
+//  4. A forward move within cycleDriftToleranceMs is the same subscription
+//     period: the gateway recomputes the reset instant as "last reset + 1
+//     month", so it drifts by hours to a couple of days. Refinement, no
+//     zeroing. Comparing derived starts for (in)equality does NOT work here: a
+//     month-end anchor clamps the derived start backwards enough to look like a
+//     different cycle, while a two-ended drift is not contained by the old
+//     interval.
+//  5. A forward move of at least the tolerance is a genuine refresh, so the
+//     previous cycle's credits are stale and are zeroed.
 func (r *Recorder) SetBillingCycle(nextResetMs int64) {
+	r.setBillingCycleAt(nextResetMs, time.Now().UnixMilli())
+}
+
+// setBillingCycleAt is SetBillingCycle with an explicit clock, so tests can use
+// fixed calendar instants (month-end anchors, leap years) instead of values
+// derived from the wall clock. Callers must pass the real clock otherwise.
+func (r *Recorder) setBillingCycleAt(nextResetMs, nowMs int64) {
 	if nextResetMs <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Advance past any boundary that has already passed: otherwise a stale
+	// boundary still visible in the cached /user/status response would be
+	// treated as a move backwards (or as a refresh) below. The roll is itself a
+	// state change, so it must be persisted even when the reported boundary
+	// then matches the rolled-forward one exactly.
+	if r.rollCycleLocked(nowMs) {
+		r.dirty = true
+	}
 	if r.data.NextResetMs == nextResetMs {
 		return
 	}
-	startMs := addMonthsMs(nextResetMs, -1)
-	if startMs != r.data.CycleStartMs {
+	if plausibleResetMs(r.data.NextResetMs) && nextResetMs <= r.data.NextResetMs {
+		// Stale report: the tracked boundary is already at or beyond it. Keep
+		// tracking the newer one so this cannot discard the live cycle.
+		//
+		// An implausible tracked boundary (a sentinel persisted by an earlier
+		// build) is deliberately excluded from this comparison: it lies beyond
+		// every genuine report, so treating it as "newer" would reject real
+		// boundaries forever and leave the rollover dead (the credits comparison
+		// below then also stays negative, so no credits are discarded either).
+		return
+	}
+	if r.data.NextResetMs != 0 && nextResetMs-r.data.NextResetMs >= cycleDriftToleranceMs {
 		// A genuinely different cycle: the allowance has been refreshed, so
 		// the previous cycle's credits are stale.
 		r.data.CycleCredits = 0
 	}
 	r.data.NextResetMs = nextResetMs
-	r.data.CycleStartMs = startMs
+	r.data.CycleStartMs = addMonthsMs(nextResetMs, -1)
 	r.dirty = true
 }
 
@@ -311,7 +383,8 @@ func (r *Recorder) SetBillingCycle(nextResetMs int64) {
 //
 // The panel reads this from memory, so storing it here (rather than fetching
 // on demand) keeps the 15s admin poll free of upstream calls. A nil account is
-// ignored so a transient status outage cannot wipe a previously known plan.
+// ignored so a transient status outage cannot wipe a previously known plan; use
+// ClearAccount to drop it on purpose.
 func (r *Recorder) SetAccount(a *Account) {
 	if a == nil {
 		return
@@ -321,6 +394,18 @@ func (r *Recorder) SetAccount(a *Account) {
 	// Deep-copy nested quota objects so later caller mutations cannot change
 	// the persisted snapshot behind the recorder's back.
 	r.data.Account = cloneAccount(a)
+	r.dirty = true
+}
+
+// ClearAccount drops the cached account snapshot, e.g. after the configured PAT
+// changed and the previous account's plan and allowance no longer apply.
+func (r *Recorder) ClearAccount() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.data.Account == nil {
+		return
+	}
+	r.data.Account = nil
 	r.dirty = true
 }
 
@@ -344,13 +429,95 @@ func cloneAccount(a *Account) *Account {
 	return &cp
 }
 
-// addMonthsMs shifts an epoch-millis instant by n calendar months.
+// addMonthsMs shifts an epoch-millis instant by n calendar months, clamping the
+// day to the target month's length.
+//
+// AddDate normalizes overflow instead of clamping (Mar 31 minus one month landed
+// on Mar 3, May 31 minus one on May 1), which pushed the derived cycle start
+// near the beginning of the month; since that value feeds SetBillingCycle's
+// same-cycle check, every reset on a 29th-31st looked like a new cycle.
 func addMonthsMs(ms int64, n int) int64 {
-	return time.UnixMilli(ms).Local().AddDate(0, n, 0).UnixMilli()
+	return addMonthsMsIn(ms, n, time.Local)
+}
+
+// addMonthsMsIn is addMonthsMs against an explicit location. Production uses
+// time.Local; tests use it to scan the historical DST-anomalous zones where a
+// one-month step does not advance.
+func addMonthsMsIn(ms int64, n int, loc *time.Location) int64 {
+	t := time.UnixMilli(ms).In(loc)
+	target := time.Date(t.Year(), t.Month()+time.Month(n), 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+	last := time.Date(target.Year(), target.Month()+1, 0, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()).Day()
+	day := t.Day()
+	if day > last {
+		day = last
+	}
+	return time.Date(target.Year(), target.Month(), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()).UnixMilli()
+}
+
+// nextCycleBoundary advances a reset instant by one calendar month, refusing to
+// move backwards or stand still. addMonthsMs is not strictly increasing for a
+// handful of historical DST-anomalous zones (America/Asuncion 1972-09,
+// America/Havana, America/St_Johns), where a one-month step can consume an
+// entire month's worth of offset change; without this guard the roll loops would
+// never advance and would spin forever while holding the recorder lock, hanging
+// every request. A non-advancing step returns 0, which callers treat as "no
+// further boundary can be derived": they zero the passed cycle and clear the
+// boundary so the next /user/status re-adopts it, rather than keeping a past
+// boundary that would re-zero every later request's credits.
+func nextCycleBoundary(nextMs int64) int64 {
+	return advanceBoundaryMs(nextMs, time.Local)
+}
+
+// advanceBoundaryMs is nextCycleBoundary's decision against an explicit location.
+// Production always passes time.Local; the parameter exists so the non-advancing
+// guard can be tested directly, since the DST-anomalous zones that trigger it are
+// historical and not the host's zone.
+func advanceBoundaryMs(nextMs int64, loc *time.Location) int64 {
+	adv := addMonthsMsIn(nextMs, 1, loc)
+	if adv <= nextMs {
+		return 0
+	}
+	return adv
+}
+
+// projectCycleLocked returns the cycle values that apply at nowMs without
+// mutating the recorder: a read must never roll the billing cycle, otherwise an
+// admin poll landing just after a boundary would persist a rollover and discard
+// the previous cycle's credits.
+//
+// It runs the same advance loop as rollCycleLocked on local copies, so a
+// projection across several missed cycles matches what the next write would
+// persist. Caller must hold the mutex.
+func (r *Recorder) projectCycleLocked(nowMs int64) (cycleCredits float64, startMs, nextMs int64) {
+	cycleCredits = r.data.CycleCredits
+	startMs = r.data.CycleStartMs
+	nextMs = r.data.NextResetMs
+	for i := 0; nextMs > 0 && nowMs >= nextMs && i < maxCycleCatchUps; i++ {
+		startMs = nextMs
+		cycleCredits = 0
+		adv := nextCycleBoundary(nextMs)
+		if adv == 0 {
+			// No later boundary can be derived for this instant; project it as
+			// unset, exactly the way rollCycleLocked drops it. Leaving the past
+			// instant in place would make the projection disagree with what the
+			// next write persists.
+			nextMs = 0
+			break
+		}
+		nextMs = adv
+	}
+	if nextMs > 0 && nowMs >= nextMs {
+		// The cap was exhausted: the boundary is more than two centuries old.
+		// Report it as unset rather than keep projecting a past instant forever.
+		nextMs = 0
+	}
+	return cycleCredits, startMs, nextMs
 }
 
 // rollCycleLocked zeroes the cycle credits once the known reset boundary has
-// passed, then advances the boundary locally. Caller must hold the mutex.
+// passed, then advances the boundary locally. It reports whether any state
+// changed, so the caller can mark the recorder dirty. Caller must hold the
+// mutex.
 //
 // The advance is what makes the rollover happen exactly once: without it,
 // every subsequent request would still see nowMs >= NextResetMs and wipe the
@@ -358,13 +525,33 @@ func addMonthsMs(ms int64, n int) int64 {
 // SetBillingCycle reconciles without zeroing when it names the same cycle.
 //
 // A loop rather than a single step covers a service that stayed down across
-// several cycles.
-func (r *Recorder) rollCycleLocked(nowMs int64) {
-	for r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs {
-		r.data.CycleStartMs = r.data.NextResetMs
-		r.data.NextResetMs = addMonthsMs(r.data.NextResetMs, 1)
+// several cycles; see nextCycleBoundary and maxCycleCatchUps for the two guards
+// that keep it from spinning or doing unbounded work under the lock.
+func (r *Recorder) rollCycleLocked(nowMs int64) bool {
+	rolled := false
+	for i := 0; r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs && i < maxCycleCatchUps; i++ {
+		current := r.data.NextResetMs
+		r.data.CycleStartMs = current
 		r.data.CycleCredits = 0
+		rolled = true
+		adv := nextCycleBoundary(current)
+		if adv == 0 {
+			// No later boundary can be derived for this instant. Drop the
+			// boundary instead of leaving it in the past, where every later
+			// request would re-zero the new cycle's credits.
+			r.data.NextResetMs = 0
+			return true
+		}
+		r.data.NextResetMs = adv
 	}
+	if r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs {
+		// The cap was exhausted: the boundary is a corrupt or centuries-old
+		// value that can never be advanced into the future. Drop it so the next
+		// request starts a fresh cycle instead of being zeroed on every write.
+		r.data.NextResetMs = 0
+		return true
+	}
+	return rolled
 }
 
 // Usage is the token accounting payload produced by transform.Usage.
@@ -421,21 +608,23 @@ func (r *Recorder) pruneLocked() {
 // Report returns a snapshot for the admin UI: totals, per-model rows sorted by
 // total (descending), and the last 24 hourly buckets in ascending order.
 func (r *Recorder) Report() *Report {
+	return r.reportAt(time.Now().UnixMilli())
+}
+
+// reportAt is Report with the billing-cycle projection evaluated at nowMs
+// instead of the wall clock, so tests can pin fixed calendar instants (month-end
+// anchors, leap years) rather than depend on the day the suite runs. Only the
+// cycle view is pinned; the hourly buckets still follow the wall clock.
+func (r *Recorder) reportAt(nowMs int64) *Report {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Roll the cycle on read as well as on write: the admin panel polls this
-	// every 15s, so an idle service would otherwise keep reporting the
-	// previous cycle's credits long after the boundary passed. The rollover is
-	// idempotent, so this costs nothing once it has already happened.
-	//
-	// Dirty is set only when the boundary actually moved, so a plain read poll
-	// never forces a disk write.
-	prevReset := r.data.NextResetMs
-	r.rollCycleLocked(time.Now().UnixMilli())
-	if r.data.NextResetMs != prevReset {
-		r.dirty = true
-	}
+	// Project the cycle for the report without mutating the recorder: the
+	// panel polls every 15s, so a poll landing just after a boundary would
+	// otherwise roll the cycle and persist a rollover that discarded the
+	// previous cycle's credits. A read is a pure projection; the write path
+	// (RecordUsage) is what advances the tracked boundary.
+	cycleCredits, cycleStartMs, nextResetMs := r.projectCycleLocked(nowMs)
 
 	rep := &Report{
 		Total:            r.data.Total,
@@ -445,9 +634,9 @@ func (r *Recorder) Report() *Report {
 		CompletionTokens: r.data.CompletionTokens,
 		CachedTokens:     r.data.CachedTokens,
 		Credits:          r.data.Credits,
-		CycleCredits:     r.data.CycleCredits,
-		CycleStartMs:     r.data.CycleStartMs,
-		NextResetMs:      r.data.NextResetMs,
+		CycleCredits:     cycleCredits,
+		CycleStartMs:     cycleStartMs,
+		NextResetMs:      nextResetMs,
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
 	}

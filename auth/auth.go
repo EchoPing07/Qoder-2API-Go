@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -343,7 +344,11 @@ type AuthError struct {
 func (e *AuthError) Error() string {
 	s := fmt.Sprintf("HTTP %d", e.StatusCode)
 	if e.Detail != "" {
-		s += " " + e.Detail
+		// Detail carries the raw upstream body, which includes userId and trace
+		// ids. Error() is what the bridge logs, so redact it here: doing it at
+		// every construction site instead would be easy to miss, and Detail
+		// itself is kept raw for callers that classify the failure.
+		s += " " + truncateErrorBody([]byte(e.Detail))
 	}
 	return s
 }
@@ -406,6 +411,130 @@ func truncateBusyMessage(s string) string {
 		return s
 	}
 	return string(r[:maxBusyMessageRunes]) + "…"
+}
+
+// maxErrorBodyChars caps how much of an upstream error body is embedded in an
+// error message. The account loop logs these at WARN, so the payload must not
+// reach the log verbatim: the quota response carries userId and trace ids.
+const maxErrorBodyChars = 200
+
+// redactedErrorKeys are JSON keys whose values are stripped from an upstream
+// error body before it is embedded in an error message. Truncation alone is not
+// enough: these fields sit near the start of the real payload.
+var redactedErrorKeys = []string{"userId", "userType", "traceId", "traceID", "requestId"}
+
+// truncateErrorBody returns a short, single-line, identity-free prefix of an
+// upstream error body for embedding in an error message. Identity-valued JSON
+// keys are replaced before the length cap, so a short-but-sensitive payload does
+// not slip through as-is.
+func truncateErrorBody(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	for _, key := range redactedErrorKeys {
+		s = redactJSONValue(s, key)
+	}
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	if len(s) <= maxErrorBodyChars {
+		return s
+	}
+	// Cut on a rune boundary: a byte-wise slice through a multi-byte character
+	// yields an invalid string, which then reaches the log garbage-escaped.
+	cut := maxErrorBodyChars
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// redactJSONValue replaces the value of a JSON field with "[REDACTED]". It works
+// on the raw text (the body may not even be valid JSON), which is exactly the
+// shape an upstream error page takes. A missing field is a no-op. The scan
+// resumes after the replacement so a value is never rescanned.
+//
+// Whitespace around the colon is accepted because upstreams pretty-print
+// (`"userId" : "..."`), and a missing closing quote is handled because a
+// truncated response body is a realistic case: matching only the compact form
+// would leak the identity value in both.
+func redactJSONValue(s, key string) string {
+	needle := `"` + key + `"`
+	var out strings.Builder
+	for {
+		keyStart := strings.Index(s, needle)
+		if keyStart < 0 {
+			break
+		}
+		valueStart, ok := jsonValueStart(s, keyStart+len(needle))
+		if !ok {
+			// The key is not a field name here (e.g. it appears inside a string
+			// value). Emit it unchanged and keep scanning past it.
+			out.WriteString(s[:keyStart+len(needle)])
+			s = s[keyStart+len(needle):]
+			continue
+		}
+		out.WriteString(s[:valueStart])
+		if s[valueStart] == '"' {
+			out.WriteString(`"[REDACTED]"`)
+		} else {
+			out.WriteString("[REDACTED]")
+		}
+		s = s[jsonValueEnd(s, valueStart):]
+	}
+	out.WriteString(s)
+	return out.String()
+}
+
+// jsonValueStart returns the index of the value's first byte, delimiter
+// included: the opening quote for a string, the first character for a scalar.
+// Everything before it (the key, whitespace, the colon) is copied verbatim. It
+// reports false when the text after the key is not a `: <value>` pair.
+func jsonValueStart(s string, from int) (int, bool) {
+	i := from
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) || s[i] != ':' {
+		return 0, false
+	}
+	i++
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) {
+		return 0, false
+	}
+	return i, true
+}
+
+// jsonValueEnd returns the index of the first byte PAST the value starting at
+// start. For a string that is one past its closing quote; for a scalar it is the
+// next JSON delimiter. A string whose closing quote is missing (a truncated
+// response) is treated as running to the end of the text so its content cannot
+// leak.
+func jsonValueEnd(s string, start int) int {
+	if s[start] == '"' {
+		for i := start + 1; i < len(s); i++ {
+			if s[i] == '\\' {
+				i++ // skip the escaped byte
+				continue
+			}
+			if s[i] == '"' {
+				return i + 1
+			}
+		}
+		return len(s) // unterminated value: redact through the end
+	}
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case ',', '}', ']', ' ', '\t', '\n', '\r':
+			return i
+		}
+	}
+	return len(s)
+}
+
+// isJSONSpace reports whether b is insignificant whitespace between JSON tokens.
+func isJSONSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // busyCodeOf normalizes a JSON "code" field that may arrive as a string
@@ -498,7 +627,7 @@ func postEncoded(ctx context.Context, urlStr string, obj interface{}, machineID,
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, fmt.Errorf("HTTP %d at %s body=%s", resp.StatusCode, urlStr, string(detail))
+		return nil, fmt.Errorf("HTTP %d at %s body=%s", resp.StatusCode, urlStr, truncateErrorBody(detail))
 	}
 
 	var result map[string]interface{}
@@ -695,10 +824,13 @@ func FetchQuotaUsage(ctx context.Context, bearer string, region *RegionConfig) (
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[auth] OpenAPI response: method=GET url=%s status=%d duration=%s headers=%v body=%s",
-		urlStr, resp.StatusCode, time.Since(started), resp.Header, body)
+	log.Printf("[auth] OpenAPI response: method=GET url=%s status=%d duration=%s",
+		urlStr, resp.StatusCode, time.Since(started))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("quota usage returned HTTP %d: %s", resp.StatusCode, body)
+		// The body is redacted and truncated before it reaches the error: the
+		// account loop logs this at WARN, and the quota payload carries the
+		// account's userId and trace ids. The status alone identifies the failure.
+		return nil, fmt.Errorf("quota usage returned HTTP %d: %s", resp.StatusCode, truncateErrorBody(body))
 	}
 	var usage QuotaUsage
 	if err := json.Unmarshal(body, &usage); err != nil {
@@ -841,7 +973,7 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, fmt.Errorf("HTTP %d body=%s", resp.StatusCode, string(detail))
+		return nil, fmt.Errorf("HTTP %d body=%s", resp.StatusCode, truncateErrorBody(detail))
 	}
 
 	var result map[string]interface{}
@@ -1084,7 +1216,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 			}
 			return &AuthError{StatusCode: resp.StatusCode, Detail: string(errBody)}
 		}
-		return fmt.Errorf("HTTP %d %s", resp.StatusCode, string(errBody))
+		return fmt.Errorf("HTTP %d %s", resp.StatusCode, truncateErrorBody(errBody))
 	}
 
 	// Cut off silent streams: long generations are fine (lines keep

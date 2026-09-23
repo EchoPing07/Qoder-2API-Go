@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestEncodeDecodeRoundTrip(t *testing.T) {
@@ -381,5 +384,346 @@ func TestFetchQuotaUsageUsesSecurityOauthBearer(t *testing.T) {
 func TestFetchQuotaUsageRequiresBearer(t *testing.T) {
 	if _, err := FetchQuotaUsage(context.Background(), "", CN); err == nil {
 		t.Fatal("expected an error for an empty security OAuth token")
+	}
+}
+
+// §8: the once-a-minute quota refresh must not log the response headers or
+// body (userId, quota details, trace ids); the summary stays status+duration.
+func TestFetchQuotaUsageResponseLogRedactsBodyAndHeaders(t *testing.T) {
+	const userID = "secret-user-id-42"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Trace-Id", "trace-secret-99")
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"userId":"`+userID+`","userType":"teams","userQuota":{"total":1,"used":0,"remaining":1,"unit":"credits"}}`)
+	}))
+	defer srv.Close()
+
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(prev)
+
+	if _, err := FetchQuotaUsage(context.Background(), "sot-test", &RegionConfig{OpenAPIBase: srv.URL}); err != nil {
+		t.Fatal(err)
+	}
+	out := logs.String()
+	if strings.Contains(out, userID) {
+		t.Errorf("response body leaked into logs: %s", out)
+	}
+	if strings.Contains(out, "trace-secret-99") {
+		t.Errorf("response headers leaked into logs: %s", out)
+	}
+	if !strings.Contains(out, "[auth] OpenAPI response:") || !strings.Contains(out, "status=200") {
+		t.Errorf("expected a status+duration response summary, got: %s", out)
+	}
+}
+
+// A non-200 quota response embeds its body in the returned error, which the
+// account loop logs at WARN. The identity fields must not survive that path
+// either: the error carries at most a short, single-line prefix.
+func TestFetchQuotaUsageErrorTruncatesBody(t *testing.T) {
+	const userID = "secret-user-id-42"
+	// Longer than the cap, so truncation is observable, with the identity field
+	// placed after the cut.
+	padding := strings.Repeat("x", 400)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"error":"upstream down","pad":"`+padding+`","userId":"`+userID+`"}`)
+	}))
+	defer srv.Close()
+
+	_, err := FetchQuotaUsage(context.Background(), "sot-test", &RegionConfig{OpenAPIBase: srv.URL})
+	if err == nil {
+		t.Fatal("expected an error for a non-200 response")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "502") {
+		t.Errorf("expected the HTTP status in the error, got %q", msg)
+	}
+	if strings.Contains(msg, userID) {
+		t.Errorf("the error leaked the response identity: %q", msg)
+	}
+	if len(msg) > 400 {
+		t.Errorf("expected a truncated body in the error, got %d chars: %q", len(msg), msg)
+	}
+}
+
+// The upstream error body is flattened to a single line so it cannot forge log
+// entries or split the WARN into several lines, and identity-valued fields are
+// replaced before the length cap so a short but sensitive payload cannot slip
+// through intact.
+func TestTruncateErrorBodyRedactsAndFlattens(t *testing.T) {
+	got := truncateErrorBody([]byte("line1\nline2\r\nline3"))
+	if strings.ContainsAny(got, "\n\r") {
+		t.Errorf("expected a single line, got %q", got)
+	}
+	if got != "line1 line2  line3" {
+		t.Errorf("unexpected flattening: %q", got)
+	}
+
+	// A sensitive field that fits well inside the cap must still be redacted.
+	got = truncateErrorBody([]byte(`{"userId":"u-42","traceId":"t-99","error":"down"}`))
+	for _, secret := range []string{"u-42", "t-99"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("identity value %q survived redaction: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected the redaction marker, got %q", got)
+	}
+	if !strings.Contains(got, `"error":"down"`) {
+		t.Errorf("redaction must preserve non-identity fields, got %q", got)
+	}
+
+	long := strings.Repeat("a", maxErrorBodyChars+50)
+	got = truncateErrorBody([]byte(long))
+	if len([]rune(got)) != maxErrorBodyChars+1 { // +1 for the ellipsis
+		t.Errorf("expected a capped body of %d chars, got %d", maxErrorBodyChars+1, len([]rune(got)))
+	}
+
+	// Multi-byte truncation must cut on a rune boundary: a byte-wise slice would
+	// emit an invalid string that reaches the log garbage-escaped.
+	got = truncateErrorBody([]byte(strings.Repeat("中", 300)))
+	if !utf8.ValidString(got) {
+		t.Errorf("truncation produced invalid UTF-8: %q", got)
+	}
+}
+
+// The redactor must not be defeated by the shapes real upstreams produce: a
+// pretty-printed `"userId" : "..."`, a value of a non-string type, a value whose
+// closing quote is missing because the response was cut off, and a key that only
+// appears inside a string value (which must NOT be redacted).
+func TestTruncateErrorBodyRedactionShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"compact", `{"userId":"u-42","error":"down"}`},
+		{"space before colon", `{"userId" : "u-42", "error":"down"}`},
+		{"tab after colon", "{\"userId\":\t\"u-42\"}"},
+		{"pretty printed", "{\n  \"userId\": \"u-42\",\n  \"traceId\": \"t-99\"\n}"},
+		{"nested object", `{"data":{"userId":"u-42"}}`},
+		{"numeric value", `{"userId":12345,"error":"down"}`},
+		{"boolean value", `{"userId":true}`},
+		{"unterminated value", `{"userId":"u-42`},
+		{"escaped quote in value", `{"userId":"u\"42","error":"down"}`},
+		{"repeated key", `{"userId":"u-42","x":{"userId":"u-43"}}`},
+	}
+	secrets := []string{"u-42", "u-43", "t-99", "12345", "true"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateErrorBody([]byte(tc.body))
+			for _, secret := range secrets {
+				if strings.Contains(got, secret) {
+					t.Errorf("identity value %q survived redaction: %q", secret, got)
+				}
+			}
+		})
+	}
+
+	// A key occurring only inside a string value is not a field assignment and
+	// must be left alone; over-redacting would hide the upstream's message.
+	got := truncateErrorBody([]byte(`{"msg":"see userId for details","error":"down"}`))
+	if !strings.Contains(got, "see userId for details") {
+		t.Errorf("a key inside a string value must not be treated as a field: %q", got)
+	}
+	// A body that is not JSON at all must survive intact.
+	if got := truncateErrorBody([]byte("<html>oops</html>")); got != "<html>oops</html>" {
+		t.Errorf("non-JSON body mangled: %q", got)
+	}
+}
+
+// Every non-200 path that embeds the upstream body in an error must route it
+// through truncateErrorBody: the bridge logs these errors, and the bodies carry
+// userId / trace ids. The response body is generated with the identity first so
+// truncation alone would not hide it.
+func TestNon200ErrorsRedactBody(t *testing.T) {
+	const userID = "secret-user-id-42"
+	body := `{"userId":"` + userID + `","message":"` + strings.Repeat("x", 400) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	assertRedacted := func(name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "500") {
+			t.Errorf("%s: expected the HTTP status, got %q", name, msg)
+		}
+		if strings.Contains(msg, userID) {
+			t.Errorf("%s: the error leaked the identity: %q", name, msg)
+		}
+		if len(msg) > 400 {
+			t.Errorf("%s: body was not truncated: %d chars", name, len(msg))
+		}
+	}
+
+	_, err := call(context.Background(), testSession(), "GET", srv.URL, nil, nil)
+	assertRedacted("call", err)
+
+	_, err = postEncoded(context.Background(), srv.URL, map[string]interface{}{"a": 1}, "mid", "mtok", "mtype")
+	assertRedacted("postEncoded", err)
+
+	err = OpenStreamLines(context.Background(), testSession(), srv.URL, []byte(`{}`), nil, func(string) error { return nil })
+	assertRedacted("OpenStreamLines", err)
+}
+
+// AuthError.Detail holds the raw upstream body, and AuthError.Error() is what the
+// bridge logs ("auth error before any content"). The redaction must therefore
+// happen in Error(), covering all four construction sites at once, while Detail
+// stays raw for callers that classify the failure.
+func TestAuthErrorRedactsDetailInErrorString(t *testing.T) {
+	const userID = "secret-user-id-42"
+	fresh := &AuthError{StatusCode: 401, Detail: `{"userId":"` + userID + `","message":"token expired"}`}
+
+	msg := fresh.Error()
+	if strings.Contains(msg, userID) {
+		t.Errorf("AuthError.Error leaked the identity: %q", msg)
+	}
+	if !strings.Contains(msg, "401") || !strings.Contains(msg, "token expired") {
+		t.Errorf("AuthError.Error lost its diagnostic signal: %q", msg)
+	}
+	if !strings.Contains(fresh.Detail, userID) {
+		t.Errorf("Detail must stay raw for classification, got %q", fresh.Detail)
+	}
+
+	// A plain HTTP status error must not gain a trailing space when Detail is empty.
+	if got := (&AuthError{StatusCode: 500}).Error(); got != "HTTP 500" {
+		t.Errorf("expected %q, got %q", "HTTP 500", got)
+	}
+}
+
+// ParseAccountStatus is the single conversion point between the raw
+// /user/status payload and the account metadata the recorder persists, so its
+// accept/reject rule and field coercion are locked here (§28).
+func TestParseAccountStatus(t *testing.T) {
+	full := map[string]interface{}{
+		"userType":        "teams",
+		"plan":            "PLAN_TIER_TEAM",
+		"userTag":         "Teams",
+		"orgName":         "Acme",
+		"nextResetAt":     float64(1784194052563),
+		"isQuotaExceeded": true,
+	}
+	st, ok := ParseAccountStatus(full)
+	if !ok {
+		t.Fatal("expected a fully populated payload to be accepted")
+	}
+	if st.UserType != "teams" || st.Plan != "PLAN_TIER_TEAM" || st.UserTag != "Teams" || st.OrgName != "Acme" {
+		t.Errorf("unexpected identity fields: %+v", st)
+	}
+	if st.NextResetAtMs != 1784194052563 {
+		t.Errorf("nextResetAt = %d, want 1784194052563", st.NextResetAtMs)
+	}
+	if !st.IsQuotaExceeded {
+		t.Error("expected isQuotaExceeded to be carried through")
+	}
+
+	// A nil payload and one with no recognizable field are both rejections.
+	if _, ok := ParseAccountStatus(nil); ok {
+		t.Error("nil payload must be rejected")
+	}
+	if _, ok := ParseAccountStatus(map[string]interface{}{"somethingElse": 1}); ok {
+		t.Error("a payload with no account field must be rejected")
+	}
+	// Identity-only payloads are accepted, with the reset instant left at 0:
+	// the bridge relies on that 0 to mean "no boundary reported".
+	st, ok = ParseAccountStatus(map[string]interface{}{"userType": "personal_standard"})
+	if !ok || st.UserType != "personal_standard" || st.NextResetAtMs != 0 {
+		t.Errorf("identity-only payload: ok=%v st=%+v", ok, st)
+	}
+	// nextResetAt alone is enough to accept, even without userType/plan.
+	if _, ok := ParseAccountStatus(map[string]interface{}{"nextResetAt": float64(1)}); !ok {
+		t.Error("a payload carrying only nextResetAt must be accepted")
+	}
+}
+
+// toInt64Ms must only accept the float64 shape encoding/json produces. The
+// gateway currently returns nextResetAt as a JSON number; a string form is a
+// silent 0 (documented in the review as §10.6), which must not panic or fabricate
+// a boundary.
+func TestToInt64Ms(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want int64
+	}{
+		{"json number", float64(1784194052563), 1784194052563},
+		{"zero", float64(0), 0},
+		{"nil", nil, 0},
+		{"string", "1784194052563", 0},
+		{"bool", true, 0},
+		{"object", map[string]interface{}{}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toInt64Ms(tc.in); got != tc.want {
+				t.Errorf("toInt64Ms(%#v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The encoded /user/status request body is decoded by the gateway against a
+// positional-ish contract: the field names and the fact that authInfo is an empty
+// JSON object must not drift, because the mismatch only surfaces as a live 401
+// rather than a build failure (§28).
+func TestFetchUserStatusRequestBodyContract(t *testing.T) {
+	var gotURL string
+	var gotInner string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		// The outer body is an Encode()d blob wrapping
+		// {"payload":"<inner JSON>","encodeVersion":"1"}.
+		plain, err := Decode(strings.TrimSpace(string(raw)))
+		if err != nil {
+			t.Errorf("request body is not Encode()d: %v", err)
+			return
+		}
+		var outer struct {
+			Payload       string `json:"payload"`
+			EncodeVersion string `json:"encodeVersion"`
+		}
+		if err := json.Unmarshal(plain, &outer); err != nil {
+			t.Errorf("outer payload: %v", err)
+			return
+		}
+		gotInner = outer.Payload
+		if outer.EncodeVersion != "1" {
+			t.Errorf("encodeVersion = %q, want %q", outer.EncodeVersion, "1")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"userType":"teams","plan":"PLAN_TIER_TEAM"}`)
+	}))
+	defer srv.Close()
+
+	if _, err := FetchUserStatus(context.Background(), "uid-42", "mid", "mtok", "default", &RegionConfig{AuthBase: srv.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "/algo/api/v3/user/status" {
+		t.Errorf("path = %q, want /algo/api/v3/user/status", gotURL)
+	}
+	var fields map[string]interface{}
+	if err := json.Unmarshal([]byte(gotInner), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["userId"] != "uid-42" {
+		t.Errorf("userId = %v, want uid-42", fields["userId"])
+	}
+	if fields["needRefresh"] != false {
+		t.Errorf("needRefresh = %v, want false", fields["needRefresh"])
+	}
+	// authInfo must serialize as an empty object, not null: the gateway rejects
+	// the request otherwise.
+	if authInfo, present := fields["authInfo"]; !present || authInfo == nil {
+		t.Errorf("authInfo = %#v, want an empty object", fields["authInfo"])
+	} else if m, isMap := authInfo.(map[string]interface{}); !isMap || len(m) != 0 {
+		t.Errorf("authInfo = %#v, want {}", authInfo)
 	}
 }

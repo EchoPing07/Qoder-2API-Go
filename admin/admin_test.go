@@ -337,6 +337,55 @@ func TestQuotaSourceSelectionIgnoresEmptyPools(t *testing.T) {
 	}
 }
 
+// quotaDetailsSource returns the renderQuotaDetails body from the embedded UI,
+// delimited by the next top-level function.
+func quotaDetailsSource(t *testing.T) string {
+	t.Helper()
+	start := strings.Index(indexHTML, "function renderQuotaDetails(d) {")
+	if start < 0 {
+		t.Fatal("renderQuotaDetails not found in the embedded UI")
+	}
+	end := strings.Index(indexHTML[start:], "function makeBadge(")
+	if end < 0 {
+		t.Fatal("could not delimit renderQuotaDetails")
+	}
+	return indexHTML[start : start+end]
+}
+
+// The 合计剩余 summary must not absorb credits the account cannot spend: an
+// unavailable org_resource_package still gets a row marked 不可用, so counting
+// its remaining credits made the summary contradict the row right above it.
+func TestQuotaSummaryOnlyCountsAvailablePools(t *testing.T) {
+	details := quotaDetailsSource(t)
+
+	guard := "if (pool.available) totalRemaining += remaining;"
+	if !strings.Contains(details, guard) {
+		t.Errorf("the summary must accumulate only available pools; missing %q", guard)
+	}
+	// Any other accumulation must carry the same availability guard.
+	for _, line := range strings.Split(details, "\n") {
+		if strings.Contains(line, "totalRemaining += remaining") && !strings.Contains(line, "pool.available") {
+			t.Errorf("totalRemaining accumulated without the availability guard: %q", strings.TrimSpace(line))
+		}
+	}
+}
+
+// fmtCredits never returns a negative string and total comes from
+// Number(pool.quota[...] || 0), so the '—' branch of the total ternary was
+// unreachable. The cell must render fmtCredits(total) directly.
+func TestQuotaDetailsHasNoDeadTotalBranch(t *testing.T) {
+	details := quotaDetailsSource(t)
+
+	for _, dead := range []string{"total >= 0 ?", "? fmtCredits(total) : '—'"} {
+		if strings.Contains(details, dead) {
+			t.Errorf("dead total branch %q must be removed from renderQuotaDetails", dead)
+		}
+	}
+	if !strings.Contains(details, "' / ' + fmtCredits(total) + '</td>'") {
+		t.Error("renderQuotaDetails must render the total via fmtCredits(total)")
+	}
+}
+
 // Repeated wrong passwords trigger per-IP rate limiting (HTTP 429).
 func TestLoginRateLimit(t *testing.T) {
 	a, _ := newAdmin(t)

@@ -168,6 +168,66 @@ func TestExtractDeltaCapturesUsageFrame(t *testing.T) {
 	}
 }
 
+// extractUsage must keep the gateway's charge flag: an explicit false marks
+// the frame non-billable, while an absent key defaults to billable so frames
+// from models that predate the flag keep contributing credits.
+func TestExtractUsageBillableFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  map[string]interface{}
+		want bool
+	}{
+		{"explicit false", map[string]interface{}{"billable": false, "prompt_tokens": 5}, false},
+		{"explicit true", map[string]interface{}{"billable": true, "prompt_tokens": 5}, true},
+		{"absent defaults to billable", map[string]interface{}{"prompt_tokens": 5}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u := extractUsage(tt.raw)
+			if u == nil {
+				t.Fatal("expected usage")
+			}
+			if u.Billable != tt.want {
+				t.Errorf("Billable = %v, want %v", u.Billable, tt.want)
+			}
+		})
+	}
+}
+
+// §26: Billable is internal-only and must never serialize into the usage
+// chunk sent to OpenAI clients, while the real fields keep serializing.
+func TestUsageMarshalOmitsBillableFlag(t *testing.T) {
+	u := &Usage{
+		PromptTokens:     17,
+		CompletionTokens: 70,
+		TotalTokens:      87,
+		Credits:          0.005,
+		OriginalCredits:  0.013,
+		Billable:         false,
+	}
+	// Same shape the bridge writes: the usage object nested in a chunk.
+	chunk := map[string]interface{}{"choices": []interface{}{}, "usage": u}
+	raw, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(raw)
+	if strings.Contains(out, "billable") {
+		t.Errorf("billable must not be serialized to clients: %s", out)
+	}
+	for _, key := range []string{
+		`"prompt_tokens":17`,
+		`"completion_tokens":70`,
+		`"total_tokens":87`,
+		`"credits":0.005`,
+		`"original_credits":0.013`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("expected %s in serialized usage: %s", key, out)
+		}
+	}
+}
+
 // [DONE] and frames without usage must not produce a Usage delta.
 func TestExtractDeltaDoneAndPlainFrames(t *testing.T) {
 	wrapper := map[string]interface{}{"body": "[DONE]"}

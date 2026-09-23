@@ -1345,12 +1345,15 @@ function renderQuotaDetails(d) {
     var ratio = total > 0 ? Math.min(Math.max(used / total, 0), 1) : 0;
     var statusText = pool.available ? (remaining > 0 ? '可用' : '已用尽') : '不可用';
     var statusKind = pool.available && remaining > 0 ? 'ok' : (pool.available ? 'bad' : 'neutral');
-    totalRemaining += remaining;
+    // Only spendable credits count towards 合计剩余: an unavailable pool still
+    // gets a row marked 不可用, but adding its remaining credits to the summary
+    // would contradict that very row.
+    if (pool.available) totalRemaining += remaining;
 
     var tr = document.createElement('tr');
     tr.innerHTML =
       '<td>' + pool.name + '</td>' +
-      '<td class="num">' + fmtCredits(used) + ' / ' + (total >= 0 ? fmtCredits(total) : '—') + '</td>' +
+      '<td class="num">' + fmtCredits(used) + ' / ' + fmtCredits(total) + '</td>' +
       '<td class="num">' + fmtCredits(remaining) + '</td>' +
       '<td><div class="rate-cell"><div class="rate-bar"><div class="rate-fill" style="width:' + (ratio * 100) + '%"></div></div>' +
       '<span class="rate-text num">' + Math.round(ratio * 100) + '%</span></div></td>' +

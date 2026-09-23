@@ -1,11 +1,14 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -716,6 +719,196 @@ func chatRequest(model string) map[string]interface{} {
 	}
 }
 
+// accountFixture centralizes the endpoints every account-status test needs:
+// jobToken exchange, /user/status and the OpenAPI quota endpoint. Tests plug
+// in their own status/quota behaviour and can count requests per endpoint.
+type accountFixture struct {
+	statusHits atomic.Int32
+	quotaHits  atomic.Int32
+
+	statusFunc func(w http.ResponseWriter, r *http.Request)
+	quotaFunc  func(w http.ResponseWriter, r *http.Request)
+}
+
+func newAccountBridge(t *testing.T, fx *accountFixture) *OpenAiBridge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+		fx.statusHits.Add(1)
+		if fx.statusFunc != nil {
+			fx.statusFunc(w, r)
+			return
+		}
+		io.WriteString(w, `{"id":"uid1","userType":"teams","plan":"PLAN_TIER_TEAM","userTag":"Teams","nextResetAt":1790265600000}`)
+	})
+	mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+		fx.quotaHits.Add(1)
+		if fx.quotaFunc != nil {
+			fx.quotaFunc(w, r)
+			return
+		}
+		io.WriteString(w, `{"userId":"uid1","userType":"teams","userQuota":{"total":3000,"used":10,"remaining":2990,"unit":"credits"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL}
+	return NewOpenAiBridge("pt-test", region)
+}
+
+// forceStatusRefetch marks the identity-status cache stale so the next
+// fetchAccountStatus call goes back to /user/status instead of hitting the
+// TTL cache.
+func forceStatusRefetch(b *OpenAiBridge) {
+	b.accountMu.Lock()
+	b.accountTs = 0
+	b.accountMu.Unlock()
+}
+
+// captureLogs redirects the standard logger to a buffer for the rest of the
+// test, restoring the previous output on cleanup, so tests can assert which
+// degradations do and do not get logged.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
+
+// §24: the cache-hit branch of fetchAccountStatus used to return the bridge's
+// internal pointer, and EnsureAccountStatus's quota-failure branch returned it
+// straight to the caller. A mutating caller could then rewrite the bridge
+// cache without accountMu. Every return path must hand out a clone.
+func TestEnsureAccountStatusCachePathDoesNotAliasInternalPointer(t *testing.T) {
+	var quotaCalls atomic.Int32
+	fx := &accountFixture{
+		quotaFunc: func(w http.ResponseWriter, r *http.Request) {
+			// The first call succeeds (primes the cache); subsequent calls fail
+			// so EnsureAccountStatus takes its quota-failure branch and returns
+			// whatever fetchAccountStatus's cache-hit path handed it.
+			if quotaCalls.Add(1) == 1 {
+				io.WriteString(w, `{"userId":"uid1","userType":"teams","userQuota":{"total":3000,"used":10,"remaining":2990,"unit":"credits"}}`)
+				return
+			}
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+		},
+	}
+	b := newAccountBridge(t, fx)
+
+	first := b.EnsureAccountStatus(context.Background())
+	if first == nil || first.UserType != "teams" {
+		t.Fatalf("priming call failed: %+v", first)
+	}
+
+	// Fresh identity cache + failing quota endpoint: fetchAccountStatus takes
+	// its cache-hit branch, and the quota outage makes EnsureAccountStatus
+	// return that pointer verbatim to the caller.
+	st := b.EnsureAccountStatus(context.Background())
+	if st == nil {
+		t.Fatal("expected cached status despite the quota outage")
+	}
+	b.accountMu.Lock()
+	internal := b.account
+	b.accountMu.Unlock()
+	if internal == nil || st == internal {
+		t.Fatal("EnsureAccountStatus returned the bridge's internal cache pointer")
+	}
+	st.UserTag = "MUTATED-BY-CALLER"
+	if snap := b.AccountStatus(); snap == nil || snap.UserTag != "Teams" {
+		t.Errorf("caller mutation leaked into the bridge cache: %+v", snap)
+	}
+}
+
+// §25a: userID == "" is the expected degradation of the first jobToken
+// exchange, not a failure. With a stale status cache resolveAccountStatus must
+// return the cached tier silently — no WARN, no /user/status request.
+func TestResolveAccountStatusNoUserIDReturnsCachedTierSilently(t *testing.T) {
+	fx := &accountFixture{}
+	b := newAccountBridge(t, fx)
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.UserType != "teams" {
+		t.Fatalf("priming call failed: %+v", st)
+	}
+	statusHits := fx.statusHits.Load()
+
+	// Stale cache, so the empty-id guard (not the TTL cache) is what must stop
+	// the request from going out.
+	forceStatusRefetch(b)
+	logs := captureLogs(t)
+	if got := b.resolveAccountStatus(context.Background(), ""); got != "teams" {
+		t.Errorf("resolveAccountStatus(\") = %q, want the cached tier teams", got)
+	}
+	if got := fx.statusHits.Load(); got != statusHits {
+		t.Errorf("/user/status hits = %d, want %d (empty user id must not re-query)", got, statusHits)
+	}
+	if strings.Contains(logs.String(), "WARN user/status failed") {
+		t.Errorf("expected degradation was logged as a failure:\n%s", logs.String())
+	}
+}
+
+// §25b: resolveAccountStatus runs under refreshMu, so a slow /user/status
+// must not hold the session lock for the full request timeout. The derived
+// context bounds the lookup; the cached tier is the fallback, and a timed-out
+// lookup is still a genuine failure that keeps its WARN.
+func TestResolveAccountStatusBoundedByDerivedTimeout(t *testing.T) {
+	orig := accountStatusTimeout
+	accountStatusTimeout = 100 * time.Millisecond
+	defer func() { accountStatusTimeout = orig }()
+
+	slowRequestHit := make(chan struct{})
+	respond := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(respond) }) }
+	// Never let a failed assertion leave the handler parked: srv.Close waits
+	// for outstanding handlers and would hang the test binary.
+	defer release()
+
+	fx := &accountFixture{}
+	fx.statusFunc = func(w http.ResponseWriter, r *http.Request) {
+		// Park the handler until the test releases it: the derived deadline
+		// then fires client-side while the request is still in flight, which is
+		// exactly the "slow /user/status" scenario. slowRequestHit lets the
+		// main goroutine proceed as soon as the request has arrived.
+		close(slowRequestHit)
+		<-respond
+		io.WriteString(w, `{"id":"uid1","userType":"teams"}`)
+	}
+	b := newAccountBridge(t, fx)
+	// Prime the cache directly so the fallback tier exists; this avoids a
+	// second slow status response racing the resolve call's own fetch.
+	b.accountMu.Lock()
+	b.account = &auth.AccountStatus{UserType: "teams"}
+	b.accountTs = 0 // stale: the next fetch must go back to the gateway
+	b.accountMu.Unlock()
+
+	logs := captureLogs(t)
+	start := time.Now()
+	result := make(chan string, 1)
+	go func() { result <- b.resolveAccountStatus(context.Background(), "uid1") }()
+	// Wait until the slow request is actually in flight, then assert the
+	// fallback returns promptly instead of blocking behind it.
+	<-slowRequestHit
+	select {
+	case got := <-result:
+		if got != "teams" {
+			t.Errorf("resolveAccountStatus = %q, want the cached tier teams", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolveAccountStatus did not return promptly while /user/status was blocked")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("resolveAccountStatus blocked for %s; the derived context must bound the lookup", elapsed)
+	}
+	if !strings.Contains(logs.String(), "WARN user/status failed") {
+		t.Errorf("a timed-out lookup is a genuine failure and must still WARN:\n%s", logs.String())
+	}
+	release()
+}
+
 // A 10605 rejection before any content must be retried once after back-off,
 // and the retry must NOT refresh the job token (the session is still valid).
 func TestHandleChatBusyRetriesWithoutTokenRefresh(t *testing.T) {
@@ -1170,6 +1363,18 @@ func TestResolveMaxTokensPrefersCallerValue(t *testing.T) {
 			map[string]interface{}{"max_completion_tokens": float64(9000)}, 9000},
 		{"max_tokens takes precedence over max_completion_tokens",
 			map[string]interface{}{"max_tokens": float64(4096), "max_completion_tokens": float64(9000)}, 4096},
+		{"the ceiling itself is kept",
+			map[string]interface{}{"max_tokens": float64(models.MaxRequestedOutputTokens)}, models.MaxRequestedOutputTokens},
+		{"ceiling + 1 is clamped",
+			map[string]interface{}{"max_tokens": float64(models.MaxRequestedOutputTokens + 1)}, models.MaxRequestedOutputTokens},
+		{"absurd values are clamped to the ceiling",
+			map[string]interface{}{"max_tokens": float64(1e18)}, models.MaxRequestedOutputTokens},
+		{"clamp does not depend on int conversion width",
+			map[string]interface{}{"max_tokens": float64(9.3e18)}, models.MaxRequestedOutputTokens},
+		{"the largest finite float is clamped",
+			map[string]interface{}{"max_tokens": math.MaxFloat64}, models.MaxRequestedOutputTokens},
+		// The ceiling must never become the catalog default: a smaller catalog
+		// cap still applies when the caller sends nothing usable.
 		{"absent falls back to catalog", map[string]interface{}{}, catalogDefault},
 		{"zero is not a usable cap", map[string]interface{}{"max_tokens": float64(0)}, catalogDefault},
 		{"negative is not a usable cap", map[string]interface{}{"max_tokens": float64(-5)}, catalogDefault},
@@ -1215,5 +1420,102 @@ func TestHandleChatForwardsCallerMaxTokens(t *testing.T) {
 	params := payload["parameters"].(map[string]interface{})
 	if got := params["max_tokens"].(float64); got != 16000 {
 		t.Errorf("parameters.max_tokens = %v, want 16000 (catalog cap is 4096)", got)
+	}
+}
+
+// §27 placement lock: tool_choice rides inside "parameters" while
+// parallel_tool_calls stays a top-level field, exactly the wire positions
+// both had when the parameters object was introduced. Whether the gateway
+// reads parallel_tool_calls from either position is unverified, so this test
+// makes a future move a deliberate, tested change.
+func TestApplyToolConfigLocksFieldPlacement(t *testing.T) {
+	body := newRequestBody()
+	toolsEnabled := applyToolConfig(body, map[string]interface{}{
+		"tools": []interface{}{map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "get_weather",
+				"description": "report the weather",
+				"parameters":  map[string]interface{}{"type": "object"},
+			},
+		}},
+		"tool_choice":         "required",
+		"parallel_tool_calls": true,
+	})
+	if !toolsEnabled {
+		t.Fatal("tools must be enabled")
+	}
+
+	raw, err := marshalNoEscape(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	params, ok := payload["parameters"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters object missing: %s", raw)
+	}
+	if got := params["tool_choice"]; got != "required" {
+		t.Errorf("parameters.tool_choice = %#v, want required", got)
+	}
+	if got := payload["parallel_tool_calls"]; got != true {
+		t.Errorf("top-level parallel_tool_calls = %#v, want true", got)
+	}
+	if _, present := params["parallel_tool_calls"]; present {
+		t.Error("parallel_tool_calls must not move into parameters without verification")
+	}
+	if _, present := payload["tool_choice"]; present {
+		t.Error("tool_choice must not reappear at the top level")
+	}
+}
+
+// §28: a usage frame the gateway flags billable=false must reach the recorder
+// as NonBillable, so its credits never inflate cycle accounting. Tokens are
+// still counted either way.
+func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{
+			"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12, "credits": 0.5, "billable": false}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	rec := stats.NewRecorder(nil)
+
+	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, rec)
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+
+	report := rec.Report()
+	if report.PromptTokens != 5 || report.CompletionTokens != 7 {
+		t.Errorf("tokens must be counted even for non-billable frames: %+v", report)
+	}
+	if report.Credits != 0 || report.CycleCredits != 0 {
+		t.Errorf("non-billable credits must be dropped, got credits=%v cycle=%v", report.Credits, report.CycleCredits)
+	}
+}
+
+// fmtResetTime backs the "reset=..." field of the once-a-minute quota log. Its
+// two contract points are that an absent boundary (0) reads as "unknown" rather
+// than 1970, and that a real instant is rendered in local time (§28).
+func TestFmtResetTime(t *testing.T) {
+	if got := fmtResetTime(0); got != "unknown" {
+		t.Errorf("fmtResetTime(0) = %q, want %q", got, "unknown")
+	}
+	if got := fmtResetTime(-1); got != "unknown" {
+		t.Errorf("fmtResetTime(-1) = %q, want %q", got, "unknown")
+	}
+	instant := time.Date(2026, time.July, 16, 17, 27, 0, 0, time.Local)
+	if got, want := fmtResetTime(instant.UnixMilli()), instant.Format("2006-01-02 15:04 MST"); got != want {
+		t.Errorf("fmtResetTime = %q, want %q", got, want)
 	}
 }
