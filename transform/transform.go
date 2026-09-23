@@ -37,6 +37,10 @@ type Usage struct {
 	CompletionTokensDetails *Detail `json:"completion_tokens_details,omitempty"`
 	Credits                 float64 `json:"credits"`
 	OriginalCredits         float64 `json:"original_credits"`
+	// Billable reports whether the gateway charged this request. Frames that
+	// omit the field are treated as billable so pre-existing models keep
+	// contributing to the credits total instead of silently zeroing it.
+	Billable bool `json:"billable"`
 }
 
 // Detail is a token breakdown (cached prompt tokens / reasoning tokens).
@@ -283,6 +287,11 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 	role, _ := message["role"].(string)
 	if role == "" {
 		role = "user"
+	}
+	// Qoder's upstream chat protocol accepts system messages but rejects the
+	// OpenAI-only developer role that Pi uses for its agent instruction.
+	if role == "developer" {
+		role = "system"
 	}
 	text := normalizeMessageText(message)
 	anyToolCalls := extractAnyToolCalls(message, text, toolsEnabled)
@@ -947,6 +956,12 @@ func extractUsage(v interface{}) *Usage {
 		TotalTokens:      toInt(m["total_tokens"]),
 		Credits:          toFloat(m["credits"]),
 		OriginalCredits:  toFloat(m["original_credits"]),
+		// Default true: only an explicit false suppresses billing. An absent
+		// field must not drop credits from frames of models that predate it.
+		Billable: true,
+	}
+	if b, ok := m["billable"].(bool); ok {
+		u.Billable = b
 	}
 	if d, ok := m["prompt_tokens_details"].(map[string]interface{}); ok {
 		u.PromptTokensDetails = &Detail{CachedTokens: toInt(d["cached_tokens"])}

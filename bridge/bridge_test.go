@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"qoder2api/auth"
+	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/transform"
 )
@@ -204,11 +206,13 @@ func TestNeedsRefreshWithUnknownExpiry(t *testing.T) {
 	if !b.needsRefresh() {
 		t.Fatal("fresh bridge must need refresh (no session)")
 	}
+	// An empty resolved tier falls back to the jobToken value, matching the
+	// pre-user/status behaviour.
 	b.applyJobToken(map[string]interface{}{
 		"name": "u", "id": "1", "userType": "personal_standard",
 		"refreshToken": "r", "securityOauthToken": "s",
 		"expireTime": nil, // missing expiry
-	})
+	}, "")
 	if b.needsRefresh() {
 		t.Error("missing expireTime must fall back to TTL-based freshness, not always-refresh")
 	}
@@ -227,7 +231,7 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 	if b.currentIdentity() != nil {
 		t.Fatal("expected nil identity before bootstrap")
 	}
-	b.applyJobToken(map[string]interface{}{"name": "u", "id": "1", "expireTime": float64(1e15)})
+	b.applyJobToken(map[string]interface{}{"name": "u", "id": "1", "expireTime": float64(1e15)}, "")
 	id := b.currentIdentity()
 	if id == nil || id.Name != "u" {
 		t.Fatalf("expected identity snapshot, got %+v", id)
@@ -243,6 +247,15 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 // region pointing at this test server).
 type fakeGateway struct {
 	chatLines []string // raw SSE lines ("data: {...}")
+
+	mu       sync.Mutex
+	chatBody []byte
+}
+
+func (g *fakeGateway) lastChatBody() []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]byte(nil), g.chatBody...)
 }
 
 func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
@@ -254,9 +267,17 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+		// Fixture deliberately mirrors the live catalog shape: thinking metadata
+		// is nested under thinking_config, not flattened onto the entry. A flat
+		// fixture is what let the original parser pass tests while reading a
+		// field path the gateway never emits.
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false,"is_reasoning":true,"max_output_tokens":4096,"thinking_config":{"disabled":{},"enabled":{"efforts":{"low":{},"medium":{"is_default":true},"xhigh":{}},"is_default":true}}}]}`)
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gw.mu.Lock()
+		gw.chatBody = body
+		gw.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
 		for _, l := range gw.chatLines {
@@ -806,5 +827,393 @@ func TestChatSlotsSerializeUpstreamCalls(t *testing.T) {
 	}
 	if got := maxInFlight.Load(); got != 1 {
 		t.Errorf("max concurrent upstream calls = %d, want 1 (default slot limit)", got)
+	}
+}
+
+func TestEnsureAccountStatusMergesAuthoritativeQuota(t *testing.T) {
+	var quotaCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"id":"uid1","userType":"teams","plan":"PLAN_TIER_TEAM","userTag":"Teams","orgName":"Example Org","nextResetAt":1790265600000,"isQuotaExceeded":false}`)
+	})
+	mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sot" {
+			t.Errorf("quota Authorization = %q", got)
+		}
+		if quotaCalls.Add(1) > 1 {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		// expiresAt is deliberately a different (and implausibly distant) value:
+		// the gateway's nextResetAt must win over it.
+		io.WriteString(w, `{"userId":"uid1","userType":"teams","totalUsagePercentage":0.98,"isQuotaExceeded":true,"expiresAt":253402214400000,"userQuota":{"total":3000,"used":2939,"remaining":61,"percentage":0.98,"unit":"credits"},"orgResourcePackage":{"used":0,"cap":4000,"remaining":0,"percentage":0,"available":false,"unit":"credits"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL}
+	b := NewOpenAiBridge("pt-test", region)
+	st := b.EnsureAccountStatus(context.Background())
+	if st == nil || st.UserQuota == nil {
+		t.Fatalf("expected authoritative quota, got %+v", st)
+	}
+	if st.UserQuota.Used != 2939 || st.UserQuota.Remaining != 61 {
+		t.Errorf("unexpected quota merge: %+v", st)
+	}
+	// The gateway boundary wins; the far-future expiresAt sentinel is ignored.
+	if st.NextResetAtMs != 1790265600000 {
+		t.Errorf("NextResetAtMs = %d, want the /user/status nextResetAt (1790265600000)", st.NextResetAtMs)
+	}
+	if !st.IsQuotaExceeded || st.Plan != "PLAN_TIER_TEAM" || st.OrgName != "Example Org" {
+		t.Errorf("gateway metadata and OpenAPI verdict were not merged: %+v", st)
+	}
+	if st.OrgResourcePackage == nil || st.OrgResourcePackage.Cap != 4000 {
+		t.Errorf("organization package missing: %+v", st.OrgResourcePackage)
+	}
+
+	// Force the identity cache stale, then fail the next quota request. A fresh
+	// reduced /user/status response must not erase the last official snapshot.
+	b.accountMu.Lock()
+	b.accountTs = 0
+	b.accountMu.Unlock()
+	st = b.EnsureAccountStatus(context.Background())
+	if st == nil || st.UserQuota == nil || st.UserQuota.Used != 2939 || !st.IsQuotaExceeded {
+		t.Errorf("temporary quota outage erased the last authoritative snapshot: %+v", st)
+	}
+}
+
+func TestHandleChatSendsReasoningEffortToSignedGateway(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "xhigh",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	if got := payload["reasoning_effort"]; got != nil {
+		t.Errorf("reasoning_effort must not be a top-level body field, got %#v", got)
+	}
+	params, ok := payload["parameters"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters object missing from gateway request: %s", plain)
+	}
+	if got := params["reasoning_effort"]; got != "xhigh" {
+		t.Errorf("parameters.reasoning_effort = %#v, want xhigh", got)
+	}
+	if got, ok := params["max_tokens"].(float64); !ok || got <= 0 {
+		t.Errorf("parameters.max_tokens = %#v, want a positive cap", params["max_tokens"])
+	}
+	if _, present := params["max_thinking_tokens"]; present {
+		t.Errorf("max_thinking_tokens must be omitted for a non-none tier, got %#v", params["max_thinking_tokens"])
+	}
+	if got := payload["model_config"].(map[string]interface{})["key"]; got != "qmodel_latest" {
+		t.Errorf("model_config.key = %#v, want qmodel_latest", got)
+	}
+}
+
+// A "none" tier must disable thinking the way the official client does: set
+// is_reasoning=false on both model_config copies AND send an explicit
+// max_thinking_tokens of 0. Serializing 0 (rather than omitting it) is the
+// whole point, so the pointer field is asserted here.
+func TestHandleChatDisablesReasoningForNoneTier(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "none",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["reasoning_effort"]; got != "none" {
+		t.Errorf("parameters.reasoning_effort = %#v, want none", got)
+	}
+	if got, ok := params["max_thinking_tokens"].(float64); !ok || got != 0 {
+		t.Errorf("parameters.max_thinking_tokens = %#v, want explicit 0", params["max_thinking_tokens"])
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != false {
+		t.Errorf("model_config.is_reasoning = %#v, want false", got)
+	}
+	extra := payload["chat_context"].(map[string]interface{})["extra"].(map[string]interface{})
+	if got := extra["modelConfig"].(map[string]interface{})["is_reasoning"]; got != false {
+		t.Errorf("chat_context.extra.modelConfig.is_reasoning = %#v, want false", got)
+	}
+}
+
+// A tier the model does not support is dropped entirely, and the model keeps
+// whatever reasoning capability the catalog advertised for it.
+func TestHandleChatUnsupportedTierKeepsCatalogReasoning(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "high",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+
+	params := payload["parameters"].(map[string]interface{})
+	if got, present := params["reasoning_effort"]; present {
+		t.Errorf("unsupported tier must be omitted, got %#v", got)
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
+		t.Errorf("model_config.is_reasoning = %#v, want true (catalog capability preserved)", got)
+	}
+}
+
+func TestResolveReasoningEffortRejectsUnsupportedModelTier(t *testing.T) {
+	qwen := &models.ModelReasoning{Efforts: []string{"low", "medium", "xhigh"}, SupportsDisabled: true, Known: true}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, qwen); got != "" {
+		t.Errorf("unsupported tier = %q, want omitted", got)
+	}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, qwen); got != "none" {
+		t.Errorf("supported disabled tier = %q, want none", got)
+	}
+}
+
+// Forwarding "none" to a model that does not declare thinking_config.disabled
+// makes the upstream reject the whole request with HTTP 400. When the catalog
+// carries no usable metadata for the key the tier cannot be validated, so it
+// must be omitted rather than passed through.
+func TestResolveReasoningEffortOmitsUnverifiedNone(t *testing.T) {
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, nil); got != "" {
+		t.Errorf("none without catalog metadata = %q, want omitted", got)
+	}
+	unknown := &models.ModelReasoning{}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, unknown); got != "" {
+		t.Errorf("none with unknown metadata = %q, want omitted", got)
+	}
+	// ...while other tiers keep their historical pass-through.
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, nil); got != "high" {
+		t.Errorf("high without catalog metadata = %q, want high", got)
+	}
+	// A model that declares the switch but no tiers still accepts "none".
+	switchOnly := &models.ModelReasoning{SupportsDisabled: true, Known: true}
+	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, switchOnly); got != "none" {
+		t.Errorf("none for a model declaring disabled = %q, want none", got)
+	}
+}
+
+// A model whose catalog entry has no thinking_config.disabled must not receive
+// "none" on the wire, and must keep its reasoning enabled.
+func TestHandleChatOmitsNoneForModelWithoutDisabled(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+	// Replace the fixture catalog with one that has no thinking_config.disabled,
+	// mirroring the models that reject "none" upstream (gmodel/gfmodel). The
+	// timestamp must be refreshed too, otherwise the cache is considered stale
+	// and the fake gateway's own catalog is fetched over it.
+	bridge.catalogMu.Lock()
+	bridge.catalog = models.ExtractCatalog(map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "qmodel_latest", "display_name": "Fake-Model", "enable": true,
+				"is_reasoning": true,
+				"thinking_config": map[string]interface{}{
+					"enabled": map[string]interface{}{
+						"efforts": map[string]interface{}{"low": map[string]interface{}{}, "high": map[string]interface{}{}},
+					},
+				}},
+		},
+	})
+	bridge.catalogTs = float64(time.Now().Unix())
+	bridge.catalogMu.Unlock()
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":            "Fake-Model",
+		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":           true,
+		"reasoning_effort": "none",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got, present := params["reasoning_effort"]; present {
+		t.Errorf("none must be omitted for a model without thinking_config.disabled, got %#v", got)
+	}
+	if _, present := params["max_thinking_tokens"]; present {
+		t.Error("max_thinking_tokens must not be sent when the tier is omitted")
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
+		t.Errorf("model_config.is_reasoning = %#v, want true (thinking stays on)", got)
+	}
+}
+
+// A far-future expiresAt sentinel (9999-12-31, used by plans without an
+// expiry) must never override the gateway's real nextResetAt, and must never
+// be adopted as the boundary when nextResetAt is missing.
+func TestEnsureAccountStatusRejectsSentinelResetBoundary(t *testing.T) {
+	const sentinel = int64(253402214400000)
+	const real = int64(1790265600000)
+
+	newBridge := func(t *testing.T, statusBody, quotaBody string) *OpenAiBridge {
+		t.Helper()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+		})
+		mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, statusBody)
+		})
+		mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, quotaBody)
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return NewOpenAiBridge("pt-test", &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL})
+	}
+
+	quota := func(expiresAt int64) string {
+		return fmt.Sprintf(`{"userId":"uid1","userType":"personal_standard","expiresAt":%d,"userQuota":{"total":0,"used":8,"remaining":0,"unit":"credits"},"addOnQuota":{"total":300,"used":36,"remaining":264,"unit":"credits"}}`, expiresAt)
+	}
+
+	// The gateway boundary wins over an OpenAPI sentinel.
+	b := newBridge(t,
+		fmt.Sprintf(`{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE","nextResetAt":%d}`, real),
+		quota(sentinel))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != real {
+		t.Errorf("NextResetAtMs = %v, want the gateway boundary %d", st, real)
+	}
+
+	// With no gateway boundary, the sentinel must be dropped rather than adopted.
+	b = newBridge(t, `{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE"}`, quota(sentinel))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != 0 {
+		t.Errorf("NextResetAtMs = %v, want 0 (sentinel rejected)", st)
+	}
+
+	// A plausible expiresAt still serves as the fallback.
+	b = newBridge(t, `{"id":"uid1","userType":"personal_standard","plan":"PLAN_FREE"}`, quota(real))
+	if st := b.EnsureAccountStatus(context.Background()); st == nil || st.NextResetAtMs != real {
+		t.Errorf("NextResetAtMs = %v, want the expiresAt fallback %d", st, real)
+	}
+}
+
+// The caller's cap must win over the catalog default, otherwise models with a
+// small advertised cap (the built-in BYOK table lists one at 2048) would have
+// their responses silently truncated.
+func TestResolveMaxTokensPrefersCallerValue(t *testing.T) {
+	const catalogDefault = 2048
+
+	cases := []struct {
+		name    string
+		reqBody map[string]interface{}
+		want    int
+	}{
+		{"caller cap wins over smaller catalog cap",
+			map[string]interface{}{"max_tokens": float64(16000)}, 16000},
+		{"newer max_completion_tokens is honored",
+			map[string]interface{}{"max_completion_tokens": float64(9000)}, 9000},
+		{"max_tokens takes precedence over max_completion_tokens",
+			map[string]interface{}{"max_tokens": float64(4096), "max_completion_tokens": float64(9000)}, 4096},
+		{"absent falls back to catalog", map[string]interface{}{}, catalogDefault},
+		{"zero is not a usable cap", map[string]interface{}{"max_tokens": float64(0)}, catalogDefault},
+		{"negative is not a usable cap", map[string]interface{}{"max_tokens": float64(-5)}, catalogDefault},
+		{"fractional is not a usable cap", map[string]interface{}{"max_tokens": 100.5}, catalogDefault},
+		{"string is not a usable cap", map[string]interface{}{"max_tokens": "8000"}, catalogDefault},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMaxTokens(tc.reqBody, catalogDefault); got != tc.want {
+				t.Errorf("resolveMaxTokens(%v, %d) = %d, want %d", tc.reqBody, catalogDefault, got, tc.want)
+			}
+		})
+	}
+}
+
+// The resolved cap must reach the signed gateway body inside "parameters".
+func TestHandleChatForwardsCallerMaxTokens(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":      "Fake-Model",
+		"messages":   []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":     true,
+		"max_tokens": float64(16000),
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["max_tokens"].(float64); got != 16000 {
+		t.Errorf("parameters.max_tokens = %v, want 16000 (catalog cap is 4096)", got)
 	}
 }

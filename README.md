@@ -12,23 +12,24 @@
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
-- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / 实际扣费额度 / 按模型 / 近 24 小时趋势）
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本周期扣费额度与重置倒计时** / 按模型 / 近 24 小时趋势）
+- **订阅周期感知** —— 从网关 `/algo/api/v3/user/status` 读取真实订阅信息（套餐、组织、`nextResetAt` 重置时间、`isQuotaExceeded` 超额标记），使面板额度按计费周期统计而非终身累计
 - **单文件部署** —— 编译为单一二进制文件，零外部依赖
 
 ## 支持的模型
 
-| 显示名称            | 内部 Key         |
+| 显示名称 | 内部 Key |
 | ----------------- | -------------- |
-| Qwen3.8-Max       | qmodel_38max   |
-| Qwen3.7-Max       | qmodel_latest  |
-| Qwen3.7-Plus      | qmodel         |
-| Qwen3.6-Flash     | q36fmodel      |
-| DeepSeek-V4-Pro   | dmodel         |
-| DeepSeek-V4-Flash | dfmodel        |
-| GLM-5.3           | gmodel         |
-| GLM-5.2           | gm51model      |
-| Kimi-K2.7-Code    | kmodel         |
-| MiniMax-M2.7      | mmodel         |
+| Qwen3.8-Max | qmodel_38max |
+| Qwen3.7-Max | qmodel_latest |
+| Qwen3.7-Plus | qmodel |
+| Qwen3.6-Flash | q36fmodel |
+| DeepSeek-V4-Pro | dmodel |
+| DeepSeek-V4-Flash | dfmodel |
+| GLM-5.3 | gmodel |
+| GLM-5.2 | gm51model |
+| Kimi-K2.7-Code | kmodel |
+| MiniMax-M2.7 | mmodel |
 
 > 以上为内置默认列表（catalog-v6，2026-08-15），实际可用模型以网关动态返回为准。
 >
@@ -68,7 +69,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 ### 环境变量
 
 | 变量名 | 默认值 | 说明 |
-|-------|--------|------|
+| ------- | -------- | ------ |
 | `QODER_HOST` | `0.0.0.0` | 监听地址 |
 | `QODER_PORT` | `10081` | 监听端口 |
 | `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
@@ -150,10 +151,77 @@ curl http://localhost:10081/v1/models \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx"
 ```
 
+### 5. 控制思考强度（`reasoning_effort`）
+
+请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位写入网关请求的 `parameters` 对象（与官方客户端一致），**无需**额外的 device token、Bearer token 或模型服务域名配置；未携带该字段的请求保持原有行为。
+
+```json
+{
+  "model": "Qwen3.8-Max",
+  "messages": [{"role": "user", "content": "你好"}],
+  "reasoning_effort": "xhigh"
+}
+```
+
+桥接层从动态模型目录的 `thinking_config` 读取校验信息：档位列表来自 `thinking_config.enabled.efforts`（对象 map），`none` 是否允许则取决于 `thinking_config.disabled` 是否声明。有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度。
+
+其中 `none` 的判据是**就紧不就松**：只有在模型目录明确声明 `thinking_config.disabled` 时才转发；目录元数据缺失（模型没有 `thinking_config` 或其为 `null`）时同样省略，因为上游对未声明支持的模型会以一个 HTTP 400 拒绝整个请求。其余档位在元数据缺失时保持原有的直接透传行为。
+
+> **注意**：档位必须放在 `parameters` 内才会生效。网关不读取请求体顶层的 `reasoning_effort`，写在该位置会被静默忽略，模型一律按默认强度思考。此外 `parameters` 还承载 `max_tokens`、`tool_choice` 等字段，桥接层会自动组装，调用方无需关心。
+
+#### `none` 档：完全关闭思考
+
+`none` 是二值开关而非强度档位，需要额外配合才能真正关闭思考。当模型目录声明了 `thinking_config.disabled` 时，桥接层在档位解析为 `none` 时会同时做三件事（与官方客户端行为一致）：
+
+1. `parameters.reasoning_effort` 置为 `"none"`
+2. `parameters.max_thinking_tokens` 显式置为 `0`（该字段用指针承载，以保证 `0` 不被 JSON 序列化省略）
+3. `model_config.is_reasoning` 与 `chat_context.extra.modelConfig.is_reasoning` 均置为 `false`
+
+其余档位不会写入 `max_thinking_tokens`：官方客户端仅在技能 / 子代理覆盖场景才把档位换算为思考预算，主交互路径只发送档位字符串。
+
+#### `is_reasoning` 与 `max_tokens` 的来源
+
+两项能力信息来自网关模型目录，与官方客户端的解析方式一致：
+
+- `is_reasoning`：取目录的 `is_reasoning` 字段，缺失时为 `false`。动态目录不可用时回退为 `true`，以保持桥接层原有的"默认开启思考"行为，避免静默关闭所有模型的思考能力。
+- `max_tokens`：取目录的 `max_output_tokens`，缺失或非法（非正整数）时回退为 `32000`，与官方客户端的 `LS()` 归一化结果相同。
+
+**pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
+
+```json
+{
+  "providers": {
+    "qoder-local": {
+      "compat": {
+        "supportsDeveloperRole": false
+      }
+    }
+  }
+}
+```
+
+以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型（`max` 映射到目录实际支持的最高档位，避免发送被上游丢弃的无效值）：
+
+```json
+{
+  "id": "Qwen3.8-Max",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "off": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  }
+}
+```
+
 ## API 端点
 
 | 端点 | 方法 | 说明 |
-|------|------|------|
+| ------ | ------ | ------ |
 | `/v1/chat/completions` | POST | 聊天补全（兼容 OpenAI 格式） |
 | `/v1/models` | GET | 获取模型列表 |
 | `/admin` | GET | Web 管理面板 |
@@ -161,11 +229,55 @@ curl http://localhost:10081/v1/models \
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
 | `/admin/api/pat` | GET/POST | PAT 令牌管理 |
 | `/admin/api/models` | GET | 获取模型列表 |
-| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 扣费额度） |
+| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 扣费额度 / 计费周期与套餐信息） |
 | `/admin/api/config` | GET/POST | 服务器配置 |
 | `/admin/api/password` | POST | 修改管理密码 |
 
 **错误响应约定**：登录失败限流返回 `429`（附 `Retry-After`）；创建重复 API Key 返回 `409`；端口配置越界（非 1–65535）返回 `400`；未鉴权或会话过期返回 `401`。
+
+## 额度与计费周期
+
+管理面板使用 Qoder 官方客户端同源的额度接口，展示当前计费周期的权威用量，而不是仅统计本服务启动后的局部消耗：
+
+```text
+套餐额度      2,939 / 3,000   剩余 61      可用
+加购额度      0 / 1,000       剩余 1,000   可用
+组织资源包    120 / 4,000     剩余 3,880   可用
+合计剩余      4,941 · 09-25 重置
+```
+
+> 免费账号的套餐池为 `userQuota.total = 0`（套餐本身不含额度），此时面板首行直接展示真正持有额度的池子（通常是加购额度），而不是渲染成「套餐 0 / 0 · 已用尽」。`total`/`cap` 为 0 的池子视为不存在，不会出现在额度明细卡中。
+
+### 数据来源
+
+主数据来自 `GET https://openapi.qoder.com.cn/api/v2/quota/usage`，使用现有 jobToken 交换返回的 `securityOauthToken` 作为 Bearer。该接口与官方客户端 `/usage` 面板相同，提供：
+
+| 字段 | 含义 | 用途 |
+| ------ | ------ | ------ |
+| `userQuota.total/used/remaining` | 套餐总额、已用及剩余 Credits | 面板额度行（`total = 0` 时该池不参与展示） |
+| `userQuota.percentage` | 套餐使用比例 | 管理 API 输出及详细信息 |
+| `addOnQuota` | 加购额度包（存在时） | 管理 API 输出及额度明细卡 |
+| `orgResourcePackage` | 组织资源包容量、已用、剩余及可用状态 | 管理 API 输出及额度明细卡 |
+| `expiresAt` | 当前额度周期结束时刻（仅兜底） | 重置日期与倒计时 |
+| `isQuotaExceeded` | 官方客户端采用的超额判定 | 面板红色告警徽标 |
+
+网关 `POST /algo/api/v3/user/status?Encode=1` 仍负责提供 `plan`、`userTag`、组织名称和真实 `userType`。它的 `quota: 0` 是精简字段，**不能解释为套餐没有数字上限**；额度必须以 OpenAPI 的 `userQuota` 为准。
+
+### 统计与降级口径
+
+- **官方额度优先**：面板的套餐用量来自账号级 OpenAPI，包含 IDE、CLI 和本服务产生的全部消耗，也能覆盖服务启动前的当期用量。
+- **额度来源分别展示**：套餐额度、加购额度和组织资源包在额度明细卡中分别成行展示，并汇总各额度来源返回的剩余 Credits；组织资源包的“可用/不可用”状态以 OpenAPI 返回值为准。
+- **本地累计仅作降级**：usage 帧中 `billable=false` 的请求仍计入 token，但不计入本地 credits；OpenAPI 从未成功时，面板才显示本服务观察到的周期消耗，并明确标注口径。
+- **周期边界权威同步**：重置时刻以网关 `/user/status` 的 `nextResetAt` 为权威，OpenAPI `expiresAt` 仅在其缺失时兜底；且 `expiresAt` 必须小于 `2100-01-01` 才会被采纳——无期限套餐会把它填成 `9999-12-31` 哨兵值，该值会被忽略。本地周期起点按自然月回退推导，断网期间仍可完成一次性滚动。
+- **累计值仍保留**：`stats.credits` 保存本服务历史累计扣费，鼠标悬停在额度行可查看。
+
+### 刷新时机
+
+主程序启动后立即获取一次额度，此后每分钟在后台刷新。管理面板的 15 秒轮询完全读取内存和持久化快照，不直接调用上游；临时网络故障会保留最后一次成功结果。
+
+### `userType` 修复
+
+`jobToken` 响应中**不含** `userType` 字段，此前 bridge 一律回退为 `personal_standard`，导致团队账号的签名会话载荷层级错误。现改为在构建会话**之前**从 `/user/status` 取真实层级（该值被 AES 签入 bearer 载荷，事后无法修改）。状态接口临时不可用时，按「上次已知层级 → 空值 → 历史默认值」顺序降级，避免续期时把团队账号静默降级。
 
 ## 安全
 

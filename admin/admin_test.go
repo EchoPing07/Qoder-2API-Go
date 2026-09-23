@@ -288,8 +288,52 @@ func TestServeIndex(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "<!DOCTYPE html>") {
+	body := w.Body.String()
+	if !strings.Contains(body, "<!DOCTYPE html>") {
 		t.Error("expected HTML doctype")
+	}
+	for _, want := range []string{`id="quotaCard"`, `id="quotaTable"`, "renderQuotaDetails(d)", "组织资源包"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected quota detail UI marker %q", want)
+		}
+	}
+}
+
+// The panel's headline must reflect the allowance the account actually holds.
+// A free account reports userQuota.total=0 while the usable budget sits in
+// addOnQuota; keying the headline off userQuota rendered "套餐 8 / 0 · 剩 0"
+// for an account that still had credits, and hid the pool that really mattered.
+func TestQuotaSourceSelectionIgnoresEmptyPools(t *testing.T) {
+	start := strings.Index(indexHTML, "function quotaPools(acct) {")
+	if start < 0 {
+		t.Fatal("quotaPools not found in the embedded UI")
+	}
+	end := strings.Index(indexHTML[start:], "\n/*\n * Prefer the authoritative")
+	if end < 0 {
+		t.Fatal("could not delimit quotaPools")
+	}
+	pools := indexHTML[start : start+end]
+
+	// A zero-total pool carries no allowance and must not be offered as one.
+	for _, guard := range []string{
+		"acct.user_quota && Number(acct.user_quota.total || 0) > 0",
+		"acct.add_on_quota && Number(acct.add_on_quota.total || 0) > 0",
+		"acct.org_resource_package && Number(acct.org_resource_package.cap || 0) > 0",
+	} {
+		if !strings.Contains(pools, guard) {
+			t.Errorf("quotaPools must skip zero-capacity pools; missing guard %q", guard)
+		}
+	}
+
+	// Both renderers must share that selection instead of hand-rolling their
+	// own, otherwise the headline and the detail card can disagree.
+	renderCredits := indexHTML[strings.Index(indexHTML, "function renderCredits(d) {"):]
+	renderCredits = renderCredits[:strings.Index(renderCredits, "function renderQuotaDetails(d) {")]
+	if !strings.Contains(renderCredits, "quotaPools(acct)") {
+		t.Error("renderCredits must select its pools via quotaPools(acct)")
+	}
+	if strings.Contains(renderCredits, "acct.user_quota ||") {
+		t.Error("renderCredits must not hardcode user_quota as the headline source")
 	}
 }
 
@@ -503,5 +547,98 @@ func TestConfigPartialInvalidTimeoutAppliesNothing(t *testing.T) {
 	timeouts := auth.CurrentStreamTimeouts()
 	if timeouts.Header != auth.DefaultChatHeaderTimeout {
 		t.Errorf("hot-apply must not run on rejected input, got %s", timeouts.Header)
+	}
+}
+
+// The billing-cycle fields and account metadata must reach the panel through
+// the stats endpoint, so the UI can render cycle-relative credits without any
+// network call of its own.
+func TestStatsEndpointExposesBillingCycle(t *testing.T) {
+	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
+	rec := stats.NewRecorder(nil)
+	rec.SetBillingCycle(reset.UnixMilli())
+	rec.SetAccount(&stats.Account{
+		Plan: "PLAN_TIER_TEAM", Tag: "Teams", OrgName: "Example Org",
+		TotalUsagePercentage: 0.98,
+		UserQuota:            &stats.Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
+		OrgResourcePackage:   &stats.OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
+	})
+	rec.RecordUsage(&stats.Usage{PromptTokens: 5, Credits: 1.25})
+
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+
+	var resp struct {
+		Credits      float64 `json:"credits"`
+		CycleCredits float64 `json:"cycle_credits"`
+		CycleStartMs int64   `json:"cycle_start_ms"`
+		NextResetMs  int64   `json:"next_reset_ms"`
+		Account      *struct {
+			Plan                 string  `json:"plan"`
+			Tag                  string  `json:"tag"`
+			OrgName              string  `json:"org_name"`
+			TotalUsagePercentage float64 `json:"total_usage_percentage"`
+			UserQuota            *struct {
+				Total     float64 `json:"total"`
+				Used      float64 `json:"used"`
+				Remaining float64 `json:"remaining"`
+			} `json:"user_quota"`
+			OrgResourcePackage *struct {
+				Cap       float64 `json:"cap"`
+				Available bool    `json:"available"`
+			} `json:"org_resource_package"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.NextResetMs != reset.UnixMilli() {
+		t.Errorf("expected next_reset_ms %d, got %d", reset.UnixMilli(), resp.NextResetMs)
+	}
+	wantStart := time.Date(2026, time.August, 25, 0, 0, 0, 0, time.Local).UnixMilli()
+	if resp.CycleStartMs != wantStart {
+		t.Errorf("expected cycle_start_ms %d (one calendar month back), got %d", wantStart, resp.CycleStartMs)
+	}
+	if resp.CycleCredits < 1.25-1e-9 || resp.CycleCredits > 1.25+1e-9 {
+		t.Errorf("expected cycle_credits 1.25, got %v", resp.CycleCredits)
+	}
+	if resp.Account == nil || resp.Account.Tag != "Teams" || resp.Account.Plan != "PLAN_TIER_TEAM" {
+		t.Errorf("expected account metadata in the response, got %+v", resp.Account)
+	}
+	if resp.Account.UserQuota == nil || resp.Account.UserQuota.Total != 3000 || resp.Account.UserQuota.Used != 2939 || resp.Account.UserQuota.Remaining != 61 {
+		t.Errorf("expected authoritative user quota in the response, got %+v", resp.Account.UserQuota)
+	}
+	if resp.Account.OrgResourcePackage == nil || resp.Account.OrgResourcePackage.Cap != 4000 || resp.Account.OrgResourcePackage.Available {
+		t.Errorf("expected organization resource package in the response, got %+v", resp.Account.OrgResourcePackage)
+	}
+}
+
+// With no account status ever resolved the cycle fields stay zero and the
+// account is omitted, which is what makes the UI fall back to the lifetime
+// total instead of rendering a bogus "resetting soon".
+func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
+	rec := stats.NewRecorder(nil)
+	rec.RecordUsage(&stats.Usage{Credits: 2})
+
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+
+	var resp struct {
+		Credits      float64        `json:"credits"`
+		NextResetMs  int64          `json:"next_reset_ms"`
+		CycleCredits float64        `json:"cycle_credits"`
+		Account      map[string]any `json:"account"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.NextResetMs != 0 {
+		t.Errorf("expected no reset boundary, got %d", resp.NextResetMs)
+	}
+	if resp.Credits < 2-1e-9 || resp.Credits > 2+1e-9 {
+		t.Errorf("lifetime credits must still accrue with no cycle known, got %v", resp.Credits)
+	}
+	if resp.Account != nil {
+		t.Errorf("expected account to be omitted, got %+v", resp.Account)
 	}
 }

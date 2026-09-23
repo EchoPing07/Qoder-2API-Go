@@ -61,6 +61,10 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	return p.bridge
 }
 
+// accountRefreshCadence keeps the authoritative allowance reasonably fresh
+// without coupling the admin panel's 15-second poll to an upstream request.
+const accountRefreshCadence = time.Minute
+
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
 // deliberately cheap (no upstream calls, no session bootstrap): the body
 // carries readiness details (PAT configured, effective stream timeouts)
@@ -165,6 +169,70 @@ func main() {
 		catalog := b.GetCatalog(ctx)
 		return catalog.Keys()
 	}
+
+	// Subscription account loop: refreshes identity metadata from /user/status
+	// and authoritative allowance totals from OpenAPI /api/v2/quota/usage out
+	// of band. The admin panel's 15-second poll remains memory-only.
+	applyAccount := func(ctx context.Context) {
+		b := provider.currentBridge()
+		if b == nil {
+			return // no PAT configured yet
+		}
+		st := b.EnsureAccountStatus(ctx)
+		if st == nil {
+			return // upstream unreachable: keep the last known state
+		}
+		rec.SetBillingCycle(st.NextResetAtMs)
+		account := &stats.Account{
+			Plan:                 st.Plan,
+			Tag:                  st.UserTag,
+			OrgName:              st.OrgName,
+			IsQuotaExceeded:      st.IsQuotaExceeded,
+			TotalUsagePercentage: st.TotalUsagePercentage,
+		}
+		if st.UserQuota != nil {
+			account.UserQuota = &stats.Quota{
+				Total: st.UserQuota.Total, Used: st.UserQuota.Used,
+				Remaining: st.UserQuota.Remaining, Percentage: st.UserQuota.Percentage,
+				Unit: st.UserQuota.Unit, DetailURL: st.UserQuota.DetailURL,
+			}
+		}
+		if st.AddOnQuota != nil {
+			account.AddOnQuota = &stats.Quota{
+				Total: st.AddOnQuota.Total, Used: st.AddOnQuota.Used,
+				Remaining: st.AddOnQuota.Remaining, Percentage: st.AddOnQuota.Percentage,
+				Unit: st.AddOnQuota.Unit, DetailURL: st.AddOnQuota.DetailURL,
+			}
+		}
+		if st.OrgResourcePackage != nil {
+			account.OrgResourcePackage = &stats.OrgResourcePackage{
+				Used: st.OrgResourcePackage.Used, Cap: st.OrgResourcePackage.Cap,
+				Remaining: st.OrgResourcePackage.Remaining, Percentage: st.OrgResourcePackage.Percentage,
+				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
+			}
+		}
+		rec.SetAccount(account)
+	}
+	go func() {
+		// Fetch once immediately so the panel is populated from the start
+		// rather than after the first tick.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		applyAccount(ctx)
+		cancel()
+
+		ticker := time.NewTicker(accountRefreshCadence)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				applyAccount(ctx)
+				cancel()
+			case <-statsStop:
+				return
+			}
+		}
+	}()
 
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec)

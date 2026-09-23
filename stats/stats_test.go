@@ -267,3 +267,186 @@ func (f *fakePersister) SaveStats(d *Data) error {
 	}
 	return f.saveFn(d)
 }
+
+// NonBillable frames must contribute tokens (the work really happened) but not
+// credits (nothing was charged to the subscription allowance).
+func TestRecordUsageNonBillableSkipsCreditsOnly(t *testing.T) {
+	r := NewRecorder(nil)
+	r.RecordUsage(&Usage{PromptTokens: 10, CompletionTokens: 20, Credits: 0.5, NonBillable: true})
+	r.RecordUsage(&Usage{PromptTokens: 1, CompletionTokens: 2, Credits: 0.25})
+
+	rep := r.Report()
+	if rep.PromptTokens != 11 || rep.CompletionTokens != 22 {
+		t.Errorf("tokens must count non-billable frames too: got prompt=%d completion=%d, want 11/22",
+			rep.PromptTokens, rep.CompletionTokens)
+	}
+	if rep.Credits < 0.25-1e-9 || rep.Credits > 0.25+1e-9 {
+		t.Errorf("expected only the billable credits 0.25, got %v", rep.Credits)
+	}
+	if rep.CycleCredits < 0.25-1e-9 || rep.CycleCredits > 0.25+1e-9 {
+		t.Errorf("expected cycle credits 0.25, got %v", rep.CycleCredits)
+	}
+}
+
+// The zero value of Usage must mean billable: a caller that forgets the flag
+// should over-count credits rather than silently lose all of them.
+func TestRecordUsageDefaultsToBillable(t *testing.T) {
+	r := NewRecorder(nil)
+	r.RecordUsage(&Usage{Credits: 1.5})
+	if got := r.Report().CycleCredits; got < 1.5-1e-9 || got > 1.5+1e-9 {
+		t.Errorf("expected 1.5 credits with the flag unset, got %v", got)
+	}
+}
+
+// SetBillingCycle derives the cycle start by stepping back one calendar month,
+// which must land on the gateway's own boundary rather than a fixed 30 days.
+// For the observed Sep 25 reset that is Aug 25, not Aug 26.
+func TestSetBillingCycleDerivesCalendarStart(t *testing.T) {
+	r := NewRecorder(nil)
+	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
+	r.SetBillingCycle(reset.UnixMilli())
+
+	rep := r.Report()
+	if rep.NextResetMs != reset.UnixMilli() {
+		t.Fatalf("expected next reset %d, got %d", reset.UnixMilli(), rep.NextResetMs)
+	}
+	wantStart := time.Date(2026, time.August, 25, 0, 0, 0, 0, time.Local)
+	if rep.CycleStartMs != wantStart.UnixMilli() {
+		t.Errorf("expected cycle start %s, got %s",
+			wantStart.Format(time.RFC3339), time.UnixMilli(rep.CycleStartMs).Format(time.RFC3339))
+	}
+}
+
+// Repeatedly polling the same boundary must not discard credits already
+// accumulated inside the live cycle.
+func TestSetBillingCycleIdempotent(t *testing.T) {
+	r := NewRecorder(nil)
+	reset := time.Now().Add(72 * time.Hour).UnixMilli()
+	r.SetBillingCycle(reset)
+	r.RecordUsage(&Usage{Credits: 2})
+	r.SetBillingCycle(reset) // a redundant refresh from the account loop
+
+	if got := r.Report().CycleCredits; got < 2-1e-9 || got > 2+1e-9 {
+		t.Errorf("expected cycle credits to survive a redundant boundary set, got %v", got)
+	}
+}
+
+// An unavailable status (0) must leave existing accounting intact rather than
+// wiping it on a transient upstream outage.
+func TestSetBillingCycleIgnoresZero(t *testing.T) {
+	r := NewRecorder(nil)
+	reset := time.Now().Add(72 * time.Hour).UnixMilli()
+	r.SetBillingCycle(reset)
+	r.RecordUsage(&Usage{Credits: 3})
+	r.SetBillingCycle(0)
+
+	rep := r.Report()
+	if rep.NextResetMs != reset {
+		t.Errorf("zero must not clear the known boundary, got %d", rep.NextResetMs)
+	}
+	if rep.CycleCredits < 3-1e-9 || rep.CycleCredits > 3+1e-9 {
+		t.Errorf("zero must not clear cycle credits, got %v", rep.CycleCredits)
+	}
+}
+
+// Crossing the reset boundary must zero the cycle exactly once. Regressing
+// here (re-zeroing on every record) is what would make the new cycle total
+// permanently stuck at the latest single request.
+func TestCycleRolloverHappensOnce(t *testing.T) {
+	r := NewRecorder(nil)
+	// A boundary already in the past: the first record triggers the rollover.
+	past := time.Now().Add(-time.Hour).UnixMilli()
+	r.SetBillingCycle(past)
+
+	r.RecordUsage(&Usage{Credits: 1})
+	r.RecordUsage(&Usage{Credits: 2})
+	r.RecordUsage(&Usage{Credits: 4})
+
+	rep := r.Report()
+	if rep.CycleCredits < 7-1e-9 || rep.CycleCredits > 7+1e-9 {
+		t.Errorf("expected the new cycle to accumulate 7, got %v (rollover fired more than once?)",
+			rep.CycleCredits)
+	}
+	if rep.NextResetMs <= past {
+		t.Errorf("expected the boundary to advance past %d, got %d", past, rep.NextResetMs)
+	}
+	// The advanced boundary must be one calendar month out, so a service that
+	// stays up does not roll over again immediately.
+	advanced := time.UnixMilli(rep.NextResetMs).Local()
+	if d := advanced.Sub(time.UnixMilli(past)); d < 27*24*time.Hour || d > 31*24*time.Hour {
+		t.Errorf("expected the advanced boundary to be ~1 month later, got %v", d)
+	}
+	// Lifetime credits are unaffected by the rollover.
+	if rep.Credits < 7-1e-9 || rep.Credits > 7+1e-9 {
+		t.Errorf("lifetime credits must ignore the rollover, got %v", rep.Credits)
+	}
+}
+
+// SetAccount must copy its argument: aliasing the caller's pointer would let a
+// later mutation reach the persisted snapshot.
+func TestSetAccountCopiesAndIsExposed(t *testing.T) {
+	r := NewRecorder(nil)
+	acct := &Account{
+		Plan: "PLAN_TIER_TEAM", Tag: "Teams", IsQuotaExceeded: false,
+		UserQuota:          &Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
+		OrgResourcePackage: &OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
+	}
+	r.SetAccount(acct)
+	acct.Tag = "mutated"
+	acct.UserQuota.Used = 1
+	acct.OrgResourcePackage.Cap = 1
+
+	rep := r.Report()
+	if rep.Account == nil {
+		t.Fatal("expected the account in the report")
+	}
+	if rep.Account.Tag != "Teams" {
+		t.Errorf("expected the snapshot to be insulated from caller mutation, got %q", rep.Account.Tag)
+	}
+	if rep.Account.UserQuota == nil || rep.Account.UserQuota.Used != 2939 {
+		t.Errorf("expected a deep copy of user quota, got %+v", rep.Account.UserQuota)
+	}
+	if rep.Account.OrgResourcePackage == nil || rep.Account.OrgResourcePackage.Cap != 4000 {
+		t.Errorf("expected a deep copy of organization quota, got %+v", rep.Account.OrgResourcePackage)
+	}
+
+	// A nil account must not wipe a known one.
+	r.SetAccount(nil)
+	if r.Report().Account == nil || r.Report().Account.Tag != "Teams" {
+		t.Error("nil account must leave the previous state intact")
+	}
+}
+
+// A read must roll the cycle too, not just a write: the panel polls every 15s,
+// so a service sitting idle across the reset boundary would otherwise keep
+// reporting the previous cycle's credits.
+func TestReportRollsCycleOnRead(t *testing.T) {
+	r := NewRecorder(nil)
+	r.SetBillingCycle(time.Now().Add(-time.Hour).UnixMilli())
+	// Seed a cycle total as if it had been accumulated before the boundary.
+	r.data.CycleCredits = 9
+
+	rep := r.Report()
+	if rep.CycleCredits != 0 {
+		t.Errorf("expected the stale cycle total to be cleared on read, got %v", rep.CycleCredits)
+	}
+	if rep.NextResetMs <= time.Now().UnixMilli() {
+		t.Errorf("expected the boundary to advance into the future, got %d", rep.NextResetMs)
+	}
+	if !r.dirty {
+		t.Error("expected the rollover to mark data dirty so it gets persisted")
+	}
+}
+
+// A read that does not cross a boundary must not mark the data dirty, otherwise
+// every 15s poll would force a disk write.
+func TestReportStaysCleanWithoutRollover(t *testing.T) {
+	r := NewRecorder(nil)
+	r.SetBillingCycle(time.Now().Add(72 * time.Hour).UnixMilli())
+	r.dirty = false
+
+	r.Report()
+	if r.dirty {
+		t.Error("a rollover-free read must not mark the data dirty")
+	}
+}

@@ -386,6 +386,12 @@ code, .mono, .num {
   color: var(--muted);
   margin-top: 6px;
 }
+.stat-sub .badge { margin-left: 6px; vertical-align: middle; }
+.badge.neutral {
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
 
 /* ---------- Cards ---------- */
 
@@ -841,7 +847,7 @@ input[readonly] {
         <div class="stat-card">
           <div class="stat-label"><span class="stat-dot success"></span>Token 总数</div>
           <div class="stat-value num" id="statTokens">0</div>
-          <div class="stat-sub num" id="statCredits">Credits 消耗 0</div>
+          <div class="stat-sub num" id="statCredits">本周期 Credits 0</div>
         </div>
         <div class="stat-card">
           <div class="stat-label"><span class="stat-dot rate"></span>总输入</div>
@@ -852,6 +858,21 @@ input[readonly] {
           <div class="stat-label"><span class="stat-dot total"></span>总输出</div>
           <div class="stat-value num" id="statCompletion">0</div>
           <div class="stat-sub num" id="statAvgOut">平均 0 / 次</div>
+        </div>
+      </div>
+
+      <div class="card hidden" id="quotaCard">
+        <div class="card-head">
+          <div class="card-title">额度明细<small>Qoder 官方账号级额度，每分钟刷新</small></div>
+          <div class="chart-legend"><span class="num" id="quotaSummary"></span></div>
+        </div>
+        <div class="card-body flush">
+          <table>
+            <thead>
+              <tr><th>额度来源</th><th class="num">已用 / 总额</th><th class="num">剩余</th><th class="num" style="width:200px">使用率</th><th>状态</th></tr>
+            </thead>
+            <tbody id="quotaTable"></tbody>
+          </table>
         </div>
       </div>
 
@@ -1196,7 +1217,8 @@ function loadStats() {
     document.getElementById('statTotal').textContent = fmt(d.total);
     document.getElementById('statReqSub').textContent = '成功率 ' + pct(d.success_rate);
     document.getElementById('statTokens').textContent = fmt(tokens);
-    document.getElementById('statCredits').textContent = 'Credits 消耗 ' + fmtCredits(d.credits);
+    renderCredits(d);
+    renderQuotaDetails(d);
     document.getElementById('statPrompt').textContent = fmt(d.prompt_tokens);
     document.getElementById('statCached').textContent = '缓存命中 ' + fmt(d.cached_tokens);
     document.getElementById('statCompletion').textContent = fmt(d.completion_tokens);
@@ -1205,6 +1227,154 @@ function loadStats() {
     renderChart(d.hourly || []);
     renderStatsTable(d.by_model || []);
   }).catch(function(e) { showToast(e.message, 'error'); });
+}
+
+/*
+ * Collect the allowance pools the account actually holds. A pool with a zero
+ * total carries no allowance at all: the free tier reports userQuota.total=0
+ * while the real budget sits in addOnQuota. Treating it as absent (instead of
+ * as an exhausted pool) is what keeps the panel from rendering "8 / 0 · 剩 0"
+ * plus a bogus out-of-quota verdict for an account that still has credits.
+ */
+function quotaPools(acct) {
+  var pools = [];
+  if (acct.user_quota && Number(acct.user_quota.total || 0) > 0) {
+    pools.push({ name: '套餐额度', quota: acct.user_quota, totalKey: 'total', available: true });
+  }
+  if (acct.add_on_quota && Number(acct.add_on_quota.total || 0) > 0) {
+    pools.push({ name: '加购额度', quota: acct.add_on_quota, totalKey: 'total', available: true });
+  }
+  if (acct.org_resource_package && Number(acct.org_resource_package.cap || 0) > 0) {
+    pools.push({
+      name: '组织资源包',
+      quota: acct.org_resource_package,
+      totalKey: 'cap',
+      available: Boolean(acct.org_resource_package.available),
+      checkAvailability: true
+    });
+  }
+  return pools;
+}
+
+/*
+ * Prefer the authoritative cycle allowance used by Qoder's official /usage
+ * view. Local cycle_credits remains a fallback for temporary OpenAPI outages;
+ * it only covers traffic observed by this bridge and is therefore never mixed
+ * with the account-wide official value.
+ */
+function renderCredits(d) {
+  var el = document.getElementById('statCredits');
+  var lifetime = Number(d.credits || 0);
+  var cycle = Number(d.cycle_credits || 0);
+  var resetMs = Number(d.next_reset_ms || 0);
+  var acct = d.account || {};
+  var pools = quotaPools(acct);
+  var title = ['本服务累计消耗 ' + fmtCredits(lifetime)];
+
+  el.textContent = '';
+  if (pools.length > 0) {
+    // The headline describes the pool that actually carries the allowance.
+    // Naming it explicitly keeps a free account (whose budget lives in the
+    // add-on pool) from reading as the plan pool being exhausted.
+    var primary = pools[0];
+    var used = Number(primary.quota.used || 0);
+    var total = Number(primary.quota[primary.totalKey] || 0);
+    var remaining = Number(primary.quota.remaining || 0);
+    el.appendChild(document.createTextNode(
+      primary.name + ' ' + fmtCredits(used) + ' / ' + fmtCredits(total) +
+      ' · 剩 ' + fmtCredits(remaining)
+    ));
+    pools.forEach(function(pool) {
+      var line = pool.name + '：已用 ' + fmtCredits(Number(pool.quota.used || 0)) +
+        ' / ' + fmtCredits(Number(pool.quota[pool.totalKey] || 0)) +
+        '，剩余 ' + fmtCredits(Number(pool.quota.remaining || 0));
+      if (pool.checkAvailability) {
+        line += pool.available ? '（可用）' : '（不可用）';
+      }
+      title.push(line);
+    });
+  } else if (resetMs > 0) {
+    el.appendChild(document.createTextNode('本服务周期内 ' + fmtCredits(cycle)));
+    title.push('官方额度暂不可用；当前数字仅统计本服务观察到的请求');
+  } else {
+    el.appendChild(document.createTextNode('Credits 消耗 ' + fmtCredits(lifetime)));
+  }
+
+  if (resetMs > 0) {
+    var left = Math.ceil((resetMs - Date.now()) / 86400000);
+    el.appendChild(document.createTextNode(' · ' + fmtMonthDay(resetMs) + ' 重置'));
+    if (left > 0) {
+      el.appendChild(document.createTextNode(' · 剩 ' + left + ' 天'));
+    }
+  }
+  el.title = title.join('\n');
+
+  if (acct.is_quota_exceeded) {
+    el.appendChild(makeBadge('额度已超', 'bad'));
+  } else if (acct.tag) {
+    el.appendChild(makeBadge(acct.tag, 'neutral'));
+  }
+}
+
+/*
+ * Render every allowance pool returned by Qoder as visible content. The
+ * compact stat line intentionally remains a plan summary; this table prevents
+ * add-on and organization packages from being hidden behind a hover tooltip.
+ */
+function renderQuotaDetails(d) {
+  var card = document.getElementById('quotaCard');
+  var table = document.getElementById('quotaTable');
+  var summary = document.getElementById('quotaSummary');
+  var acct = d.account || {};
+  var pools = quotaPools(acct);
+
+  if (pools.length === 0) {
+    card.classList.add('hidden');
+    table.textContent = '';
+    summary.textContent = '';
+    return;
+  }
+
+  card.classList.remove('hidden');
+  table.textContent = '';
+  var totalRemaining = 0;
+  pools.forEach(function(pool) {
+    var used = Number(pool.quota.used || 0);
+    var total = Number(pool.quota[pool.totalKey] || 0);
+    var remaining = Number(pool.quota.remaining || 0);
+    var ratio = total > 0 ? Math.min(Math.max(used / total, 0), 1) : 0;
+    var statusText = pool.available ? (remaining > 0 ? '可用' : '已用尽') : '不可用';
+    var statusKind = pool.available && remaining > 0 ? 'ok' : (pool.available ? 'bad' : 'neutral');
+    totalRemaining += remaining;
+
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + pool.name + '</td>' +
+      '<td class="num">' + fmtCredits(used) + ' / ' + (total >= 0 ? fmtCredits(total) : '—') + '</td>' +
+      '<td class="num">' + fmtCredits(remaining) + '</td>' +
+      '<td><div class="rate-cell"><div class="rate-bar"><div class="rate-fill" style="width:' + (ratio * 100) + '%"></div></div>' +
+      '<span class="rate-text num">' + Math.round(ratio * 100) + '%</span></div></td>' +
+      '<td><span class="badge ' + statusKind + '">' + statusText + '</span></td>';
+    table.appendChild(tr);
+  });
+
+  var resetMs = Number(d.next_reset_ms || 0);
+  summary.textContent = '合计剩余 ' + fmtCredits(totalRemaining) +
+    (resetMs > 0 ? ' · ' + fmtMonthDay(resetMs) + ' 重置' : '');
+}
+
+function makeBadge(text, kind) {
+  var b = document.createElement('span');
+  b.className = 'badge ' + kind;
+  b.textContent = text;
+  return b;
+}
+
+function fmtMonthDay(ms) {
+  var t = new Date(ms);
+  var m = t.getMonth() + 1;
+  var day = t.getDate();
+  return (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
 }
 
 function fmtCredits(v) {

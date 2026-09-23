@@ -23,6 +23,19 @@ func TestBuildMessagesUsesOnlyIncomingOpenAIMessages(t *testing.T) {
 	}
 }
 
+func TestBuildQoderMessagesNormalizesDeveloperRoleToSystem(t *testing.T) {
+	converted := BuildQoderMessages([]map[string]interface{}{
+		{"role": "developer", "content": "Agent instruction"},
+		{"role": "user", "content": "Hi"},
+	}, "Hi", false)
+	if len(converted) != 2 {
+		t.Fatalf("converted message count = %d, want 2", len(converted))
+	}
+	if converted[0].Role != "system" {
+		t.Errorf("developer role = %q, want system", converted[0].Role)
+	}
+}
+
 func TestApplyOpenAIToolConfigRemovesTemplateToolsWhenAbsent(t *testing.T) {
 	body := map[string]interface{}{
 		"tools":               []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "Skill"}}},

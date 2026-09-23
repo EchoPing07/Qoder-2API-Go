@@ -349,3 +349,37 @@ func TestDetectInStreamBusyIgnoresPlainDeltas(t *testing.T) {
 		t.Error("plain content delta must not be classified as busy")
 	}
 }
+
+func TestFetchQuotaUsageUsesSecurityOauthBearer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v2/quota/usage" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sot-test" {
+			t.Errorf("Authorization = %q, want security OAuth bearer", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"userId":"u1","userType":"teams","totalUsagePercentage":0.98,"isQuotaExceeded":false,"expiresAt":1790265600000,"userQuota":{"total":3000,"used":2939,"remaining":61,"percentage":0.98,"unit":"credits"},"orgResourcePackage":{"used":0,"cap":4000,"remaining":0,"percentage":0,"available":false,"unit":"credits"}}`)
+	}))
+	defer srv.Close()
+
+	usage, err := FetchQuotaUsage(context.Background(), "sot-test", &RegionConfig{OpenAPIBase: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.UserQuota == nil || usage.UserQuota.Used != 2939 || usage.UserQuota.Remaining != 61 {
+		t.Errorf("unexpected user quota: %+v", usage.UserQuota)
+	}
+	if usage.OrgResourcePackage == nil || usage.OrgResourcePackage.Cap != 4000 || usage.OrgResourcePackage.Available {
+		t.Errorf("unexpected organization package: %+v", usage.OrgResourcePackage)
+	}
+	if usage.ExpiresAtMs != 1790265600000 || usage.TotalUsagePercentage != 0.98 {
+		t.Errorf("unexpected cycle metadata: %+v", usage)
+	}
+}
+
+func TestFetchQuotaUsageRequiresBearer(t *testing.T) {
+	if _, err := FetchQuotaUsage(context.Background(), "", CN); err == nil {
+		t.Fatal("expected an error for an empty security OAuth token")
+	}
+}
