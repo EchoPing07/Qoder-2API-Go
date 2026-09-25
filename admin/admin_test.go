@@ -603,7 +603,13 @@ func TestConfigPartialInvalidTimeoutAppliesNothing(t *testing.T) {
 // the stats endpoint, so the UI can render cycle-relative credits without any
 // network call of its own.
 func TestStatsEndpointExposesBillingCycle(t *testing.T) {
-	reset := time.Date(2026, time.September, 25, 0, 0, 0, 0, time.Local)
+	// The anchor is derived from the wall clock, not hardcoded: SetBillingCycle
+	// rolls a boundary that has already passed forward to the next period, so a
+	// fixed instant starts disagreeing with the response the moment the calendar
+	// reaches it. Day 15 of a month two ahead is always in the future and never
+	// lands on a month-end, so no day clamping is involved.
+	now := time.Now()
+	reset := time.Date(now.Year(), now.Month()+2, 15, 0, 0, 0, 0, time.Local)
 	rec := stats.NewRecorder(nil)
 	rec.SetBillingCycle(reset.UnixMilli())
 	rec.SetAccount(&stats.Account{
@@ -644,7 +650,7 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 	if resp.NextResetMs != reset.UnixMilli() {
 		t.Errorf("expected next_reset_ms %d, got %d", reset.UnixMilli(), resp.NextResetMs)
 	}
-	wantStart := time.Date(2026, time.August, 25, 0, 0, 0, 0, time.Local).UnixMilli()
+	wantStart := time.Date(reset.Year(), reset.Month()-1, 15, 0, 0, 0, 0, time.Local).UnixMilli()
 	if resp.CycleStartMs != wantStart {
 		t.Errorf("expected cycle_start_ms %d (one calendar month back), got %d", wantStart, resp.CycleStartMs)
 	}
