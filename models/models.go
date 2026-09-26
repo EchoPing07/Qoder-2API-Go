@@ -68,22 +68,11 @@ const DefaultScene = "chat"
 // not a positive safe integer.
 const DefaultMaxOutputTokens = 32000
 
-// MaxRequestedOutputTokens bounds a caller-supplied completion cap. It matches
-// the largest context window the gateway catalog advertises (1M) and keeps
-// absurd values (1e18 and friends) out of the upstream request.
-const MaxRequestedOutputTokens = 1000000
-
 // ModelCatalog holds display_name → qoder key mapping and capability metadata.
 type ModelCatalog struct {
 	ModelMap     map[string]string // display_name -> key
 	VisionModels map[string]bool   // display_name set
 	DefaultName  string            // used when model param is empty
-
-	// Reasoning carries the gateway's per-model thinking-effort metadata,
-	// keyed by the qoder internal key. Entries exist only for models whose
-	// catalog record carried effort metadata; a missing entry means "unknown",
-	// and callers fall back to the global effort vocabulary.
-	Reasoning map[string]*ModelReasoning
 
 	// Caps carries the per-model limits the official client reads from the
 	// catalog before building a gateway request, keyed by the qoder internal
@@ -156,15 +145,6 @@ func positiveInt(v interface{}) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// ModelReasoning mirrors the reasoning-related fields of a model/list entry.
-// The official client derives the exact same information before deciding
-// whether a requested effort may be forwarded to the gateway.
-type ModelReasoning struct {
-	Efforts          []string // canonical efforts the model accepts (lowercased)
-	SupportsDisabled bool     // gateway allows switching thinking off entirely
-	Known            bool     // true when any effort metadata was present
 }
 
 // Keys returns sorted display names for deterministic output.
@@ -240,7 +220,6 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 	}
 	modelMap := map[string]string{}
 	vision := map[string]bool{}
-	reasoning := map[string]*ModelReasoning{}
 	caps := map[string]*ModelCaps{}
 	for _, item := range sceneList {
 		m, ok := item.(map[string]interface{})
@@ -261,9 +240,6 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 		if isVL, ok := m["is_vl"].(bool); ok && isVL {
 			vision[name] = true
 		}
-		if ri := parseReasoningMeta(m); ri != nil {
-			reasoning[key] = ri
-		}
 		maxOut, ok := positiveInt(m["max_output_tokens"])
 		if !ok {
 			maxOut = DefaultMaxOutputTokens
@@ -279,113 +255,8 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 	return &ModelCatalog{
 		ModelMap:     modelMap,
 		VisionModels: vision,
-		Reasoning:    reasoning,
 		Caps:         caps,
 		DefaultName:  nameForKey(modelMap, PreferredDefaultKey),
-	}
-}
-
-// parseReasoningMeta extracts the per-model thinking-effort metadata from a
-// catalog entry. It returns nil when the entry carries no usable effort
-// information at all, letting callers fall back to the global vocabulary.
-//
-// The live gateway nests the metadata under "thinking_config", keyed by the
-// tier names the model accepts:
-//
-//	"thinking_config": {
-//	  "disabled": {},                                   // present => may switch thinking off
-//	  "enabled": {"efforts": {"low": {}, "xhigh": {}}} // keys are the accepted tiers
-//	}
-//
-// A flat payload carrying "efforts"/"supports_disabled" at the top level is
-// still accepted; the tier names are normalized the same way either way.
-func parseReasoningMeta(m map[string]interface{}) *ModelReasoning {
-	if tc, ok := m["thinking_config"].(map[string]interface{}); ok {
-		supportsDisabled := false
-		if v, present := tc["disabled"]; present && v != nil {
-			supportsDisabled = true
-		}
-		return &ModelReasoning{
-			Efforts:          normalizeEfforts(thinkingEfforts(tc)),
-			SupportsDisabled: supportsDisabled,
-			Known:            true,
-		}
-	}
-
-	effortsRaw, hasEfforts := m["efforts"]
-	supportsDisabled := false
-	if v, ok := m["supports_disabled"]; ok && enableFlag(v) {
-		supportsDisabled = true
-	}
-	if !hasEfforts && !supportsDisabled {
-		return nil
-	}
-	return &ModelReasoning{
-		Efforts:          normalizeEfforts(effortsRaw),
-		SupportsDisabled: supportsDisabled,
-		Known:            true,
-	}
-}
-
-// thinkingEfforts returns the raw "thinking_config.enabled.efforts" value, in
-// whichever of the supported shapes the gateway serialized it.
-func thinkingEfforts(tc map[string]interface{}) interface{} {
-	enabled, ok := tc["enabled"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	return enabled["efforts"]
-}
-
-// normalizeEfforts turns the several shapes the gateway uses for the accepted
-// tiers (a list, a comma/space separated string, or the efforts object whose keys
-// are the tier names) into a deterministic, canonical list. Map iteration order
-// is random in Go, so the keys are sorted before canonicalization: callers (and
-// the tests locking them) must not depend on iteration order. "off"/"disabled"
-// are folded into "none", matching the official client's normalization.
-func normalizeEfforts(v interface{}) []string {
-	var raw []string
-	switch x := v.(type) {
-	case []interface{}:
-		for _, item := range x {
-			if s, ok := item.(string); ok {
-				raw = append(raw, s)
-			}
-		}
-	case string:
-		for _, field := range strings.FieldsFunc(x, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
-			raw = append(raw, field)
-		}
-	case map[string]interface{}:
-		for k := range x {
-			raw = append(raw, k)
-		}
-		sort.Strings(raw)
-	}
-	seen := map[string]bool{}
-	out := make([]string, 0, len(raw))
-	for _, s := range raw {
-		e := canonicalEffort(s)
-		if e == "" || seen[e] {
-			continue
-		}
-		seen[e] = true
-		out = append(out, e)
-	}
-	return out
-}
-
-// canonicalEffort validates a single effort token against the gateway's
-// vocabulary, folding the client-side aliases "off"/"disabled" into "none".
-func canonicalEffort(s string) string {
-	e := strings.ToLower(strings.TrimSpace(s))
-	switch e {
-	case "off", "disabled":
-		return "none"
-	case "none", "low", "medium", "high", "xhigh", "max":
-		return e
-	default:
-		return ""
 	}
 }
 

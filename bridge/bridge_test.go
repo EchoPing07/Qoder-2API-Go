@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -322,6 +321,7 @@ func TestHandleStreamEndToEnd(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "hi"},
 		},
 		"stream": true,
+		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) { usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, Credits: u.Credits} })
 	if err != nil {
 		t.Fatalf("HandleChat: %v", err)
@@ -461,6 +461,195 @@ func TestHandleStreamRealGatewayDoneFormat(t *testing.T) {
 // token stats at zero for GLM models while Qwen models (standalone usage
 // frame) worked fine. The stream must deliver content, finish_reason and
 // the usage chunk, and the usage sink must fire.
+// Without stream_options.include_usage the terminal usage frame is NOT
+// emitted (OpenAI semantics), while internal statistics still receive usage.
+func TestHandleStreamUsageFrameGatedByIncludeUsage(t *testing.T) {
+	frames := []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "credits": 0.1}}),
+		"data: [DONE]",
+	}
+
+	run := func(t *testing.T, body map[string]interface{}) string {
+		t.Helper()
+		gw := &fakeGateway{chatLines: frames}
+		b := newFakeBridge(t, gw)
+		var usageSeen *stats.Usage
+		w := httptest.NewRecorder()
+		if err := b.HandleChat(context.Background(), w, body, func(u *transform.Usage) {
+			usageSeen = &stats.Usage{PromptTokens: u.PromptTokens}
+		}); err != nil {
+			t.Fatalf("HandleChat: %v", err)
+		}
+		if usageSeen == nil || usageSeen.PromptTokens != 3 {
+			t.Errorf("usage sink must fire regardless of include_usage, got %+v", usageSeen)
+		}
+		return w.Body.String()
+	}
+
+	t.Run("absent omits the frame", func(t *testing.T) {
+		body := run(t, map[string]interface{}{
+			"model": "Fake-Model",
+			"messages": []interface{}{
+				map[string]interface{}{"role": "user", "content": "hi"},
+			},
+			"stream": true,
+		})
+		if strings.Contains(body, "prompt_tokens") {
+			t.Errorf("usage frame must be omitted without include_usage:\n%s", body)
+		}
+	})
+	t.Run("false omits the frame", func(t *testing.T) {
+		body := run(t, map[string]interface{}{
+			"model": "Fake-Model",
+			"messages": []interface{}{
+				map[string]interface{}{"role": "user", "content": "hi"},
+			},
+			"stream":         true,
+			"stream_options": map[string]interface{}{"include_usage": false},
+		})
+		if strings.Contains(body, "prompt_tokens") {
+			t.Errorf("usage frame must be omitted when include_usage=false:\n%s", body)
+		}
+	})
+	t.Run("true emits the frame", func(t *testing.T) {
+		body := run(t, map[string]interface{}{
+			"model": "Fake-Model",
+			"messages": []interface{}{
+				map[string]interface{}{"role": "user", "content": "hi"},
+			},
+			"stream":         true,
+			"stream_options": map[string]interface{}{"include_usage": true},
+		})
+		if !strings.Contains(body, "\"prompt_tokens\":3") {
+			t.Errorf("usage frame must be emitted with include_usage=true:\n%s", body)
+		}
+	})
+}
+
+// Passthrough sampling parameters must reach the signed gateway body inside
+// "parameters" exactly as the client sent them.
+func TestHandleChatForwardsPassthroughParams(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":       "Fake-Model",
+		"messages":    []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":      true,
+		"temperature": json.Number("0.5"),
+		"top_p":       json.Number("0.8"),
+		"seed":        json.Number("42"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["temperature"]; got != 0.5 {
+		t.Errorf("parameters.temperature = %#v, want 0.5", got)
+	}
+	if got := params["top_p"]; got != 0.8 {
+		t.Errorf("parameters.top_p = %#v, want 0.8", got)
+	}
+	if got := params["seed"]; got != float64(42) {
+		t.Errorf("parameters.seed = %#v, want 42", got)
+	}
+}
+
+// reasoning.effort object form rides into parameters like the top-level form.
+func TestHandleChatReasoningEffortObjectForm(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":     "Fake-Model",
+		"messages":  []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":    true,
+		"reasoning": map[string]interface{}{"effort": "low"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["reasoning_effort"]; got != "low" {
+		t.Errorf("parameters.reasoning_effort = %#v, want low (object form)", got)
+	}
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
+		t.Errorf("model_config.is_reasoning = %#v, want true (explicit tier)", got)
+	}
+}
+
+// A malformed parameter type is a 400 invalid_request_error, not a silent
+// substitution and not a 500.
+func TestChatRouteRejectsMalformedParamTypes(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+
+	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":"8000"}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer k")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "max_tokens must be a number") {
+		t.Errorf("error must name the offending field: %s", w.Body.String())
+	}
+}
+
+// n != 1 is rejected honestly instead of silently returning a single choice.
+func TestChatRouteRejectsMultiChoice(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+
+	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"n":3}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer k")
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "single choice") {
+		t.Errorf("error must state the single-choice limitation: %s", w.Body.String())
+	}
+}
+
 func TestHandleStreamGLMStyleUsageOnFinalContentFrame(t *testing.T) {
 	gw := &fakeGateway{chatLines: []string{
 		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "蓝", "role": "assistant"}}}}),
@@ -490,6 +679,7 @@ func TestHandleStreamGLMStyleUsageOnFinalContentFrame(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
 		"stream": true,
+		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedPromptTokens(), Credits: u.Credits}
 	})
@@ -642,6 +832,7 @@ func TestHandleStreamMiniMaxStyleFinishEvent(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
 		"stream": true,
+		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Credits: u.Credits}
 	})
@@ -1170,9 +1361,10 @@ func TestHandleChatDisablesReasoningForNoneTier(t *testing.T) {
 	}
 }
 
-// A tier the model does not support is dropped entirely, and the model keeps
-// whatever reasoning capability the catalog advertised for it.
-func TestHandleChatUnsupportedTierKeepsCatalogReasoning(t *testing.T) {
+// Verbatim policy: a tier the model does not declare is forwarded unchanged
+// (the gateway decides), and an explicit non-none tier forces is_reasoning on
+// even when the catalog would default it off.
+func TestHandleChatUnsupportedTierForwardedVerbatim(t *testing.T) {
 	gw := &fakeGateway{chatLines: []string{
 		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
 		"data: [DONE]",
@@ -1183,7 +1375,7 @@ func TestHandleChatUnsupportedTierKeepsCatalogReasoning(t *testing.T) {
 		"model":            "Fake-Model",
 		"messages":         []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
 		"stream":           true,
-		"reasoning_effort": "high",
+		"reasoning_effort": "high", // fixture declares low/medium/xhigh only
 	}, nil)
 	if err != nil {
 		t.Fatalf("HandleChat: %v", err)
@@ -1199,59 +1391,69 @@ func TestHandleChatUnsupportedTierKeepsCatalogReasoning(t *testing.T) {
 	}
 
 	params := payload["parameters"].(map[string]interface{})
-	if got, present := params["reasoning_effort"]; present {
-		t.Errorf("unsupported tier must be omitted, got %#v", got)
+	if got := params["reasoning_effort"]; got != "high" {
+		t.Errorf("parameters.reasoning_effort = %#v, want verbatim high", got)
 	}
 	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
-		t.Errorf("model_config.is_reasoning = %#v, want true (catalog capability preserved)", got)
+		t.Errorf("model_config.is_reasoning = %#v, want true (explicit tier overrides catalog default)", got)
 	}
 }
 
-func TestResolveReasoningEffortRejectsUnsupportedModelTier(t *testing.T) {
-	qwen := &models.ModelReasoning{Efforts: []string{"low", "medium", "xhigh"}, SupportsDisabled: true, Known: true}
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, qwen); got != "" {
-		t.Errorf("unsupported tier = %q, want omitted", got)
+// An unknown tier value is forwarded as-is for the gateway to judge; it is
+// not normalized, validated or dropped locally.
+func TestResolveReasoningEffortVerbatim(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]interface{}
+		want string
+	}{
+		{"known tier passes through", map[string]interface{}{"reasoning_effort": "xhigh"}, "xhigh"},
+		{"minimal is NOT mapped to low", map[string]interface{}{"reasoning_effort": "minimal"}, "minimal"},
+		{"unknown vocabulary passes through", map[string]interface{}{"reasoning_effort": "banana"}, "banana"},
+		{"case is preserved", map[string]interface{}{"reasoning_effort": "HIGH"}, "HIGH"},
+		{"reasoning.effort object form is accepted", map[string]interface{}{"reasoning": map[string]interface{}{"effort": "low"}}, "low"},
+		{"top-level reasoning_effort wins over reasoning.effort",
+			map[string]interface{}{"reasoning_effort": "high", "reasoning": map[string]interface{}{"effort": "low"}}, "high"},
+		{"absent", map[string]interface{}{}, ""},
 	}
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, qwen); got != "none" {
-		t.Errorf("supported disabled tier = %q, want none", got)
-	}
-}
-
-// Forwarding "none" to a model that does not declare thinking_config.disabled
-// makes the upstream reject the whole request with HTTP 400. When the catalog
-// carries no usable metadata for the key the tier cannot be validated, so it
-// must be omitted rather than passed through.
-func TestResolveReasoningEffortOmitsUnverifiedNone(t *testing.T) {
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, nil); got != "" {
-		t.Errorf("none without catalog metadata = %q, want omitted", got)
-	}
-	unknown := &models.ModelReasoning{}
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, unknown); got != "" {
-		t.Errorf("none with unknown metadata = %q, want omitted", got)
-	}
-	// ...while other tiers keep their historical pass-through.
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "high"}, nil); got != "high" {
-		t.Errorf("high without catalog metadata = %q, want high", got)
-	}
-	// A model that declares the switch but no tiers still accepts "none".
-	switchOnly := &models.ModelReasoning{SupportsDisabled: true, Known: true}
-	if got := resolveReasoningEffort(map[string]interface{}{"reasoning_effort": "none"}, switchOnly); got != "none" {
-		t.Errorf("none for a model declaring disabled = %q, want none", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveReasoningEffort(tc.body)
+			if err != nil {
+				t.Fatalf("resolveReasoningEffort: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveReasoningEffort = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
-// A model whose catalog entry has no thinking_config.disabled must not receive
-// "none" on the wire, and must keep its reasoning enabled.
-func TestHandleChatOmitsNoneForModelWithoutDisabled(t *testing.T) {
+// Type errors are the only locally rejected effort forms.
+func TestResolveReasoningEffortTypeErrors(t *testing.T) {
+	for _, body := range []map[string]interface{}{
+		{"reasoning_effort": json.Number("3")},
+		{"reasoning_effort": true},
+		{"reasoning": map[string]interface{}{"effort": 3}},
+	} {
+		if _, err := resolveReasoningEffort(body); err == nil {
+			t.Errorf("resolveReasoningEffort(%v) must reject non-string effort", body)
+		}
+	}
+}
+
+// Verbatim policy: "none" is forwarded even when the model does not declare
+// thinking_config.disabled — a model that rejects it answers with an upstream
+// error that is passed back to the client, instead of the request being
+// silently rewritten to keep thinking on.
+func TestHandleChatSendsNoneEvenWithoutDisabledDeclaration(t *testing.T) {
 	gw := &fakeGateway{chatLines: []string{
 		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
 		"data: [DONE]",
 	}}
 	bridge := newFakeBridge(t, gw)
 	// Replace the fixture catalog with one that has no thinking_config.disabled,
-	// mirroring the models that reject "none" upstream (gmodel/gfmodel). The
-	// timestamp must be refreshed too, otherwise the cache is considered stale
-	// and the fake gateway's own catalog is fetched over it.
+	// mirroring models that would previously have their "none" dropped locally.
 	bridge.catalogMu.Lock()
 	bridge.catalog = models.ExtractCatalog(map[string]interface{}{
 		"chat": []interface{}{
@@ -1286,14 +1488,14 @@ func TestHandleChatOmitsNoneForModelWithoutDisabled(t *testing.T) {
 		t.Fatalf("decode JSON gateway request: %v", err)
 	}
 	params := payload["parameters"].(map[string]interface{})
-	if got, present := params["reasoning_effort"]; present {
-		t.Errorf("none must be omitted for a model without thinking_config.disabled, got %#v", got)
+	if got := params["reasoning_effort"]; got != "none" {
+		t.Errorf("parameters.reasoning_effort = %#v, want verbatim none", got)
 	}
-	if _, present := params["max_thinking_tokens"]; present {
-		t.Error("max_thinking_tokens must not be sent when the tier is omitted")
+	if got, ok := params["max_thinking_tokens"].(float64); !ok || got != 0 {
+		t.Errorf("parameters.max_thinking_tokens = %#v, want explicit 0", params["max_thinking_tokens"])
 	}
-	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != true {
-		t.Errorf("model_config.is_reasoning = %#v, want true (thinking stays on)", got)
+	if got := payload["model_config"].(map[string]interface{})["is_reasoning"]; got != false {
+		t.Errorf("model_config.is_reasoning = %#v, want false", got)
 	}
 }
 
@@ -1349,45 +1551,114 @@ func TestEnsureAccountStatusRejectsSentinelResetBoundary(t *testing.T) {
 // The caller's cap must win over the catalog default, otherwise models with a
 // small advertised cap (the built-in BYOK table lists one at 2048) would have
 // their responses silently truncated.
-func TestResolveMaxTokensPrefersCallerValue(t *testing.T) {
-	const catalogDefault = 2048
-
+// Verbatim max_tokens: any JSON number (0, negatives, fractions, huge
+// magnitudes) is forwarded unchanged; only type errors are rejected and only
+// an absent pair falls back to the catalog default.
+func TestMaxTokensFieldVerbatim(t *testing.T) {
 	cases := []struct {
 		name    string
-		reqBody map[string]interface{}
-		want    int
+		body    map[string]interface{}
+		want    string // raw JSON token, "" for error, "-" for catalog fallback
+		wantErr bool
 	}{
-		{"caller cap wins over smaller catalog cap",
-			map[string]interface{}{"max_tokens": float64(16000)}, 16000},
-		{"newer max_completion_tokens is honored",
-			map[string]interface{}{"max_completion_tokens": float64(9000)}, 9000},
-		{"max_tokens takes precedence over max_completion_tokens",
-			map[string]interface{}{"max_tokens": float64(4096), "max_completion_tokens": float64(9000)}, 4096},
-		{"the ceiling itself is kept",
-			map[string]interface{}{"max_tokens": float64(models.MaxRequestedOutputTokens)}, models.MaxRequestedOutputTokens},
-		{"ceiling + 1 is clamped",
-			map[string]interface{}{"max_tokens": float64(models.MaxRequestedOutputTokens + 1)}, models.MaxRequestedOutputTokens},
-		{"absurd values are clamped to the ceiling",
-			map[string]interface{}{"max_tokens": float64(1e18)}, models.MaxRequestedOutputTokens},
-		{"clamp does not depend on int conversion width",
-			map[string]interface{}{"max_tokens": float64(9.3e18)}, models.MaxRequestedOutputTokens},
-		{"the largest finite float is clamped",
-			map[string]interface{}{"max_tokens": math.MaxFloat64}, models.MaxRequestedOutputTokens},
-		// The ceiling must never become the catalog default: a smaller catalog
-		// cap still applies when the caller sends nothing usable.
-		{"absent falls back to catalog", map[string]interface{}{}, catalogDefault},
-		{"zero is not a usable cap", map[string]interface{}{"max_tokens": float64(0)}, catalogDefault},
-		{"negative is not a usable cap", map[string]interface{}{"max_tokens": float64(-5)}, catalogDefault},
-		{"fractional is not a usable cap", map[string]interface{}{"max_tokens": 100.5}, catalogDefault},
-		{"string is not a usable cap", map[string]interface{}{"max_tokens": "8000"}, catalogDefault},
+		{"positive integer", map[string]interface{}{"max_tokens": json.Number("16000")}, "16000", false},
+		{"zero is forwarded, not substituted", map[string]interface{}{"max_tokens": json.Number("0")}, "0", false},
+		{"negative is forwarded", map[string]interface{}{"max_tokens": json.Number("-5")}, "-5", false},
+		{"fraction is forwarded", map[string]interface{}{"max_tokens": json.Number("100.5")}, "100.5", false},
+		{"huge magnitudes are forwarded, not clamped", map[string]interface{}{"max_tokens": json.Number("1e18")}, "1e18", false},
+		{"beyond float64 precision keeps its exact token", map[string]interface{}{"max_tokens": json.Number("123456789012345678901234567890")}, "123456789012345678901234567890", false},
+		{"newer alias is honored", map[string]interface{}{"max_completion_tokens": json.Number("9000")}, "9000", false},
+		{"max_tokens wins over max_completion_tokens",
+			map[string]interface{}{"max_tokens": json.Number("4096"), "max_completion_tokens": json.Number("9000")}, "4096", false},
+		{"alias type error is reported even when max_tokens is valid",
+			map[string]interface{}{"max_tokens": json.Number("4096"), "max_completion_tokens": "9000"}, "", true},
+		{"string is a type error", map[string]interface{}{"max_tokens": "8000"}, "", true},
+		{"null is a type error", map[string]interface{}{"max_tokens": nil}, "", true},
+		{"absent falls back to catalog", map[string]interface{}{}, "-", false},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveMaxTokens(tc.reqBody, catalogDefault); got != tc.want {
-				t.Errorf("resolveMaxTokens(%v, %d) = %d, want %d", tc.reqBody, catalogDefault, got, tc.want)
+			got, err := maxTokensField(tc.body)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("maxTokensField(%v) = %s, want error", tc.body, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("maxTokensField(%v): %v", tc.body, err)
+			}
+			if tc.want == "-" {
+				if got != nil {
+					t.Errorf("maxTokensField(%v) = %s, want nil (catalog fallback)", tc.body, got)
+				}
+				return
+			}
+			if string(got) != tc.want {
+				t.Errorf("maxTokensField(%v) = %s, want %s", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// buildParameters end-to-end: verbatim number rides into the assembled
+// parameters object, catalog default when absent, passthrough keys ride
+// along, n!=1 is rejected, n==1 is forwarded.
+func TestBuildParametersVerbatim(t *testing.T) {
+	raw, err := buildParameters(map[string]interface{}{
+		"max_tokens":  json.Number("1e18"),
+		"temperature": json.Number("0.7"),
+		"top_p":       json.Number("0.9"),
+		"stop":        []interface{}{"END"},
+		"n":           json.Number("1"),
+	}, "", 4096)
+	if err != nil {
+		t.Fatalf("buildParameters: %v", err)
+	}
+	var params map[string]interface{}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := params["max_tokens"]; got != float64(1e18) {
+		t.Errorf("max_tokens = %#v, want 1e18 verbatim", got)
+	}
+	if got := params["temperature"]; got != 0.7 {
+		t.Errorf("temperature = %#v, want 0.7 forwarded", got)
+	}
+	if got := params["top_p"]; got != 0.9 {
+		t.Errorf("top_p = %#v, want 0.9 forwarded", got)
+	}
+	if got, ok := params["stop"].([]interface{}); !ok || got[0] != "END" {
+		t.Errorf("stop = %#v, want [END] forwarded", params["stop"])
+	}
+	if got := params["n"]; got != float64(1) {
+		t.Errorf("n = %#v, want 1 forwarded", got)
+	}
+	// Known gateway keys not requested must stay absent.
+	for _, k := range []string{"max_thinking_tokens", "reasoning_effort", "tool_choice", "seed", "logit_bias"} {
+		if _, present := params[k]; present {
+			t.Errorf("parameters.%s must be absent when the client sent none", k)
+		}
+	}
+
+	// Catalog default when the client sent nothing.
+	raw, err = buildParameters(map[string]interface{}{}, "", 4096)
+	if err != nil {
+		t.Fatalf("buildParameters: %v", err)
+	}
+	params = nil
+	if err := json.Unmarshal(raw, &params); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := params["max_tokens"]; got != float64(4096) {
+		t.Errorf("max_tokens = %#v, want catalog default 4096", got)
+	}
+
+	// n != 1 is rejected honestly.
+	if _, err := buildParameters(map[string]interface{}{"n": json.Number("3")}, "", 4096); err == nil {
+		t.Error("n=3 must be rejected")
+	} else if _, ok := err.(*RequestParamError); !ok {
+		t.Errorf("n=3 must be a RequestParamError, got %T", err)
 	}
 }
 
@@ -1428,8 +1699,9 @@ func TestHandleChatForwardsCallerMaxTokens(t *testing.T) {
 // both had when the parameters object was introduced. Whether the gateway
 // reads parallel_tool_calls from either position is unverified, so this test
 // makes a future move a deliberate, tested change.
-func TestApplyToolConfigLocksFieldPlacement(t *testing.T) {
+func TestParameterAssemblyLocksFieldPlacement(t *testing.T) {
 	body := newRequestBody()
+	body.Parameters = json.RawMessage(`{"max_tokens":4096,"tool_choice":"required"}`)
 	toolsEnabled := applyToolConfig(body, map[string]interface{}{
 		"tools": []interface{}{map[string]interface{}{
 			"type": "function",
@@ -1439,7 +1711,6 @@ func TestApplyToolConfigLocksFieldPlacement(t *testing.T) {
 				"parameters":  map[string]interface{}{"type": "object"},
 			},
 		}},
-		"tool_choice":         "required",
 		"parallel_tool_calls": true,
 	})
 	if !toolsEnabled {
@@ -1469,6 +1740,42 @@ func TestApplyToolConfigLocksFieldPlacement(t *testing.T) {
 	}
 	if _, present := payload["tool_choice"]; present {
 		t.Error("tool_choice must not reappear at the top level")
+	}
+}
+
+// The chat pipeline wires tool_choice into parameters via buildParameters
+// with the same placement the lock test above pins.
+func TestHandleChatToolChoiceRidesInParameters(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	bridge := newFakeBridge(t, gw)
+
+	err := bridge.HandleChat(context.Background(), httptest.NewRecorder(), map[string]interface{}{
+		"model":       "Fake-Model",
+		"messages":    []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		"stream":      true,
+		"tool_choice": "required",
+	}, nil)
+	if err != nil {
+		t.Fatalf("HandleChat: %v", err)
+	}
+
+	plain, err := auth.Decode(string(gw.lastChatBody()))
+	if err != nil {
+		t.Fatalf("decode signed gateway request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(plain, &payload); err != nil {
+		t.Fatalf("decode JSON gateway request: %v", err)
+	}
+	params := payload["parameters"].(map[string]interface{})
+	if got := params["tool_choice"]; got != "required" {
+		t.Errorf("parameters.tool_choice = %#v, want required", got)
+	}
+	if _, present := payload["tool_choice"]; present {
+		t.Error("tool_choice must not appear at the top level")
 	}
 }
 

@@ -107,6 +107,12 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 				}
 				return
 			}
+			var paramErr *RequestParamError
+			if errors.As(err, &paramErr) {
+				writeError(w, 400, "invalid_request_error", paramErr.Error())
+				record(false)
+				return
+			}
 			var valErr *models.UnsupportedModelError
 			if errors.As(err, &valErr) {
 				writeError(w, 400, "invalid_request_error", valErr.Error())

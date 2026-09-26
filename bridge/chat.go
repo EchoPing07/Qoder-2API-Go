@@ -55,20 +55,9 @@ type modelConfig struct {
 // chatParameters mirrors the gateway's "parameters" object. The official client
 // builds this map first and always attaches it to the request body; the gateway
 // reads completion caps, thinking control and tool selection from here and never
-// from the top level of the body.
-type chatParameters struct {
-	// MaxTokens caps completion tokens. Always sent, matching the official
-	// client's unconditional max_tokens entry.
-	MaxTokens int `json:"max_tokens"`
-	// MaxThinkingTokens caps thinking tokens. A pointer so that an explicit 0
-	// survives serialization: 0 is how the official client disables thinking.
-	MaxThinkingTokens *int `json:"max_thinking_tokens,omitempty"`
-	// ReasoningEffort is the canonical thinking tier (none/low/medium/high/
-	// xhigh/max) validated against the model's catalog metadata.
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	// ToolChoice carries the OpenAI tool_choice value verbatim.
-	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
-}
+// from the top level of the body. Assembled verbatim by buildParameters
+// (params.go) — see the verbatim policy documented there.
+type chatParameters = json.RawMessage
 
 type business struct {
 	ID      string      `json:"id"`
@@ -143,9 +132,6 @@ func newRequestBody() *ChatRequestBody {
 		Business: business{
 			Name: "hi",
 		},
-		Parameters: chatParameters{
-			MaxTokens: models.DefaultMaxOutputTokens,
-		},
 	}
 }
 
@@ -186,16 +172,29 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	body.ModelConfig.Key = qoderModel
 	body.ChatContext.Extra.ModelConfig.Key = qoderModel
 
-	// Thinking capability comes from the gateway catalog the way the official
-	// client resolves it (is_reasoning ?? false), instead of being forced on.
-	// A resolved "none" tier overrides both copies further below.
+	// Verbatim parameter policy (params.go): client values are forwarded
+	// unchanged and the gateway is the judge. Only an absent max_tokens gets
+	// the catalog default (the official client's own fallback), and
+	// effort=="none" additionally flips the protocol's thinking off-switches.
+	effort, err := resolveReasoningEffort(reqBody)
+	if err != nil {
+		return err
+	}
+	params, err := buildParameters(reqBody, effort, catalog.MaxOutputTokens(qoderModel))
+	if err != nil {
+		return err
+	}
+	body.Parameters = params
+
+	// Thinking capability: the catalog default applies when the client is
+	// silent; an explicit effort overrides it either way — any non-none tier
+	// requests thinking, "none" requests it off.
 	reasoningOn := catalog.ReasoningDefault(qoderModel)
+	if effort != "" {
+		reasoningOn = effort != "none"
+	}
 	body.ModelConfig.IsReasoning = reasoningOn
 	body.ChatContext.Extra.ModelConfig.IsReasoning = reasoningOn
-	// Completion cap follows the official precedence: a caller-supplied value
-	// wins, the catalog default is only the fallback. Clamping to the catalog
-	// would silently truncate models whose advertised cap is small.
-	body.Parameters.MaxTokens = resolveMaxTokens(reqBody, catalog.MaxOutputTokens(qoderModel))
 	body.Business.ID = uuid.New().String()
 	body.Business.BeginAt = time.Now().UnixMilli()
 
@@ -238,24 +237,12 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 		log.Printf("[bridge] multimodal: %d image(s) attached [%s]", imgCount, openaiModel)
 	}
 
-	if effort := resolveReasoningEffort(reqBody, catalog.Reasoning[qoderModel]); effort != "" {
-		// The gateway reads the tier from "parameters", never from the top level
-		// of the body. The official client assembles it the same way.
-		body.Parameters.ReasoningEffort = effort
-		if effort == "none" {
-			// Disable thinking explicitly: the client sets is_reasoning=false and
-			// max_thinking_tokens=0 together. The pointer field is what lets an
-			// explicit 0 survive serialization instead of being omitted.
-			zero := 0
-			body.Parameters.MaxThinkingTokens = &zero
-			body.ModelConfig.IsReasoning = false
-			body.ChatContext.Extra.ModelConfig.IsReasoning = false
-		}
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s is_reasoning=%t max_tokens=%d",
-			len(prompt), openaiModel, effort, body.ModelConfig.IsReasoning, body.Parameters.MaxTokens)
+	if effort != "" {
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s is_reasoning=%t",
+			len(prompt), openaiModel, effort, body.ModelConfig.IsReasoning)
 	} else {
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default(on) is_reasoning=%t max_tokens=%d",
-			len(prompt), openaiModel, body.ModelConfig.IsReasoning, body.Parameters.MaxTokens)
+		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default is_reasoning=%t",
+			len(prompt), openaiModel, body.ModelConfig.IsReasoning)
 	}
 
 	url := auth.ChatURL(b.Region)
@@ -291,7 +278,7 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	}
 
 	if stream {
-		return b.handleStream(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled, usageSink)
+		return b.handleStream(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled, streamIncludeUsage(reqBody), usageSink)
 	}
 	return b.handleSync(ctx, w, jsonBody, url, extraHeaders, reqID, created, openaiModel, toolsEnabled, usageSink)
 }

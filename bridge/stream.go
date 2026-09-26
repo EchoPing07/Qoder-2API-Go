@@ -22,7 +22,7 @@ type StreamReportedError struct {
 func (e *StreamReportedError) Error() string { return e.Err.Error() }
 func (e *StreamReportedError) Unwrap() error { return e.Err }
 
-func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool, usageSink UsageSink) error {
+func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, jsonBody []byte, url string, extraHeaders map[string]string, reqID string, created int64, model string, toolsEnabled bool, includeUsage bool, usageSink UsageSink) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
@@ -71,14 +71,17 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 		w.Write([]byte("data: " + string(doneBytes) + "\n\n"))
 	}
 
-	// Emit the usage frame before [DONE] (OpenAI stream_options.include_usage
-	// convention: a terminal chunk with empty choices carrying usage).
+	// Emit the usage frame before [DONE] only when the client opted in via
+	// stream_options.include_usage (OpenAI semantics). Internal statistics
+	// still receive usage through the sink either way.
 	if usage != nil {
-		usageChunk := transform.MakeChunk(reqID, created, model)
-		usageChunk["choices"] = []map[string]interface{}{}
-		usageChunk["usage"] = usage
-		usageBytes, _ := marshalNoEscape(usageChunk)
-		w.Write([]byte("data: " + string(usageBytes) + "\n\n"))
+		if includeUsage {
+			usageChunk := transform.MakeChunk(reqID, created, model)
+			usageChunk["choices"] = []map[string]interface{}{}
+			usageChunk["usage"] = usage
+			usageBytes, _ := marshalNoEscape(usageChunk)
+			w.Write([]byte("data: " + string(usageBytes) + "\n\n"))
+		}
 		if usageSink != nil {
 			usageSink(usage)
 		}
