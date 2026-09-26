@@ -389,6 +389,24 @@ func (e *BusyError) Error() string {
 	return s
 }
 
+// --- Generic upstream errors ---
+
+// UpstreamError describes a non-2xx gateway response outside the dedicated
+// session (AuthError) and admission-control (BusyError) categories. It
+// preserves the HTTP status and the truncated response body so the chat
+// handler can map the rejection back to the client with the real status and
+// message instead of collapsing everything into an opaque 500. Typical
+// sources: parameter rejections (400, e.g. an unsupported max_tokens range
+// or reasoning tier) and gateway faults (5xx).
+type UpstreamError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("gateway HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 // busyMeta extracts retryAfterSeconds from the nested JSON message carried
 // inside a 10605 payload, if present.
 func busyMeta(msg string) time.Duration {
@@ -627,7 +645,7 @@ func postEncoded(ctx context.Context, urlStr string, obj interface{}, machineID,
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, fmt.Errorf("HTTP %d at %s body=%s", resp.StatusCode, urlStr, truncateErrorBody(detail))
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail))}
 	}
 
 	var result map[string]interface{}
@@ -973,7 +991,7 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, fmt.Errorf("HTTP %d body=%s", resp.StatusCode, truncateErrorBody(detail))
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail))}
 	}
 
 	var result map[string]interface{}
@@ -1216,7 +1234,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 			}
 			return &AuthError{StatusCode: resp.StatusCode, Detail: string(errBody)}
 		}
-		return fmt.Errorf("HTTP %d %s", resp.StatusCode, truncateErrorBody(errBody))
+		return &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(errBody))}
 	}
 
 	// Cut off silent streams: long generations are fine (lines keep

@@ -113,6 +113,23 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 				record(false)
 				return
 			}
+			var upErr *auth.UpstreamError
+			if errors.As(err, &upErr) {
+				// A gateway rejection of the request itself (bad parameter values,
+				// unknown tiers, oversized caps...) passes through with its status
+				// and body instead of being masked as a bridge fault. 5xx is a
+				// gateway fault: report it as 502 Bad Gateway.
+				switch {
+				case upErr.StatusCode == 429:
+					writeError(w, 429, "rate_limit_error", "upstream: "+upErr.Body)
+				case upErr.StatusCode >= 500:
+					writeError(w, 502, "upstream_error", "upstream: "+upErr.Body)
+				default:
+					writeError(w, 400, "invalid_request_error", "upstream: "+upErr.Body)
+				}
+				record(false)
+				return
+			}
 			var valErr *models.UnsupportedModelError
 			if errors.As(err, &valErr) {
 				writeError(w, 400, "invalid_request_error", valErr.Error())

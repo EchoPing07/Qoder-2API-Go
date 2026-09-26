@@ -1826,3 +1826,80 @@ func TestFmtResetTime(t *testing.T) {
 		t.Errorf("fmtResetTime = %q, want %q", got, want)
 	}
 }
+
+// rejectingGateway serves the auth endpoints but rejects every chat request
+// with a fixed status and body, for pass-through error mapping tests.
+type rejectingGateway struct {
+	status int
+	body   string
+}
+
+func newRejectingBridge(t *testing.T, gw *rejectingGateway) *OpenAiBridge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"chat":[{"key":"qmodel_latest","display_name":"Fake-Model","enable":true,"is_vl":false}]}`)
+	})
+	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(gw.status)
+		io.WriteString(w, gw.body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL}
+	return NewOpenAiBridge("pt-test", region)
+}
+
+// Upstream rejections of the request itself pass back with the gateway's
+// real status and message instead of being masked as a bridge 500.
+func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		body       string
+		wantCode   int
+		wantInBody string
+	}{
+		{"400 parameter rejection passes through",
+			400, `{"code":"invalid_parameter_error","message":"Range of max_tokens validation failed"}`,
+			400, "Range of max_tokens"},
+		{"404 unknown model",
+			404, `{"code":"not_found","message":"model not found"}`,
+			400, "model not found"},
+		{"429 rate limit",
+			429, `{"code":"too_many_requests","message":"slow down"}`,
+			429, "slow down"},
+		{"500 gateway fault maps to 502",
+			500, `{"code":"internal_error","message":"boom"}`,
+			502, "boom"},
+		{"503 gateway unavailable maps to 502",
+			503, "service unavailable",
+			502, "service unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &rejectingGateway{status: tc.status, body: tc.body}
+			b := newRejectingBridge(t, gw)
+			handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+
+			req := httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Authorization", "Bearer sk-test")
+			w := httptest.NewRecorder()
+			handler(w, req)
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.wantInBody) {
+				t.Errorf("body must carry the upstream message %q:\n%s", tc.wantInBody, w.Body.String())
+			}
+		})
+	}
+}
