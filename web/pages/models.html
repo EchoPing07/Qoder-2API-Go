@@ -1,0 +1,31 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>模型</h1>
+          <div class="page-actions">
+            <span class="muted-xs">点击模型卡片复制名称，用于 API 调用</span>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>模型列表</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-show="!models.loading && models.models.length" x-text="models.models.length + ' 个模型'"></span>
+          </div>
+          <div x-show="!models.loading && models.models.length">
+            <div class="model-chips">
+              <template x-for="m in models.models" :key="m">
+                <span class="model-chip" style="cursor:pointer" role="button" tabindex="0" @click="copy(m)" @keydown.enter.prevent="copy(m)" :title="'点击复制：' + m">
+                  <span class="model-chip-name" x-text="m"></span>
+                  <span class="ic ic-sm" style="color:var(--muted-fg)" x-html="ic('copy')"></span>
+                </span>
+              </template>
+            </div>
+          </div>
+          <div class="empty" x-show="!models.loading && !models.models.length">
+            <span class="ic ic-lg" x-html="ic('box')"></span>暂无可用模型
+          </div>
+          <div class="empty" x-show="models.loading"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+        </div>
+      </section>
+

@@ -5,6 +5,9 @@ dist/
 # Data files (runtime generated)
 data.json
 
+# Local reference repos (do not push)
+references/
+
 # OS files
 .DS_Store
 Thumbs.db

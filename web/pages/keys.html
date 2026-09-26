@@ -1,0 +1,54 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>密钥</h1>
+          <div class="page-actions">
+            <button class="btn btn-sm" @click="keyModal=true"><span class="ic" x-html="ic('plus')"></span>创建密钥</button>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="table-wrap" x-show="keys.length">
+            <table>
+              <thead><tr><th>密钥</th><th>备注</th><th>创建时间</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="k in keys" :key="k.id">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <code class="key-chip" :title="k.key" x-text="k.key"></code>
+                        <button class="btn btn-ghost btn-sm" @click="copy(k.key)">复制</button>
+                      </div>
+                    </td>
+                    <td x-text="k.note || '—'"></td>
+                    <td class="muted-xs" x-text="dateStr(k.created_at)"></td>
+                    <td><button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteKey(k)">删除</button></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!keys.length">
+            <span class="ic ic-lg" x-html="ic('keys')"></span>
+            暂无密钥，点击右上角创建第一个密钥
+          </div>
+        </div>
+      </section>
+
+<!-- ═══ 创建密钥弹窗 ═══ -->
+<template x-if="keyModal">
+  <div class="overlay" @click.self="keyModal=false">
+    <form class="modal" @submit.prevent="createKey()">
+      <div class="modal-title">创建密钥</div>
+      <p class="modal-msg">客户端调用 /v1/chat/completions 时使用的密钥。</p>
+      <div class="form-row"><label class="label">密钥（留空则自动生成）</label><input class="input mono" x-model="keyForm.key" placeholder="sk-..." autocomplete="off"></div>
+      <div class="form-row"><label class="label">备注</label><input class="input" x-model="keyForm.note" placeholder="可选描述" autocomplete="off"></div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="keyModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">
+          <span class="spin" x-show="loading"></span>
+          <span x-show="!loading">创建</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</template>

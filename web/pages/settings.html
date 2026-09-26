@@ -1,0 +1,65 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>设置</h1>
+          <div class="page-actions">
+            <button class="btn btn-sm" @click="saveConfig()" :disabled="loading">
+              <span class="spin" x-show="loading"></span>
+              <span class="ic" x-show="!loading" x-html="ic('check')"></span>保存配置
+            </button>
+          </div>
+        </header>
+
+        <div class="grid settings-grid">
+          <div class="space">
+          <div class="card">
+            <div class="card-head"><h3>服务器配置</h3></div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">主机</label>
+                <input class="input" x-model="config.host" placeholder="0.0.0.0" autocomplete="off">
+              </div>
+              <div class="form-row">
+                <label class="label">端口</label>
+                <input class="input" type="number" x-model.number="config.port" placeholder="10081">
+              </div>
+            </div>
+            <p class="field-hint">配置监听地址和端口，与超时配置一起经「保存配置」提交；修改后需要重启服务才能生效</p>
+            <p class="field-hint" style="color:var(--warn-fg)" x-show="configHint" x-text="configHint"></p>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>超时配置</h3></div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">Chat 响应超时（秒）</label>
+                <input class="input" type="number" min="1" max="3600" x-model.number="config.chat_timeout_seconds" placeholder="120">
+              </div>
+              <div class="form-row">
+                <label class="label">流空闲超时（秒）</label>
+                <input class="input" type="number" min="1" max="3600" x-model.number="config.idle_timeout_seconds" placeholder="300">
+              </div>
+            </div>
+            <p class="field-hint">Chat 响应超时：等待上游开始响应（返回响应头）的最长时间；流空闲超时：流式响应中持续无数据的最长等待，只要数据持续到达就不会中断。保存后立即生效，无需重启；留空表示保持当前值</p>
+          </div>
+          </div>
+
+          <div class="space">
+          <div class="card">
+            <div class="card-head"><h3>修改管理密码</h3></div>
+            <div class="form-grid c2">
+              <div class="form-row"><label class="label">当前密码</label><input class="input" type="password" x-model="pwForm.current_password" placeholder="当前密码" autocomplete="current-password"></div>
+              <div class="form-row"><label class="label">新密码</label><input class="input" type="password" x-model="pwForm.new_password" placeholder="新密码" autocomplete="new-password"></div>
+            </div>
+            <div class="action-row">
+              <div class="spacer"></div>
+              <button class="btn btn-sm" @click="savePassword()" :disabled="loading">
+                <span class="spin" x-show="loading"></span>
+                <span x-show="!loading">修改密码</span>
+              </button>
+            </div>
+            <p class="field-hint">修改管理控制台的登录密码；由环境变量 QODER_ADMIN_PASSWORD 管理时无法在面板中修改</p>
+          </div>
+          </div>
+        </div>
+      </section>
+

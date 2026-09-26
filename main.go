@@ -17,10 +17,15 @@ import (
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
+	"qoder2api/web"
 
 	"sync"
 	"time"
 )
+
+// Version is the build version, overridden at build time via
+// -ldflags "-X main.Version=v1.2.3". It is only used for display (login page).
+var Version = "dev"
 
 // bridgeProvider manages a single OpenAiBridge for the current PAT.
 // When the PAT changes (via admin UI), the bridge is recreated on next access.
@@ -317,6 +322,13 @@ func main() {
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec)
 
+	// WebUI: pre-render all pages at startup (multi-page Alpine.js frontend,
+	// no build step, no external dependencies).
+	webHandler, err := web.New(Version)
+	if err != nil {
+		log.Fatalf("[web] failed to init: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec))
 	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
@@ -331,8 +343,10 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	// Register admin routes
+	// Register admin API routes (/admin/api/*) and WebUI routes
+	// (/admin, /admin/<page>, /admin/assets/*)
 	adminInst.RegisterRoutes(mux)
+	webHandler.Mount(mux)
 
 	addr := host + ":" + strconv.Itoa(port)
 	log.Printf("[bridge] listening http://%s/v1/chat/completions", addr)

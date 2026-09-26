@@ -1,0 +1,30 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>令牌</h1>
+        </header>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>访问令牌</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs">Qoder 个人访问令牌，API 桥接运行必须配置</span>
+          </div>
+          <p class="field-hint">令牌变更后，桥接会话将在下一次请求时自动重建。</p>
+          <div class="form-row">
+            <label class="label">当前令牌</label>
+            <input class="input mono" :value="pat.masked" readonly>
+          </div>
+          <div class="form-row">
+            <label class="label">新令牌</label>
+            <input class="input mono" x-model="pat.input" placeholder="pt-..." autocomplete="off">
+          </div>
+          <div class="action-row">
+            <div class="spacer"></div>
+            <button class="btn btn-sm" @click="savePAT()" :disabled="loading">
+              <span class="spin" x-show="loading"></span>
+              <span x-show="!loading">保存</span>
+            </button>
+          </div>
+        </div>
+      </section>
+

@@ -51,12 +51,12 @@ func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder) *Admin {
 	}
 }
 
-// RegisterRoutes registers all admin routes on the given mux.
+// RegisterRoutes registers all admin API routes on the given mux.
+//
+// The WebUI itself is served by the web package (pages under /admin, assets
+// under /admin/assets/); this mux section only owns the JSON API under
+// /admin/api/*.
 func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
-	// WebUI (no auth — the page handles auth client-side)
-	mux.HandleFunc("/admin", a.serveIndex)
-	mux.HandleFunc("/admin/", a.serveIndex)
-
 	// Auth endpoints (no auth required)
 	mux.HandleFunc("/admin/api/login", a.handleLogin)
 	mux.HandleFunc("/admin/api/logout", a.handleLogout)
@@ -577,17 +577,6 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.stats.Report())
-}
-
-// --- WebUI ---
-
-func (a *Admin) serveIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	w.WriteHeader(200)
-	w.Write([]byte(indexHTML))
 }
 
 // maskPAT returns a masked version of the PAT for display.

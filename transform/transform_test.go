@@ -36,56 +36,6 @@ func TestBuildQoderMessagesNormalizesDeveloperRoleToSystem(t *testing.T) {
 	}
 }
 
-func TestApplyOpenAIToolConfigRemovesTemplateToolsWhenAbsent(t *testing.T) {
-	body := map[string]interface{}{
-		"tools":               []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "Skill"}}},
-		"tool_choice":         "auto",
-		"parallel_tool_calls": true,
-	}
-	reqBody := map[string]interface{}{"messages": []interface{}{}}
-	toolsEnabled := ApplyOpenAIToolConfig(body, reqBody)
-	if toolsEnabled {
-		t.Error("tools should be disabled")
-	}
-	if _, ok := body["tools"]; ok {
-		t.Error("tools should be removed")
-	}
-	if _, ok := body["parallel_tool_calls"]; ok {
-		t.Error("parallel_tool_calls should be removed")
-	}
-}
-
-func TestApplyOpenAIToolConfigKeepsOnlyRequestTools(t *testing.T) {
-	reqTool := map[string]interface{}{
-		"type":     "function",
-		"function": map[string]interface{}{"name": "MyTool", "parameters": map[string]interface{}{}},
-	}
-	body := map[string]interface{}{
-		"tools":       []interface{}{map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "Skill"}}},
-		"tool_choice": "auto",
-	}
-	reqBody := map[string]interface{}{
-		"tools":       []interface{}{reqTool},
-		"tool_choice": "required",
-		"messages":    []interface{}{},
-	}
-	toolsEnabled := ApplyOpenAIToolConfig(body, reqBody)
-	if !toolsEnabled {
-		t.Error("tools should be enabled")
-	}
-	tools, _ := body["tools"].([]interface{})
-	if len(tools) != 1 {
-		t.Fatalf("expected 1 tool, got %d", len(tools))
-	}
-	fn := tools[0].(map[string]interface{})["function"].(map[string]interface{})
-	if fn["name"] != "MyTool" {
-		t.Errorf("expected MyTool, got %v", fn["name"])
-	}
-	if body["tool_choice"] != "required" {
-		t.Errorf("expected required, got %v", body["tool_choice"])
-	}
-}
-
 func TestToolHistoryFlattenedWhenRequestToolsAbsent(t *testing.T) {
 	messages := []map[string]interface{}{
 		{"role": "user", "content": "Hi"},

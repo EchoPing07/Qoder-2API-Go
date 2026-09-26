@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Brand}} · {{.Title}}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 7 4 4 20 4 20 7'/%3E%3Cline x1='9' x2='15' y1='20' y2='20'/%3E%3Cline x1='12' x2='12' y1='4' y2='20'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/admin/assets/app.css">
+<script defer src="/admin/assets/app.js"></script>
+<script defer src="/admin/assets/alpine.js"></script>
+</head>
+<body data-page="{{.Key}}">
+<div x-data="app()" @popstate.window="onPop($event)">
+
+<!-- 启动加载 -->
+<template x-if="!ready">
+  <div class="splash" x-cloak><span class="spin" style="width:20px;height:20px"></span></div>
+</template>
+
+<!-- ═══ 登录页 ═══ -->
+<template x-if="ready && !loggedIn">
+<div class="login-page" x-cloak>
+  <main class="login-main">
+    <div class="login-grid">
+      <section class="login-brand">
+        <p class="login-brand-title"><a href="{{.Repo}}" target="_blank" rel="noreferrer" title="在 GitHub 打开项目主页">{{.Brand}}</a></p>
+        <p class="login-ver"><span>{{.Version}}</span></p>
+        <p class="login-sub">将 Qoder AI 服务转化为兼容 OpenAI 格式的 API</p>
+      </section>
+      <section class="login-form-col">
+        <h1 class="login-h1">登录</h1>
+        <p class="login-form-sub">输入管理密码进入后台</p>
+        <form @submit.prevent="doLogin()">
+          <div class="form-row">
+            <label class="label" for="pw">管理密码</label>
+            <input id="pw" class="input" type="password" x-model="password" placeholder="••••••••" autofocus autocomplete="current-password">
+          </div>
+          <button type="submit" class="btn login-submit" :disabled="loading">
+            <span class="spin" x-show="loading"></span>
+            <span x-show="!loading">登 录</span>
+          </button>
+        </form>
+      </section>
+    </div>
+  </main>
+</div>
+</template>
+
+<!-- ═══ 主界面 ═══ -->
+<template x-if="ready && loggedIn">
+<div class="shell" x-cloak>
+
+  <!-- 移动端顶栏 -->
+  <header class="topbar">
+    <button class="btn btn-ghost btn-icon" @click="mobileNav=true" aria-label="打开导航" x-html="ic('menu')"></button>
+    <a class="logo" href="{{.Repo}}" target="_blank" rel="noreferrer" title="在 GitHub 打开项目主页">{{.Brand}}</a>
+    <button class="btn btn-outline btn-sm" @click="cycleTheme()" :title="'点击切换主题（当前：'+themeLabel+'）'">
+      <span class="ic" x-html="ic(theme==='light'?'sun':theme==='dark'?'moon':'monitor')"></span>
+      <span x-text="themeLabel"></span>
+    </button>
+  </header>
+
+  <!-- 侧边栏 -->
+  <div class="side-backdrop" x-show="mobileNav" x-transition.opacity @click="mobileNav=false"></div>
+  <aside class="sidebar" :class="{'open':mobileNav}">
+    <div class="side-head">
+      <a class="logo" href="{{.Repo}}" target="_blank" rel="noreferrer" title="在 GitHub 打开项目主页">{{.Brand}}</a>
+    </div>
+    <nav class="sidenav" aria-label="主导航">
+{{.Nav}}
+    </nav>
+    <div class="side-foot">
+      <div class="side-actions">
+        <button class="btn btn-outline btn-sm" @click="cycleTheme()" :title="'点击切换主题（当前：'+themeLabel+'）'">
+          <span class="ic" x-html="ic(theme==='light'?'sun':theme==='dark'?'moon':'monitor')"></span>
+          <span x-text="themeLabel"></span>
+        </button>
+        <button class="btn btn-outline btn-sm" @click="logout()"><span class="ic" x-html="ic('logout')"></span>退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 内容区 -->
+  <div class="content">
+    <main class="main">
+
+
+{{.Content}}
+
+
+    </main>
+  </div>
+</div>
+</template>
+
+<!-- ═══ 确认弹窗 ═══ -->
+<template x-if="confirmBox.open">
+  <div class="overlay" @click.self="confirmBox.open=false">
+    <div class="modal" role="alertdialog" style="max-width:380px">
+      <div class="modal-title" x-text="confirmBox.title"></div>
+      <p class="modal-msg" x-text="confirmBox.message"></p>
+      <p class="modal-detail" x-show="confirmBox.detail" x-text="confirmBox.detail"></p>
+      <div class="modal-foot">
+        <button class="btn btn-secondary btn-sm" @click="confirmBox.open=false">取消</button>
+        <button class="btn btn-sm" :class="confirmBox.danger?'btn-danger':''" @click="confirmBox.onOk && confirmBox.onOk()" x-text="confirmBox.okText"></button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- ═══ 提示 ═══ -->
+<div class="toasts">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="toast" :class="t.type">
+      <span class="ic" x-html="ic(t.type==='ok'?'check':'alert')"></span>
+      <span x-text="t.msg"></span>
+    </div>
+  </template>
+</div>
+</div>
+
+</body>
+</html>

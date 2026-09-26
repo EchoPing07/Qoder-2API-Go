@@ -307,7 +307,7 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 		return &msg
 	}
 	if role == "assistant" && anyToolCalls != nil && !allowStructuredToolCalls {
-		msg := buildStructuredMessage("assistant", summarizeUnresolvedToolCalls(toolsCallsToMaps(anyToolCalls)))
+		msg := buildStructuredMessage("assistant", summarizeUnresolvedToolCalls(ToolsCallsToMaps(anyToolCalls)))
 		return &msg
 	}
 
@@ -381,29 +381,6 @@ func BuildQoderMessages(incomingMessages []map[string]interface{}, prompt string
 	}
 
 	return rebuilt
-}
-
-// ApplyOpenAIToolConfig applies tool configuration from the request to the body.
-// Returns true if tools are enabled.
-func ApplyOpenAIToolConfig(body map[string]interface{}, reqBody map[string]interface{}) bool {
-	incomingTools, ok := reqBody["tools"].([]interface{})
-	toolsEnabled := ok && len(incomingTools) > 0
-	if toolsEnabled {
-		body["tools"] = incomingTools
-	} else {
-		delete(body, "tools")
-	}
-	if tc, ok := reqBody["tool_choice"]; ok {
-		body["tool_choice"] = tc
-	} else {
-		delete(body, "tool_choice")
-	}
-	if ptc, ok := reqBody["parallel_tool_calls"]; ok {
-		body["parallel_tool_calls"] = ptc
-	} else {
-		delete(body, "parallel_tool_calls")
-	}
-	return toolsEnabled
 }
 
 // ExtractLatestUserPrompt extracts the latest user message text.
@@ -754,8 +731,8 @@ func (a *StreamAccumulator) Flush() {
 		parsed = ParseToolCallsText(buffered)
 	}
 	if parsed != nil {
-		a.toolCalls.Append(toolsCallsToMaps(parsed))
-		a.emit("", "", withToolCallIndices(toolsCallsToMaps(parsed)))
+		a.toolCalls.Append(ToolsCallsToMaps(parsed))
+		a.emit("", "", withToolCallIndices(ToolsCallsToMaps(parsed)))
 		return
 	}
 	a.streamingText = true
@@ -1029,7 +1006,10 @@ func interfaceSliceToMapSlice(slice []interface{}) []map[string]interface{} {
 	return result
 }
 
-func toolsCallsToMaps(calls []NormalizedToolCall) []map[string]interface{} {
+// ToolsCallsToMaps converts normalized tool calls to the OpenAI delta shape
+// (map form). Exported so the bridge stream path can reuse it without a
+// duplicate copy (it previously carried its own identical private helper).
+func ToolsCallsToMaps(calls []NormalizedToolCall) []map[string]interface{} {
 	result := []map[string]interface{}{}
 	for _, tc := range calls {
 		m := map[string]interface{}{

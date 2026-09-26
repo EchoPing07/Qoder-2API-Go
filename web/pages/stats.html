@@ -1,0 +1,114 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>统计</h1>
+          <div class="page-actions">
+            <span class="muted-xs">统计自服务启动以来记录的请求，每 30 秒持久化一次 · 每 15 秒自动刷新</span>
+            <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
+              <span class="ic" x-html="ic('refresh')"></span>刷新统计
+            </button>
+          </div>
+        </header>
+
+        <div class="grid metrics-4">
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total)"></div>
+            <p class="metric-detail" x-text="'成功率 ' + pctStr(stats.success_rate)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head">
+              <span class="metric-label">Token 总数</span>
+              <span class="row" style="gap:6px">
+                <span class="badge badge-err" x-show="accountExceeded">额度已超</span>
+                <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
+                <span class="ic" x-html="ic('type')"></span>
+              </span>
+            </header>
+            <div class="metric-value" x-text="fmt(totalTokens)"></div>
+            <p class="metric-detail" :title="creditsTitle" x-text="creditsHeadline"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总输入</span><span class="ic" x-html="ic('download')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.prompt_tokens)"></div>
+            <p class="metric-detail" x-text="'缓存命中 ' + fmt(stats.cached_tokens)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总输出</span><span class="ic" x-html="ic('upload')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.completion_tokens)"></div>
+            <p class="metric-detail" x-text="'平均 ' + fmt(avgOut) + ' / 次'"></p>
+          </article>
+        </div>
+
+        <!-- 额度明细：Qoder 官方账号级额度，账号无任何可用池时整卡隐藏 -->
+        <div class="card" x-show="quotaPoolsList.length">
+          <div class="card-head">
+            <h3>额度明细</h3>
+            <span class="muted-xs">Qoder 官方账号级额度，每分钟刷新</span>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-text="quotaSummary"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>额度来源</th><th style="text-align:right">已用 / 总额</th><th style="text-align:right">剩余</th><th style="width:200px">使用率</th><th>状态</th></tr></thead>
+              <tbody>
+                <template x-for="p in quotaPoolsList" :key="p.name">
+                  <tr>
+                    <td x-text="p.name"></td>
+                    <td style="text-align:right" x-text="fmtCredits(p.used) + ' / ' + fmtCredits(p.total)"></td>
+                    <td style="text-align:right" x-text="fmtCredits(p.remaining)"></td>
+                    <td>
+                      <div class="row" style="gap:10px;flex-wrap:nowrap">
+                        <div class="bar" style="width:72px"><div :style="'width:'+(p.ratio*100)+'%'"></div></div>
+                        <span class="muted-xs" style="min-width:44px;text-align:right" x-text="Math.round(p.ratio*100)+'%'"></span>
+                      </div>
+                    </td>
+                    <td><span class="badge" :class="p.statusKind" x-text="p.statusText"></span></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>近 24 小时请求量</h3>
+            <div class="spacer"></div>
+            <div class="legend">
+              <span class="lg lg-bar"><i style="background:var(--chart-bar-hl)"></i>成功</span>
+              <span class="lg"><i style="background:var(--err-fg)"></i>失败</span>
+              <span class="muted-xs" x-text="hourlyPeak"></span>
+            </div>
+          </div>
+          <div id="chartHourly" class="chart-box"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>按模型统计</h3></div>
+          <div class="table-wrap" x-show="(stats.by_model||[]).length">
+            <table>
+              <thead><tr><th>模型</th><th style="text-align:right">请求</th><th style="text-align:right">成功</th><th style="text-align:right">失败</th><th style="width:200px">成功率</th></tr></thead>
+              <tbody>
+                <template x-for="m in (stats.by_model||[])" :key="m.model">
+                  <tr>
+                    <td><span class="mono" x-text="m.model"></span></td>
+                    <td style="text-align:right" x-text="fmt(m.total)"></td>
+                    <td style="text-align:right" x-text="fmt(m.success)"></td>
+                    <td style="text-align:right" x-text="fmt(m.failed)"></td>
+                    <td>
+                      <div class="row" style="gap:10px;flex-wrap:nowrap">
+                        <div class="bar" style="width:72px"><div :class="rateClass(m.success_rate)" :style="'width:'+(m.success_rate*100)+'%'"></div></div>
+                        <span class="muted-xs" style="min-width:44px;text-align:right" x-text="pctStr(m.success_rate)"></span>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!(stats.by_model||[]).length">
+            <span class="ic ic-lg" x-html="ic('activity')"></span>暂无统计数据，请求处理完成后会自动记录
+          </div>
+        </div>
+      </section>
+
