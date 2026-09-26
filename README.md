@@ -7,7 +7,8 @@
 ## 功能特性
 
 - **OpenAI API 兼容** —— 支持 `/v1/chat/completions` 和 `/v1/models` 端点，可无缝替换 OpenAI API
-- **流式响应** —— 支持 SSE 流式输出，末尾附带 usage 帧（含输入 / 输出 / 缓存命中 / 思考 token 与实际扣费额度，遵循 `stream_options.include_usage` 终帧格式）
+- **流式响应** —— 支持 SSE 流式输出；`stream_options.include_usage: true` 时末尾附带 usage 帧（含输入 / 输出 / 缓存命中 / 思考 token 与实际扣费额度）
+- **参数完全透传** —— `reasoning_effort`、`max_tokens`、`temperature` 等参数原样转发网关，不做本地校验/钳制/映射；网关拒绝时按真实状态码与原文回传客户端
 - **真实用量统计** —— `/v1/chat/completions` 响应携带网关真实 token 用量：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`，以及 Qoder 扩展字段 `credits`（实际扣费额度）/ `original_credits`（折扣前额度）
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
@@ -151,44 +152,47 @@ curl http://localhost:10081/v1/models \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx"
 ```
 
-### 5. 控制思考强度（`reasoning_effort`）
+### 5. 思考强度与参数透传（verbatim 原则）
 
-请求体支持 OpenAI 风格的 `reasoning_effort`。有效档位写入网关请求的 `parameters` 对象（与官方客户端一致），**无需**额外的 device token、Bearer token 或模型服务域名配置；未携带 `reasoning_effort` 的请求不改变思考档位，保持模型默认强度（但请求体仍会带上 `parameters.max_tokens`，见下文「`is_reasoning` 与 `max_tokens` 的来源」）。
+本桥接层对请求参数执行**完全原样转发**（verbatim）策略：客户端给什么就往网关送什么，不做本地校验、钳制、映射或静默替换；网关不接受时，错误按真实状态码与原文回传（见下文「错误回传」）。
 
 ```json
 {
   "model": "Qwen3.8-Max",
   "messages": [{"role": "user", "content": "你好"}],
-  "reasoning_effort": "xhigh"
+  "reasoning_effort": "xhigh",
+  "max_tokens": 16000,
+  "temperature": 0.5
 }
 ```
 
-桥接层从动态模型目录的 `thinking_config` 读取校验信息：档位列表来自 `thinking_config.enabled.efforts`（对象 map），`none` 是否允许则取决于 `thinking_config.disabled` 是否声明。有效值为 `none`、`low`、`medium`、`high`、`xhigh`、`max`，`minimal` 会映射为 `low`。不受当前模型支持的档位会被省略，模型继续使用默认思考强度。
+参数处理一览：
 
-其中 `none` 的判据是**就紧不就松**：只有在模型目录明确声明 `thinking_config.disabled` 时才转发；目录元数据缺失（模型没有 `thinking_config` 或其为 `null`）时同样省略，因为上游对未声明支持的模型会以一个 HTTP 400 拒绝整个请求。其余档位在元数据缺失时保持原有的直接透传行为。
-
-> **注意**：档位必须放在 `parameters` 内才会生效。网关不读取请求体顶层的 `reasoning_effort`，写在该位置会被静默忽略，模型一律按默认强度思考。此外 `parameters` 还承载 `max_tokens`、`tool_choice` 等字段，桥接层会自动组装，调用方无需关心。
+| 请求字段 | 处理 |
+| --- | --- |
+| `reasoning_effort` / `reasoning.effort` | 原样写入 `parameters.reasoning_effort`（顶层优先）。不校验档位、不映射 `minimal`、不因目录未声明而丢弃；模型不支持时由网关报错回传 |
+| `max_tokens` / `max_completion_tokens` | 任意 JSON 数値原样写入 `parameters.max_tokens`（含 0、负数、小数、超大值；`max_tokens` 优先）。未传时才用目录默认值 |
+| `temperature` / `top_p` / `stop` / `seed` / `response_format` / `logit_bias` / `presence_penalty` / `frequency_penalty` / `n=1` | 原样写入 `parameters`。网关认不认由网关决定，错误回传 |
+| `n` ≠ 1 | 本地 `400`：响应通道结构上只能产生单个 choice，拒绝静默只返回一个 |
+| 类型错误（如 `"max_tokens": "8000"`、`"reasoning_effort": 3`） | 本地 `400 invalid_request_error` |
+| `stream_options.include_usage` | 流式响应仅在显式 `true` 时发送 usage 终帧（OpenAI 语义）；非流式始终携带 usage |
 
 #### `none` 档：完全关闭思考
 
-`none` 是二值开关而非强度档位，需要额外配合才能真正关闭思考。当模型目录声明了 `thinking_config.disabled` 时，桥接层在档位解析为 `none` 时会同时做三件事（与官方客户端行为一致）：
+`reasoning_effort: "none"` 无条件转发（不再要求目录声明 `thinking_config.disabled`），并同时完成三件事（与官方客户端一致）：
 
 1. `parameters.reasoning_effort` 置为 `"none"`
-2. `parameters.max_thinking_tokens` 显式置为 `0`（该字段用指针承载，以保证 `0` 不被 JSON 序列化省略）
+2. `parameters.max_thinking_tokens` 显式置为 `0`
 3. `model_config.is_reasoning` 与 `chat_context.extra.modelConfig.is_reasoning` 均置为 `false`
 
-其余档位不会写入 `max_thinking_tokens`：官方客户端仅在技能 / 子代理覆盖场景才把档位换算为思考预算，主交互路径只发送档位字符串。
-
-> 档位之间的区别在上游是否可观测仍存疑（见下方「档位实效说明」）：`none` 是唯一实测稳定生效的档位，其余档位不应被当作可靠的强度旋钮。
+其余档位不写 `max_thinking_tokens`；显式非 `none` 档位会强制 `is_reasoning=true`（覆盖目录默认），未传档位时才由目录决定。
 
 #### `is_reasoning` 与 `max_tokens` 的来源
 
-两项能力信息来自网关模型目录，与官方客户端的解析方式一致：
+- `is_reasoning`：客户端显式档位优先（非 `none` → `true`，`none` → `false`）；未传时看目录（`thinking_config.enabled` 存在且非 null → 顶层 `is_reasoning` → 回退 `true`）。
+- `max_tokens`：仅当客户端未传时才用目录 `max_output_tokens`（缺失时 32000）。
 
-- `is_reasoning`：优先看目录条目是否存在 `thinking_config.enabled`（存在且非 null 即视为"可思考"——这是目录真正声明可思考能力的位置；`dfmodel` / `kmodel_latest` 的顶层 `is_reasoning=false` 与嵌套块矛盾，故以嵌套块为准），其次才看顶层 `is_reasoning`；两者都缺失时回退为 `true`。动态目录整体不可用时同样回退为 `true`（保持原有"默认开启思考"）。
-- `max_tokens`：调用方传入的 `max_tokens` / `max_completion_tokens` 优先，但被钳制在 1,000,000 上限（避免 `1e18` 之类异常值直达上游）；未传或非法时才取目录的 `max_output_tokens`，目录缺失时为 `32000`。该值总是写入网关请求的 `parameters.max_tokens`，这是本 PR 引入的行为变更：此前版本的请求体不含该字段，客户端传入的 `max_tokens` 会被静默丢弃。
-
-> **档位实效说明**：实测显示，除 `none`（且仅当目录声明了 `thinking_config.disabled` 时）外，各档位字符串对 `reasoning_tokens` 的影响落在采样噪声内。档位仍会经目录校验后透传，但不应据此期待精细的思考强度控制；下面的 pi `thinkingLevelMap` 示例只用于显式表达调用方意图。
+> **档位实效说明**：实测显示，除 `none` 外各档位字符串对 `reasoning_tokens` 的影响落在采样噪声内，不应据此期待精细的思考强度控制；但桥接层不再因此替网关做裁决，调用方发送的档位一律上船。
 
 **pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
 
@@ -204,7 +208,7 @@ curl http://localhost:10081/v1/models \
 }
 ```
 
-以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型（`max` 映射到目录实际支持的最高档位，避免发送被上游丢弃的无效值）：
+以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型（桥接层不再过滤档位，`max` 映射仅是为了不发送无意义的无效值）：
 
 ```json
 {
@@ -238,6 +242,8 @@ curl http://localhost:10081/v1/models \
 | `/admin/api/password` | POST | 修改管理密码 |
 
 **错误响应约定**：登录失败限流返回 `429`（附 `Retry-After`）；创建重复 API Key 返回 `409`；端口配置越界（非 1–65535）返回 `400`；未鉴权或会话过期返回 `401`。
+
+**上游错误回传**：网关对请求本身的拒绝（如不支持的档位、`max_tokens` 范围校验失败）按真实状态码回传——4xx 请求级拒绝 → `400 invalid_request_error` + 网关原始 message；429 → `429 rate_limit_error`；5xx → `502 upstream_error`。参数类型错误（字符串数值等）与 `n`≠1 在本地返回 `400`。流中错误以 SSE error chunk 形式携带真实原因。
 
 ## 额度与计费周期
 
