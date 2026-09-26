@@ -210,7 +210,7 @@ func marshalNoEscape(v interface{}) ([]byte, error) {
 type OpenAiBridge struct {
 	Region *auth.RegionConfig
 	pat    string
-	intlIdentity map[string]interface{}
+	ideIdentity map[string]interface{}
 
 	machineID    string
 	machineToken string
@@ -244,7 +244,7 @@ type OpenAiBridge struct {
 }
 
 // NewOpenAiBridge creates a new bridge for the given PAT.
-func NewOpenAiBridge(pat string, region *auth.RegionConfig, intlIdentity map[string]interface{}) *OpenAiBridge {
+func NewOpenAiBridge(pat string, region *auth.RegionConfig, ideIdentity map[string]interface{}) *OpenAiBridge {
 	if region == nil {
 		region = auth.CN
 	}
@@ -261,7 +261,7 @@ func NewOpenAiBridge(pat string, region *auth.RegionConfig, intlIdentity map[str
 	return &OpenAiBridge{
 		Region:       region,
 		pat:          pat,
-		intlIdentity: intlIdentity,
+		ideIdentity: ideIdentity,
 		machineID:    machineID,
 		machineToken: machineToken,
 		machineType:  machineType,
@@ -284,14 +284,15 @@ func maxUpstreamConcurrency() int {
 	return 1
 }
 
-// bootstrapSession performs a cold PAT → jobToken exchange.
+// bootstrapSession performs a cold PAT → jobToken exchange — unless a
+// desktop-IDE identity is present, in which case its access token
+// authenticates the COSY-signed session directly (no jobToken exchange or
+// /user/status round-trip). Region-agnostic: cn reuses the intl mechanism.
 func (b *OpenAiBridge) bootstrapSession(ctx context.Context) error {
-	if b.Region != nil && b.Region.Name == "intl" && b.intlIdentity != nil {
-		// INTL: the desktop IDE access token authenticates as a plain bearer;
-		// no jobToken exchange or /user/status round-trip is involved.
-		b.applyJobToken(b.intlIdentity, "")
+	if b.ideIdentity != nil {
+		b.applyJobToken(b.ideIdentity, "")
 		b.bootstrapped.Store(true)
-		log.Printf("[bridge] intl session bootstrapped from IDE identity (exp=%v)", b.intlIdentity["expireTime"])
+		log.Printf("[bridge] IDE-identity session bootstrapped [%s] (exp=%v)", b.Region.Name, b.ideIdentity["expireTime"])
 		return nil
 	}
 	jt, err := auth.ExchangeJobToken(ctx, b.pat, b.machineID, b.machineToken, b.machineType, b.Region)
@@ -590,10 +591,12 @@ func (b *OpenAiBridge) currentSecurityOauth() string {
 	return token
 }
 
-// doRenew renews the session token via refreshToken.
+// doRenew renews the session token via refreshToken. Sessions bootstrapped
+// from a desktop-IDE identity have no PAT exchange to renew through — their
+// credentials are expiry-managed by all2api, refresh by re-logging the IDE.
 func (b *OpenAiBridge) doRenew(ctx context.Context, force bool) error {
-	if b.Region != nil && b.Region.Name == "intl" {
-		return fmt.Errorf("intl credentials are expiry-managed by all2api; re-login the Qoder IDE to refresh them")
+	if b.ideIdentity != nil {
+		return fmt.Errorf("IDE-identity credentials are expiry-managed by all2api; re-login the Qoder IDE to refresh them")
 	}
 	b.mu.Lock()
 	rt := b.refreshToken

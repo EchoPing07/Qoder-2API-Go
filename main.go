@@ -73,11 +73,12 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 		}
 	} else if p.bridge == nil || p.pat != pat {
 		realPAT, region := auth.Resolve(pat)
-		intlIdentity, _ := p.store.GetIntlIdentity()
-		if region.Name != "intl" {
-			intlIdentity = nil
-		}
-		p.bridge = bridge.NewOpenAiBridge(realPAT, region, intlIdentity)
+		// A desktop-IDE identity (when present) replaces the PAT exchange on
+		// every region — cn reuses the same pure-token session mechanism as
+		// intl. A real PAT still wins: the TS side clears stale identity
+		// fields whenever one is configured.
+		ideIdentity, _ := p.store.GetIdeIdentity()
+		p.bridge = bridge.NewOpenAiBridge(realPAT, region, ideIdentity)
 		p.pat = pat
 		b = p.bridge
 	} else {

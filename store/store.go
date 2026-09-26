@@ -288,7 +288,7 @@ func (s *Store) SetPassword(password string) error {
 
 // --- PAT ---
 
-func (s *Store) GetIntlIdentity() (map[string]interface{}, bool) {
+func (s *Store) GetIdeIdentity() (map[string]interface{}, bool) {
 	if s.config.SecurityOauthToken == "" {
 		return nil, false
 	}
