@@ -29,7 +29,13 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 
 	var usage *transform.Usage
 
+	// wrote tracks whether ANY byte reached the client. Until the first
+	// write, the response is still uncommitted and the real upstream status
+	// can (and must) be sent instead; once content has been delivered, the
+	// only remaining channel is the SSE error chunk.
+	wrote := false
 	acc := transform.NewStreamAccumulator(reqID, created, model, toolsEnabled, func(chunk string) {
+		wrote = true
 		w.Write([]byte(chunk))
 		if flusher != nil {
 			flusher.Flush()
@@ -55,7 +61,18 @@ func (b *OpenAiBridge) handleStream(ctx context.Context, w http.ResponseWriter, 
 	acc.Flush()
 
 	if err != nil {
-		log.Printf("[bridge] stream error: %v", err)
+		if !wrote {
+			// Nothing was delivered: the response is still uncommitted, so let
+			// MakeChatHandler map the upstream rejection to a real HTTP status
+			// (400/429/502, Retry-After, ...) instead of collapsing it into an
+			// already-committed 200 SSE stream. Buffered accumulator content is
+			// dropped — the request failed, and a clean status beats a 200 that
+			// every SDK and retry policy reads as success. acc.Flush() above ran
+			// first, so content that WAS flushed still flips wrote and keeps the
+			// SSE error-chunk path.
+			return err
+		}
+		log.Printf("[bridge] stream error after content: %v", err)
 		errChunk := transform.MakeChunk(reqID, created, model)
 		writeFinishReason(errChunk, "error")
 		clearDelta(errChunk)

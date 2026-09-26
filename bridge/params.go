@@ -109,7 +109,18 @@ func buildParameters(reqBody map[string]interface{}, effort string, catalogDefau
 	}
 	obj.set("max_tokens", maxRaw)
 
-	if effort == "none" {
+	// max_thinking_tokens: a client-supplied value is a gateway-defined
+	// parameter like any other and is forwarded verbatim (it even overrides
+	// the synthesized off-switch below — the gateway judges the combination,
+	// we do not). Only effort=="none" WITHOUT a client value synthesizes the
+	// explicit 0 the official client sends to switch thinking off entirely.
+	mttRaw, mttPresent, err := maxThinkingTokensField(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	if mttPresent {
+		obj.set("max_thinking_tokens", mttRaw)
+	} else if effort == "none" {
 		// The gateway protocol's thinking off-switch: the official client
 		// sends max_thinking_tokens=0 alongside reasoning_effort=none. The
 		// explicit zero must serialize, not be omitted.
@@ -138,6 +149,22 @@ func buildParameters(reqBody map[string]interface{}, effort string, catalogDefau
 	}
 
 	return obj.marshal()
+}
+
+// maxThinkingTokensField extracts a client-supplied thinking budget, verbatim
+// (any JSON number — the gateway validates the range). The boolean reports
+// presence; a wrong JSON type is a RequestParamError so it is not silently
+// swallowed by the none-synthesis fallback.
+func maxThinkingTokensField(reqBody map[string]interface{}) (json.RawMessage, bool, error) {
+	raw, present := reqBody["max_thinking_tokens"]
+	if !present {
+		return nil, false, nil
+	}
+	num, ok := numberJSON(raw)
+	if !ok {
+		return nil, false, &RequestParamError{fmt.Sprintf("max_thinking_tokens must be a number, got %s", jsonTypeName(raw))}
+	}
+	return num, true, nil
 }
 
 // maxTokensField extracts the client completion cap. max_tokens wins over

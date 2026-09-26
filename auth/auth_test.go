@@ -131,11 +131,11 @@ func TestDetectInStreamGatewayErrorEnvelope429(t *testing.T) {
 	if e == nil {
 		t.Fatal("429 envelope must be detected as in-stream error")
 	}
-	if e.status != 429 {
-		t.Errorf("status = %d, want 429", e.status)
+	if e.Status != 429 {
+		t.Errorf("status = %d, want 429", e.Status)
 	}
-	if e.detail != "provider_error: All backends failed" {
-		t.Errorf("detail = %q, want provider_error message", e.detail)
+	if e.Detail != "provider_error: All backends failed" {
+		t.Errorf("detail = %q, want provider_error message", e.Detail)
 	}
 }
 
@@ -161,8 +161,8 @@ func TestDetectInStreamGatewayErrorBareFailure(t *testing.T) {
 	if e == nil {
 		t.Fatal("bare success:false frame must be detected")
 	}
-	if e.detail != "Internal Server Error" {
-		t.Errorf("detail = %q", e.detail)
+	if e.Detail != "Internal Server Error" {
+		t.Errorf("detail = %q", e.Detail)
 	}
 }
 

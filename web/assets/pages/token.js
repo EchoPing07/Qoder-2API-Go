@@ -8,7 +8,7 @@ PAGE('token', {
     try{
       const r = await this.api('/admin/api/pat');
       this.pat.masked = r.pat_masked || '';
-    }catch(e){}
+    }catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示
   },
   async savePAT(){
     const v = (this.pat.input||'').trim();

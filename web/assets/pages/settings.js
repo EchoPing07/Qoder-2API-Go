@@ -12,11 +12,12 @@ PAGE('settings', {
         chat_timeout_seconds: r.chat_timeout_seconds || '',
         idle_timeout_seconds: r.idle_timeout_seconds || '',
       };
-    }catch(e){}
+    }catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示
   },
-  /* 保存与旧面板同一语义：host/port 必填（空回落默认），超时字段留空 = 不下发
-   * （保持服务端当前值）；数值输入被清空时 x-model.number 得到 null，须按
-   * 「留空」处理，不能当 0 发出去（0 会被服务端当作「未携带」之外的非法值路径）。 */
+  /* 保存：host 留空回落默认 0.0.0.0；port 必填且须在 1-65535（空/非法均被拒，
+   * 不会静默回落）；超时字段留空 = 不下发（保持服务端当前值）；数值输入被清空时
+   * x-model.number 得到 null，须按「留空」处理，不能当 0 发出去（0 会被服务端当作
+   * 「未携带」之外的非法值路径）。 */
   async saveConfig(){
     this.busy(async()=>{
       const c = this.config||{};

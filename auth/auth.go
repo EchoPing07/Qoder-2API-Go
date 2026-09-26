@@ -398,13 +398,29 @@ func (e *BusyError) Error() string {
 // message instead of collapsing everything into an opaque 500. Typical
 // sources: parameter rejections (400, e.g. an unsupported max_tokens range
 // or reasoning tier) and gateway faults (5xx).
+//
+// RetryAfter carries the gateway's numeric Retry-After header when the
+// rejection came with one (429); 0 means absent/unparseable, and the client
+// response then simply omits the header.
 type UpstreamError struct {
 	StatusCode int
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("gateway HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// retryAfterHeader parses a numeric Retry-After response header into a
+// duration. The HTTP-date form and unparsable/non-positive values yield 0;
+// only 429 rejections are expected to carry the header at all.
+func retryAfterHeader(h string) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(h))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // busyMeta extracts retryAfterSeconds from the nested JSON message carried
@@ -645,7 +661,7 @@ func postEncoded(ctx context.Context, urlStr string, obj interface{}, machineID,
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail))}
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail)), RetryAfter: retryAfterHeader(resp.Header.Get("Retry-After"))}
 	}
 
 	var result map[string]interface{}
@@ -991,7 +1007,7 @@ func call(ctx context.Context, sess *SessionContext, method, fullURL string, jso
 			}
 			return nil, &AuthError{StatusCode: resp.StatusCode, Detail: string(detail)}
 		}
-		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail))}
+		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(detail)), RetryAfter: retryAfterHeader(resp.Header.Get("Retry-After"))}
 	}
 
 	var result map[string]interface{}
@@ -1105,20 +1121,23 @@ func isErrorEvent(line string) bool {
 	return strings.HasPrefix(line, "event:") && strings.TrimSpace(line[len("event:"):]) == "error"
 }
 
-// inStreamError describes a gateway failure delivered inside the SSE stream
+// InStreamError describes a gateway failure delivered inside the SSE stream
 // (HTTP status is still 200). Kept when seen so the EOF-without-[DONE]
 // fallback reports the real cause instead of a misleading "connection
-// truncated".
-type inStreamError struct {
-	status int
-	detail string
+// truncated". Status carries the status embedded in the failure frame
+// (statusCodeValue or msgCode); 0 means unknown. Exported so the chat
+// handler can map the client response to the same status instead of a
+// generic 500 when the stream failed before any content was delivered.
+type InStreamError struct {
+	Status int
+	Detail string
 }
 
-func (e *inStreamError) Error() string {
-	if e.status > 0 {
-		return fmt.Sprintf("gateway in-stream error (HTTP %d): %s", e.status, e.detail)
+func (e *InStreamError) Error() string {
+	if e.Status > 0 {
+		return fmt.Sprintf("gateway in-stream error (HTTP %d): %s", e.Status, e.Detail)
 	}
-	return fmt.Sprintf("gateway in-stream error: %s", e.detail)
+	return fmt.Sprintf("gateway in-stream error: %s", e.Detail)
 }
 
 // detectInStreamGatewayError extracts a terminal gateway/provider failure
@@ -1133,7 +1152,7 @@ func (e *inStreamError) Error() string {
 //     {"success":false,"msgCode":500,"message":"Internal Server Error"}
 //
 // A 200 OK envelope with normal chat/usage/[DONE] bodies returns nil.
-func detectInStreamGatewayError(line string) *inStreamError {
+func detectInStreamGatewayError(line string) *InStreamError {
 	if !strings.HasPrefix(line, "data:") {
 		return nil
 	}
@@ -1151,7 +1170,7 @@ func detectInStreamGatewayError(line string) *inStreamError {
 		if detail == "" {
 			detail = env.StatusCode
 		}
-		return &inStreamError{status: env.StatusValue, detail: trimJSONMessage(detail)}
+		return &InStreamError{Status: env.StatusValue, Detail: trimJSONMessage(detail)}
 	}
 	if env.Body != "" || env.StatusCode != "" {
 		// A well-formed envelope with a 2xx status is a normal frame.
@@ -1176,7 +1195,7 @@ func detectInStreamGatewayError(line string) *inStreamError {
 		if detail == "" {
 			detail = fmt.Sprintf("msgCode %d", bare.MsgCode)
 		}
-		return &inStreamError{status: bare.MsgCode, detail: detail}
+		return &InStreamError{Status: bare.MsgCode, Detail: detail}
 	}
 	return nil
 }
@@ -1234,7 +1253,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 			}
 			return &AuthError{StatusCode: resp.StatusCode, Detail: string(errBody)}
 		}
-		return &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(errBody))}
+		return &UpstreamError{StatusCode: resp.StatusCode, Body: string(truncateErrorBody(errBody)), RetryAfter: retryAfterHeader(resp.Header.Get("Retry-After"))}
 	}
 
 	// Cut off silent streams: long generations are fine (lines keep
@@ -1264,7 +1283,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	// success would silently truncate the answer and still emit our own
 	// [DONE] to the client.
 	sawDone := false
-	var gwErr *inStreamError
+	var gwErr *InStreamError
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -1309,7 +1328,7 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 			// sure the EOF fallback reports the real cause (from the error
 			// frames seen before this event) instead of "truncated".
 			if gwErr == nil {
-				gwErr = &inStreamError{detail: "upstream stream failed (event:error)"}
+				gwErr = &InStreamError{Detail: "upstream stream failed (event:error)"}
 			}
 		}
 		if e := detectInStreamGatewayError(line); e != nil && gwErr == nil {

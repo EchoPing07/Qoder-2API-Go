@@ -70,7 +70,12 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 		r.Body = http.MaxBytesReader(w, r.Body, chatMaxBodyBytes)
 
 		var reqBody map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		// UseNumber keeps client numbers as json.Number so their exact token
+		// (1e18, 9007199254740993, long fractions) survives re-marshaling into
+		// the gateway request verbatim instead of being rounded through float64.
+		dec := json.NewDecoder(r.Body)
+		dec.UseNumber()
+		if err := dec.Decode(&reqBody); err != nil {
 			writeError(w, 400, "invalid_request_error", "Invalid JSON body: "+err.Error())
 			return
 		}
@@ -117,16 +122,29 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 			if errors.As(err, &upErr) {
 				// A gateway rejection of the request itself (bad parameter values,
 				// unknown tiers, oversized caps...) passes through with its status
-				// and body instead of being masked as a bridge fault. 5xx is a
-				// gateway fault: report it as 502 Bad Gateway.
-				switch {
-				case upErr.StatusCode == 429:
-					writeError(w, 429, "rate_limit_error", "upstream: "+upErr.Body)
-				case upErr.StatusCode >= 500:
-					writeError(w, 502, "upstream_error", "upstream: "+upErr.Body)
-				default:
-					writeError(w, 400, "invalid_request_error", "upstream: "+upErr.Body)
-				}
+				// and body instead of being masked as a bridge fault.
+				writeUpstreamRejection(w, upErr.StatusCode, upErr.Body, upErr.RetryAfter)
+				record(false)
+				return
+			}
+			var isErr *auth.InStreamError
+			if errors.As(err, &isErr) {
+				// The gateway accepted the request (HTTP 200) but failed inside the
+				// SSE stream before any content was delivered: map by the status
+				// embedded in the failure frame, same policy as UpstreamError. A
+				// frame without a usable status is still a provider fault → 502.
+				writeUpstreamRejection(w, isErr.Status, isErr.Detail, 0)
+				record(false)
+				return
+			}
+			var authErr *auth.AuthError
+			if errors.As(err, &authErr) {
+				// The gateway rejected OUR session/PAT credentials, not the
+				// client's API key (that was validated by the resolver long before
+				// this point). Passing the upstream 401 through would make every
+				// client believe its own key is invalid, so this is reported as a
+				// bad-gateway fault with the (redacted) upstream detail.
+				writeError(w, 502, "upstream_error", "upstream auth: "+authErr.Error())
 				record(false)
 				return
 			}
@@ -161,6 +179,27 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder) http.HandlerF
 			return
 		}
 		record(true)
+	}
+}
+
+// writeUpstreamRejection maps a gateway rejection onto the client response.
+// status is the upstream status to mirror: 429 → 429 rate_limit_error (with
+// Retry-After when the gateway sent one), ≥500 (or unknown, ≤0) → 502
+// upstream_error, other 4xx → 400 invalid_request_error with the upstream
+// body carried verbatim. Shared by the pre-flight (UpstreamError) and
+// in-stream (InStreamError) paths so both speak the same convention.
+func writeUpstreamRejection(w http.ResponseWriter, status int, body string, retryAfter time.Duration) {
+	switch {
+	case status == 429:
+		if retryAfter > 0 {
+			retrySecs := int((retryAfter + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		}
+		writeError(w, 429, "rate_limit_error", "upstream: "+body)
+	case status >= 500 || status <= 0:
+		writeError(w, 502, "upstream_error", "upstream: "+body)
+	default:
+		writeError(w, 400, "invalid_request_error", "upstream: "+body)
 	}
 }
 

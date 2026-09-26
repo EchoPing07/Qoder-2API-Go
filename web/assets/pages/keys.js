@@ -4,7 +4,8 @@ PAGE('keys', {
 
   /* ── Keys ── */
   async loadKeys(){
-    try{ const r = await this.api('/admin/api/keys'); this.keys = r.keys||[]; }catch(e){}
+    try{ const r = await this.api('/admin/api/keys'); this.keys = r.keys||[]; }
+    catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示，否则用户对着陈旧列表无感知
   },
   /* 创建：留空 key 由服务端随机生成；「随机生成」与「自定义」共用此入口。 */
   async createKey(){

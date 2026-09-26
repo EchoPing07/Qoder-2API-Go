@@ -171,7 +171,8 @@ curl http://localhost:10081/v1/models \
 | 请求字段 | 处理 |
 | --- | --- |
 | `reasoning_effort` / `reasoning.effort` | 原样写入 `parameters.reasoning_effort`（顶层优先）。不校验档位、不映射 `minimal`、不因目录未声明而丢弃；模型不支持时由网关报错回传 |
-| `max_tokens` / `max_completion_tokens` | 任意 JSON 数値原样写入 `parameters.max_tokens`（含 0、负数、小数、超大值；`max_tokens` 优先）。未传时才用目录默认值 |
+| `max_tokens` / `max_completion_tokens` | 任意 JSON 数値原样写入 `parameters.max_tokens`（含 0、负数、小数、超大值与超出 float64 精度的整数；`max_tokens` 优先）。未传时才用目录默认值 |
+| `max_thinking_tokens` | 客户端显式传入时原样转发（即使同时携带 `reasoning_effort: "none"`，也以客户端值为准）；仅 `none` 档且未传时才合成显式 `0`（官方客户端的天闭开关） |
 | `temperature` / `top_p` / `stop` / `seed` / `response_format` / `logit_bias` / `presence_penalty` / `frequency_penalty` / `n=1` | 原样写入 `parameters`。网关认不认由网关决定，错误回传 |
 | `n` ≠ 1 | 本地 `400`：响应通道结构上只能产生单个 choice，拒绝静默只返回一个 |
 | 类型错误（如 `"max_tokens": "8000"`、`"reasoning_effort": 3`） | 本地 `400 invalid_request_error` |
@@ -243,7 +244,7 @@ curl http://localhost:10081/v1/models \
 
 **错误响应约定**：登录失败限流返回 `429`（附 `Retry-After`）；创建重复 API Key 返回 `409`；端口配置越界（非 1–65535）返回 `400`；未鉴权或会话过期返回 `401`。
 
-**上游错误回传**：网关对请求本身的拒绝（如不支持的档位、`max_tokens` 范围校验失败）按真实状态码回传——4xx 请求级拒绝 → `400 invalid_request_error` + 网关原始 message；429 → `429 rate_limit_error`；5xx → `502 upstream_error`。参数类型错误（字符串数值等）与 `n`≠1 在本地返回 `400`。流中错误以 SSE error chunk 形式携带真实原因。
+**上游错误回传**：网关对请求本身的拒绝（如不支持的档位、`max_tokens` 范围校验失败）按真实状态码回传——4xx 请求级拒绝 → `400 invalid_request_error` + 网关原始 message；429 → `429 rate_limit_error`（上游携带 `Retry-After` 时一并透传）；5xx → `502 upstream_error`。流式与非流式一视同仁：只要尚未向客户端写出任何内容，拒绝就以真实状态码的 JSON 错误体返回；内容已开始输出后才失败的，则以 SSE error chunk 携带真实原因（此时状态码只能保持 200）。网关在流内报错（HTTP 200 但错误帧）时，若尚无内容，同样按错误帧内嵌的状态码映射（无状态码则 `502`）。上游会话/PAT 凭证被拒（网关 401/403）回传 `502 upstream_error`（上游凭证问题不是客户端的 API key 问题，不回传 401 以免误导）。参数类型错误（字符串数值等）与 `n`≠1 在本地返回 `400`。
 
 ## 额度与计费周期
 

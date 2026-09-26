@@ -456,7 +456,10 @@ func (b *OpenAiBridge) GetCatalog(ctx context.Context) *models.ModelCatalog {
 	}
 	b.catalogMu.Lock()
 	b.catalog = cat
-	b.catalogTs = float64(now)
+	// Timestamp AFTER the fetch: stamping the pre-fetch `now` would bill the
+	// fetch duration to every waiter's TTL check and keep the cache trusted
+	// for longer than catalogTTL after it was actually produced.
+	b.catalogTs = float64(time.Now().Unix())
 	b.catalogMu.Unlock()
 	return cat
 }

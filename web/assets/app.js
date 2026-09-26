@@ -83,8 +83,12 @@ function appShell(){
       matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>{ if(this.theme==='system') this.applyTheme(); });
       let rto;
       window.addEventListener('resize', ()=>{ clearTimeout(rto); rto=setTimeout(()=>{ if(this.view==='stats') this.renderHourly(); }, 200); });
-      // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发。
-      setInterval(()=>{ if(this.loggedIn && this.view==='stats') this.loadStats(); }, 15000);
+      // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发；
+      // 后台标签页跳过（visibilityState），回到前台时立即补一次，避免展示陈旧数据。
+      setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible') this.loadStats(); }, 15000);
+      document.addEventListener('visibilitychange', ()=>{
+        if(!document.hidden && this.loggedIn && this.view==='stats') this.loadStats();
+      });
       try{
         const r = await this.api('/admin/api/auth');
         this.loggedIn = !!r.authenticated;
@@ -201,7 +205,15 @@ function appShell(){
       };
     },
     copy(text){
-      navigator.clipboard.writeText(text).then(()=>this.toast('已复制到剪贴板','ok'));
+      // navigator.clipboard 仅在安全上下文（HTTPS / localhost）存在：非安全部署下
+      // 访问它会同步抛 TypeError，须判空 + catch，否则复制按钮静默失败。
+      if(!navigator.clipboard || !navigator.clipboard.writeText){
+        this.toast('当前环境不支持剪贴板复制','err');
+        return;
+      }
+      navigator.clipboard.writeText(text)
+        .then(()=>this.toast('已复制到剪贴板','ok'))
+        .catch(()=>this.toast('复制失败','err'));
     },
     fmt(n){ return (n||0).toLocaleString(); },
     compact(n){

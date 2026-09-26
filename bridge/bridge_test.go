@@ -773,28 +773,27 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	}}
 	b := newFakeBridge(t, gw)
 
+	// The failure frames carry no content, so nothing is committed to the
+	// client and the rejection must surface as a real HTTP status carrying the
+	// embedded 429 — not a 200 SSE stream whose success every SDK would read.
+	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
 	w := httptest.NewRecorder()
-	err := b.HandleChat(context.Background(), w, map[string]interface{}{
-		"model":    "Fake-Model",
-		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
-		"stream":   true,
-	}, nil)
-	if err == nil {
-		t.Fatal("provider outage stream must fail")
+	handler(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (embedded statusCodeValue)\n%s", w.Code, w.Body.String())
 	}
-	var repErr *StreamReportedError
-	if !errors.As(err, &repErr) {
-		t.Fatalf("expected StreamReportedError, got %T: %v", err, err)
+	if !strings.Contains(w.Body.String(), "provider_error: All backends failed") {
+		t.Errorf("error body must surface the real gateway cause, got:\n%s", w.Body.String())
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "HTTP 429") || !strings.Contains(body, "provider_error: All backends failed") {
-		t.Errorf("error chunk must surface the real gateway cause, got:\n%s", body)
+	if strings.Contains(w.Body.String(), "connection truncated") {
+		t.Errorf("misleading truncated message must be gone, got:\n%s", w.Body.String())
 	}
-	if strings.Contains(body, "connection truncated") {
-		t.Errorf("misleading truncated message must be gone, got:\n%s", body)
-	}
-	if strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
-		t.Error("failed stream must not terminate with [DONE]")
+	if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Errorf("no content was delivered; the response must be a JSON error, not SSE")
 	}
 }
 
@@ -1141,18 +1140,22 @@ func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
 		t.Errorf("Retry-After header missing/invalid: %q", ra)
 	}
 
-	// Streaming path: the error chunk carries the busy message and no second
-	// HTTP-level response is attempted.
+	// Streaming path: with no content delivered yet the response is still
+	// uncommitted, so the busy rejection must surface as a real 429 (with
+	// Retry-After) instead of an already-committed 200 SSE stream.
 	w2 := httptest.NewRecorder()
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req2.Header.Set("Authorization", "Bearer sk-test")
 	handler(w2, req2)
-	if w2.Code != 200 {
-		t.Errorf("streaming status = %d, want 200 (SSE headers already sent)", w2.Code)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Errorf("streaming status = %d, want 429 (no content committed yet)\n%s", w2.Code, w2.Body.String())
 	}
-	if !strings.Contains(w2.Body.String(), "10605") {
-		t.Errorf("stream body should carry the busy code:\n%s", w2.Body.String())
+	if ra := w2.Header().Get("Retry-After"); ra == "" || ra == "0" {
+		t.Errorf("streaming Retry-After header missing/invalid: %q", ra)
+	}
+	if !strings.Contains(w2.Body.String(), "upstream busy") {
+		t.Errorf("stream body should carry the busy message:\n%s", w2.Body.String())
 	}
 }
 
@@ -1830,8 +1833,9 @@ func TestFmtResetTime(t *testing.T) {
 // rejectingGateway serves the auth endpoints but rejects every chat request
 // with a fixed status and body, for pass-through error mapping tests.
 type rejectingGateway struct {
-	status int
-	body   string
+	status     int
+	body       string
+	retryAfter string // optional Retry-After header served with the rejection
 }
 
 func newRejectingBridge(t *testing.T, gw *rejectingGateway) *OpenAiBridge {
@@ -1847,6 +1851,9 @@ func newRejectingBridge(t *testing.T, gw *rejectingGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if gw.retryAfter != "" {
+			w.Header().Set("Retry-After", gw.retryAfter)
+		}
 		w.WriteHeader(gw.status)
 		io.WriteString(w, gw.body)
 	})
@@ -1860,31 +1867,30 @@ func newRejectingBridge(t *testing.T, gw *rejectingGateway) *OpenAiBridge {
 // real status and message instead of being masked as a bridge 500.
 func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 	cases := []struct {
-		name       string
-		status     int
-		body       string
-		wantCode   int
-		wantInBody string
+		name           string
+		status         int
+		body           string
+		retryAfter     string // Retry-After header served by the gateway, "" for none
+		wantCode       int
+		wantInBody     string
+		wantRetryAfter string
 	}{
 		{"400 parameter rejection passes through",
-			400, `{"code":"invalid_parameter_error","message":"Range of max_tokens validation failed"}`,
-			400, "Range of max_tokens"},
+			400, `{"code":"invalid_parameter_error","message":"Range of max_tokens validation failed"}`, "", 400, "Range of max_tokens", ""},
 		{"404 unknown model",
-			404, `{"code":"not_found","message":"model not found"}`,
-			400, "model not found"},
+			404, `{"code":"not_found","message":"model not found"}`, "", 400, "model not found", ""},
 		{"429 rate limit",
-			429, `{"code":"too_many_requests","message":"slow down"}`,
-			429, "slow down"},
+			429, `{"code":"too_many_requests","message":"slow down"}`, "", 429, "slow down", ""},
+		{"429 rate limit with Retry-After passes it through",
+			429, `{"code":"too_many_requests","message":"slow down"}`, "7", 429, "slow down", "7"},
 		{"500 gateway fault maps to 502",
-			500, `{"code":"internal_error","message":"boom"}`,
-			502, "boom"},
+			500, `{"code":"internal_error","message":"boom"}`, "", 502, "boom", ""},
 		{"503 gateway unavailable maps to 502",
-			503, "service unavailable",
-			502, "service unavailable"},
+			503, "service unavailable", "", 502, "service unavailable", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gw := &rejectingGateway{status: tc.status, body: tc.body}
+			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: tc.retryAfter}
 			b := newRejectingBridge(t, gw)
 			handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
 
@@ -1899,6 +1905,9 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 			}
 			if !strings.Contains(w.Body.String(), tc.wantInBody) {
 				t.Errorf("body must carry the upstream message %q:\n%s", tc.wantInBody, w.Body.String())
+			}
+			if got := w.Header().Get("Retry-After"); got != tc.wantRetryAfter {
+				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetryAfter)
 			}
 		})
 	}
