@@ -47,8 +47,26 @@ var CN = &RegionConfig{
 	OpenAPIBase: "https://openapi.qoder.com.cn",
 }
 
+// INTL is the international (qoder.com) deployment. Endpoint hosts were
+// mapped from the international IDE's endpoint registry and verified live:
+// /algo/api/v3/user/jobToken on center.qoder.sh and /api/v2/quota/usage on
+// openapi.qoder.sh respond with the same auth-gated semantics as CN.
+var INTL = &RegionConfig{
+	Name:        "intl",
+	AuthBase:    "https://center.qoder.sh",
+	ChatBase:    "https://center.qoder.sh",
+	OpenAPIBase: "https://openapi.qoder.sh",
+}
+
+// Resolve picks the region: QODER_REGION=intl selects the international
+// deployment; everything else keeps the default CN behaviour.
 func Resolve(pat string) (string, *RegionConfig) {
-	return pat, CN
+	switch strings.TrimSpace(os.Getenv("QODER_REGION")) {
+	case "intl", "global":
+		return pat, INTL
+	default:
+		return pat, CN
+	}
 }
 
 func AuthURL(region *RegionConfig, path string) string {
@@ -205,6 +223,7 @@ type SessionContext struct {
 	MachineID    string
 	MachineToken string
 	MachineType  string
+	IsIntl       bool
 }
 
 func rsaEncrypt(tempKey []byte) ([]byte, error) {
@@ -883,6 +902,27 @@ func drainBody(body io.Reader) {
 
 // --- Bearer API Client ---
 
+func intlHeaders(sess *SessionContext, accept string) http.Header {
+	h := http.Header{}
+	h.Set("content-type", "application/json")
+	h.Set("accept", accept)
+	if sess.Identity.SecurityOauthToken != "" {
+		h.Set("authorization", "Bearer "+sess.Identity.SecurityOauthToken)
+	}
+	return h
+}
+
+// intlBodyString: INTL gateways take plain JSON; QODER_INTL_ENCODE=1 forces the CN custom encoding.
+func intlBodyString(plain string) string {
+	if plain == "" {
+		return ""
+	}
+	if strings.TrimSpace(os.Getenv("QODER_INTL_ENCODE")) == "1" {
+		return Encode([]byte(plain))
+	}
+	return plain
+}
+
 func makeCommonHeaders(sess *SessionContext, date, bearer, accept string) http.Header {
 	h := http.Header{}
 	h.Set("cosy-data-policy", "AGREE")
@@ -932,16 +972,22 @@ func CallGet(ctx context.Context, sess *SessionContext, fullURL string) (map[str
 func call(ctx context.Context, sess *SessionContext, method, fullURL string, jsonBody map[string]interface{}, extraHeaders map[string]string) (map[string]interface{}, error) {
 	pathSig := sigPath(fullURL)
 	body := ""
+	plainBody := ""
 	if jsonBody != nil {
 		plain, err := marshalNoEscape(jsonBody)
 		if err != nil {
 			return nil, err
 		}
+		plainBody = string(plain)
 		body = Encode(plain)
 	}
 	date := strconv.FormatInt(time.Now().Unix(), 10)
 	bearer := buildBearer(sess, date, body, pathSig)
 	headers := makeCommonHeaders(sess, date, bearer, "application/json")
+	if sess.IsIntl {
+		body = intlBodyString(plainBody)
+		headers = intlHeaders(sess, "application/json")
+	}
 	for k, v := range extraHeaders {
 		headers.Set(k, v)
 	}
@@ -1190,6 +1236,10 @@ func OpenStreamLines(ctx context.Context, sess *SessionContext, fullURL string, 
 	date := strconv.FormatInt(time.Now().Unix(), 10)
 	bearer := buildBearer(sess, date, body, pathSig)
 	headers := makeCommonHeaders(sess, date, bearer, "text/event-stream")
+	if sess.IsIntl {
+		body = intlBodyString(string(jsonBody))
+		headers = intlHeaders(sess, "text/event-stream")
+	}
 	headers.Set("cache-control", "no-cache")
 	for k, v := range extraHeaders {
 		headers.Set(k, v)

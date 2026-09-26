@@ -32,6 +32,11 @@ type Config struct {
 	Host     string      `json:"host"`
 	Port     int         `json:"port"`
 	PAT      string      `json:"pat"`
+	SecurityOauthToken string `json:"securityOauthToken,omitempty"`
+	RefreshToken       string `json:"refreshToken,omitempty"`
+	UID                string `json:"uid,omitempty"`
+	Nickname           string `json:"nickname,omitempty"`
+	ExpireTime         int64  `json:"expireTime,omitempty"`
 	Password string      `json:"password"`
 	APIKeys  []APIKey    `json:"api_keys"`
 	Stats    *stats.Data `json:"stats,omitempty"`
@@ -282,6 +287,24 @@ func (s *Store) SetPassword(password string) error {
 }
 
 // --- PAT ---
+
+func (s *Store) GetIntlIdentity() (map[string]interface{}, bool) {
+	if s.config.SecurityOauthToken == "" {
+		return nil, false
+	}
+	id := map[string]interface{}{
+		"name":               s.config.Nickname,
+		"id":                 s.config.UID,
+		"uid":                s.config.UID,
+		"userType":           "personal_standard",
+		"securityOauthToken": s.config.SecurityOauthToken,
+		"refreshToken":       s.config.RefreshToken,
+	}
+	if s.config.ExpireTime > 0 {
+		id["expireTime"] = float64(s.config.ExpireTime)
+	}
+	return id, true
+}
 
 func (s *Store) GetPAT() string {
 	s.mu.RLock()
