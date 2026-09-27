@@ -11,6 +11,8 @@ PAGE('settings', {
         port: r.port || '',
         chat_timeout_seconds: r.chat_timeout_seconds || '',
         idle_timeout_seconds: r.idle_timeout_seconds || '',
+        log_retention_days: r.log_retention_days || '',
+        log_max_entries: r.log_max_entries || '',
       };
     }catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示
   },
@@ -37,6 +39,19 @@ PAGE('settings', {
         const it = parseInt(itRaw, 10);
         if(!it || it < 1 || it > 3600){ this.toast('流空闲超时需在 1-3600 秒之间','err'); return; }
         body.idle_timeout_seconds = it;
+      }
+      /* 日志配置沿用超时字段的可选约定：留空 = 不下发（保持服务端当前值）。 */
+      const lrRaw = c.log_retention_days;
+      if(lrRaw !== null && lrRaw !== undefined && String(lrRaw).trim() !== ''){
+        const lr = parseInt(lrRaw, 10);
+        if(!lr || lr < 1 || lr > 3650){ this.toast('日志保留天数需在 1-3650 之间','err'); return; }
+        body.log_retention_days = lr;
+      }
+      const lmRaw = c.log_max_entries;
+      if(lmRaw !== null && lmRaw !== undefined && String(lmRaw).trim() !== ''){
+        const lm = parseInt(lmRaw, 10);
+        if(!lm || lm < 100 || lm > 100000){ this.toast('日志条数上限需在 100-100000 之间','err'); return; }
+        body.log_max_entries = lm;
       }
       const r = await this.api('/admin/api/config',{method:'POST',body:JSON.stringify(body)});
       this.toast('配置已保存（超时配置即时生效）');

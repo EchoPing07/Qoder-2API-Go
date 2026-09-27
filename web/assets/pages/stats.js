@@ -12,6 +12,45 @@ PAGE('stats', {
     return s.total > 0 ? Math.round((s.completion_tokens||0)/s.total) : 0;
   },
 
+  /* ── Credits 消耗统计 ──
+   * 本服务实际扣费：usage 帧 credits 累加（billable=false 的帧既不计费也不计数）。
+   * 官方额度池是账号级数字，含 IDE/CLI 等其它客户端消耗，回答不了「本服务花了多少」。
+   */
+  get totalCredits(){
+    return Number((this.stats||{}).credits || 0);
+  },
+  get cycleCredits(){
+    return Number((this.stats||{}).cycle_credits || 0);
+  },
+  get billedCount(){
+    return Number((this.stats||{}).billed_requests || 0);
+  },
+  /* 平均每次计费请求的额度消耗；无计费请求时返回 0（不显示误导性的均值） */
+  get avgCredits(){
+    const avg = Number((this.stats||{}).avg_credits || 0);
+    return this.billedCount > 0 ? avg : 0;
+  },
+  /* 卡片主体数字：已同步订阅周期时看本周期消耗，否则看本服务累计。周期消耗可以为
+   * 0（新周期刚开始），故不能写作 `cycle>0 ? cycle : lifetime`，否则会让人误以为周期
+   * 重置没有生效。
+   */
+  get shownCredits(){
+    return this.hasCycle ? this.cycleCredits : this.totalCredits;
+  },
+  get hasCycle(){
+    return Number((this.stats||{}).next_reset_ms || 0) > 0;
+  },
+  /* 卡片副行：只陈述与主体数字同一口径的事实，不混入另一个范围的计数 */
+  get creditsDetail(){
+    if (this.hasCycle) return '本周期 · 累计 ' + this.fmtCredits(this.totalCredits);
+    if (this.billedCount === 0) {
+      // 升级前的数据只有累计 credits、没有计费次数：说明口径，而不是报「暂无计费
+      // 请求」——那会和卡片主体上非零的数字自相矛盾。
+      return this.totalCredits > 0 ? '计费次数与均值自本版起统计' : '暂无计费请求';
+    }
+    return '计费请求 ' + this.fmt(this.billedCount) + ' 次 · 平均 ' + this.fmtCredits(this.avgCredits);
+  },
+
   /* ── 额度池 ──
    * Collect the allowance pools the account actually holds. A pool with a zero
    * total carries no allowance at all: the free tier reports userQuota.total=0
@@ -69,8 +108,6 @@ PAGE('stats', {
    */
   get creditsHeadline(){
     const d = this.stats||{};
-    const lifetime = Number(d.credits || 0);
-    const cycle = Number(d.cycle_credits || 0);
     const resetMs = Number(d.next_reset_ms || 0);
     const pools = this.quotaPoolsList;
     let text;
@@ -82,9 +119,9 @@ PAGE('stats', {
       text = primary.name + ' ' + this.fmtCredits(primary.used) + ' / ' + this.fmtCredits(primary.total) +
         ' · 剩 ' + this.fmtCredits(primary.remaining);
     } else if (resetMs > 0) {
-      text = '本服务周期内 ' + this.fmtCredits(cycle);
+      text = '本服务周期内 ' + this.fmtCredits(this.cycleCredits);
     } else {
-      text = 'Credits 消耗 ' + this.fmtCredits(lifetime);
+      text = '本服务累计 ' + this.fmtCredits(this.totalCredits);
     }
     if (resetMs > 0) {
       const left = Math.ceil((resetMs - Date.now()) / 86400000);
@@ -93,13 +130,21 @@ PAGE('stats', {
     }
     return text;
   },
-  /* 完整分池明细（悬停 tooltip）：每池一行，官方额度不可用时说明口径。 */
+  /* 完整分池明细（悬停 tooltip）：先给本服务自算的消耗口径，再逐池列出官方额度。 */
   get creditsTitle(){
     const d = this.stats||{};
-    const title = ['本服务累计消耗 ' + this.fmtCredits(Number(d.credits || 0))];
+    const resetMs = Number(d.next_reset_ms || 0);
+    const self = this;
+    const title = ['本服务累计实际消耗 ' + this.fmtCredits(this.totalCredits) +
+      '（计费请求 ' + this.fmt(this.billedCount) + ' 次 · 平均 ' + this.fmtCredits(this.avgCredits) + ' / 次）'];
+    if (resetMs > 0) {
+      title.push('本服务本周期消耗 ' + this.fmtCredits(this.cycleCredits) +
+        (this.cycleStartLabel ? '（周期自 ' + this.cycleStartLabel + '）' : ''));
+    }
     const pools = this.quotaPoolsList;
     if (pools.length > 0) {
-      const self = this;
+      title.push('');
+      title.push('官方账号级额度（含 IDE / CLI 等其它客户端）：');
       pools.forEach(function(pool){
         let line = pool.name + '：已用 ' + self.fmtCredits(pool.used) +
           ' / ' + self.fmtCredits(pool.total) +
@@ -109,15 +154,21 @@ PAGE('stats', {
         }
         title.push(line);
       });
-    } else if (Number(d.next_reset_ms || 0) > 0) {
-      title.push('官方额度暂不可用；当前数字仅统计本服务观察到的请求');
+    } else if (resetMs > 0) {
+      title.push('官方额度暂不可用；上方数字仅统计本服务观察到的请求');
     }
     return title.join('\n');
+  },
+  /* 周期起点（MM-DD），未同步到订阅边界时为空串 */
+  get cycleStartLabel(){
+    const ms = Number((this.stats||{}).cycle_start_ms || 0);
+    return ms > 0 ? this.fmtMonthDay(ms) : '';
   },
   get accountExceeded(){
     const acct = (this.stats||{}).account;
     return !!(acct && acct.is_quota_exceeded);
   },
+  /* 账号等级徽标（Free / Teams…）：渲染在「令牌」页，数据仍取自本统计快照 */
   get accountTag(){
     const acct = (this.stats||{}).account;
     return (acct && acct.tag) ? acct.tag : '';
@@ -180,7 +231,8 @@ PAGE('stats', {
         const i = +hz.dataset.i, h = hourly[i];
         tt.textContent = (h.label||'')+' 时段';
         l1.textContent = `总 ${this.fmt(h.total||0)} · 成功 ${this.fmt(h.success||0)}`;
-        l2.textContent = `失败 ${this.fmt(h.failed||0)}`;
+        // 第三行是本时段实际扣费：与模型表的消耗列同一口径（仅计费帧）
+        l2.textContent = `失败 ${this.fmt(h.failed||0)} · 消耗 ${this.fmtCredits(h.credits||0)}`;
         const w = Math.max(...[tt,l1,l2].map(t=>t.getComputedTextLength())) + 20;
         bg.setAttribute('width', w.toFixed(0));
         const g = this._chartGeom;
@@ -223,6 +275,16 @@ PAGE('stats', {
     return n.toPrecision(6).replace(/\.?0+$/, '');
   },
 
+  /* ── 模型（自「模型」页迁入：模型列表改在本页展示） ── */
+  async loadModels(){
+    this.models.loading = true;
+    try{
+      const r = await this.api('/admin/api/models');
+      this.models.models = r.models||[];
+    }catch(e){ this.toast(e.message,'err'); }
+    finally{ this.models.loading = false; }
+  },
+
   /* ── 进场：本页所需数据 ── */
-  load(){ this.loadStats(); },
+  load(){ this.loadStats(); this.loadModels(); },
 });

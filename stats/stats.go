@@ -47,6 +47,11 @@ type ModelStat struct {
 	Total   int64  `json:"total"`
 	Success int64  `json:"success"`
 	Failed  int64  `json:"failed"`
+	// Billed counts the usage frames actually charged for this model and
+	// Credits is the post-discount amount they cost, so Credits/Billed is the
+	// real average spend. billable=false frames are counted in neither.
+	Billed  int64   `json:"billed,omitempty"`
+	Credits float64 `json:"credits,omitempty"`
 }
 
 // HourStat aggregates request counters for a single hour bucket.
@@ -55,6 +60,10 @@ type HourStat struct {
 	Total   int64  `json:"total"`
 	Success int64  `json:"success"`
 	Failed  int64  `json:"failed"`
+	// Billed / Credits carry the same meaning as in ModelStat, bucketed by
+	// hour so the trend chart can show what each hour cost.
+	Billed  int64   `json:"billed,omitempty"`
+	Credits float64 `json:"credits,omitempty"`
 }
 
 // Account is the subscription metadata reported by the gateway's
@@ -107,6 +116,11 @@ type Data struct {
 	CompletionTokens int64   `json:"completion_tokens"`
 	CachedTokens     int64   `json:"cached_tokens"`
 	Credits          float64 `json:"credits"`
+	// BilledRequests is the number of usage frames actually charged, i.e. the
+	// denominator of the average spend per request. Persisted rather than
+	// derived from the request counters, which also include failures and
+	// uncharged calls and would therefore understate the average.
+	BilledRequests int64 `json:"billed_requests,omitempty"`
 	// Billing-cycle scope. The gateway refreshes the subscription allowance
 	// monthly, so the lifetime Credits total above says nothing about what is
 	// left this cycle. These fields make the displayed number cycle-relative.
@@ -131,15 +145,23 @@ type ModelRow struct {
 	Success     int64   `json:"success"`
 	Failed      int64   `json:"failed"`
 	SuccessRate float64 `json:"success_rate"`
+	// Credits is what this model actually cost, Billed how many charged
+	// requests it took, and AvgCredits the average spend per charged request
+	// (0 when nothing was billed). Computed here so every consumer agrees.
+	Credits    float64 `json:"credits"`
+	Billed     int64   `json:"billed"`
+	AvgCredits float64 `json:"avg_credits"`
 }
 
 // HourRow is a chart bucket report row served to the admin UI.
 type HourRow struct {
-	Hour    string `json:"hour"`
-	Label   string `json:"label"`
-	Total   int64  `json:"total"`
-	Success int64  `json:"success"`
-	Failed  int64  `json:"failed"`
+	Hour    string  `json:"hour"`
+	Label   string  `json:"label"`
+	Total   int64   `json:"total"`
+	Success int64   `json:"success"`
+	Failed  int64   `json:"failed"`
+	Credits float64 `json:"credits"`
+	Billed  int64   `json:"billed"`
 }
 
 // Report is the aggregated snapshot served to the admin UI.
@@ -153,11 +175,18 @@ type Report struct {
 	CompletionTokens int64   `json:"completion_tokens"`
 	CachedTokens     int64   `json:"cached_tokens"`
 	Credits          float64 `json:"credits"`
-	// Billing-cycle view of the credits above (all zero when the account
-	// status is unknown).
+	// BilledRequests and AvgCredits are the charged-frame count and the
+	// resulting spend per request (see Data.BilledRequests).
+	BilledRequests int64   `json:"billed_requests"`
+	AvgCredits     float64 `json:"avg_credits"`
+	// CycleCredits is this service's own spend in the current billing cycle
+	// (0 when the account status is unknown). It excludes traffic from other
+	// clients, which the account-wide pools below include.
 	CycleCredits float64 `json:"cycle_credits"`
-	CycleStartMs int64   `json:"cycle_start_ms"`
-	NextResetMs  int64   `json:"next_reset_ms"`
+	// CycleStartMs and NextResetMs delimit that cycle; both stay 0 when the
+	// subscription boundary has never been resolved.
+	CycleStartMs int64 `json:"cycle_start_ms"`
+	NextResetMs  int64 `json:"next_reset_ms"`
 	// Account is nil when the subscription state has never been resolved.
 	Account *Account   `json:"account,omitempty"`
 	ByModel []ModelRow `json:"by_model"`
@@ -223,6 +252,7 @@ func (d *Data) Clone() *Data {
 		CompletionTokens: d.CompletionTokens,
 		CachedTokens:     d.CachedTokens,
 		Credits:          d.Credits,
+		BilledRequests:   d.BilledRequests,
 		NextResetMs:      d.NextResetMs,
 		CycleStartMs:     d.CycleStartMs,
 		CycleCredits:     d.CycleCredits,
@@ -231,10 +261,16 @@ func (d *Data) Clone() *Data {
 	}
 	cp.Account = cloneAccount(d.Account)
 	for k, v := range d.ByModel {
-		cp.ByModel[k] = &ModelStat{Model: v.Model, Total: v.Total, Success: v.Success, Failed: v.Failed}
+		cp.ByModel[k] = &ModelStat{
+			Model: v.Model, Total: v.Total, Success: v.Success, Failed: v.Failed,
+			Billed: v.Billed, Credits: v.Credits,
+		}
 	}
 	for k, v := range d.Hourly {
-		cp.Hourly[k] = &HourStat{Hour: v.Hour, Total: v.Total, Success: v.Success, Failed: v.Failed}
+		cp.Hourly[k] = &HourStat{
+			Hour: v.Hour, Total: v.Total, Success: v.Success, Failed: v.Failed,
+			Billed: v.Billed, Credits: v.Credits,
+		}
 	}
 	return cp
 }
@@ -285,7 +321,11 @@ func (r *Recorder) Record(model string, ok bool) {
 // Tokens are counted for every frame, but credits only for billable ones: a
 // frame the gateway flags billable=false was not charged to the subscription,
 // so including it would overstate consumption against the cycle allowance.
-func (r *Recorder) RecordUsage(u *Usage) {
+//
+// model labels the per-model and hourly rows, as in Record. It is passed in
+// rather than looked up from the request counter because the sink fires before
+// the handler's Record call, so the model's row may not exist yet.
+func (r *Recorder) RecordUsage(model string, u *Usage) {
 	if u == nil {
 		return
 	}
@@ -299,8 +339,32 @@ func (r *Recorder) RecordUsage(u *Usage) {
 		return
 	}
 	r.data.Credits += u.Credits
-	r.rollCycleLocked(time.Now().UnixMilli())
+	r.data.BilledRequests++
+	nowMs := time.Now().UnixMilli()
+	r.rollCycleLocked(nowMs)
 	r.data.CycleCredits += u.Credits
+
+	// Attribute credits to the model and hour; the token totals above stay
+	// account-wide, because credits are what the panel weighs against an
+	// allowance and an unattributed spend total names no culprit.
+	m := r.data.ByModel[model]
+	if m == nil {
+		m = &ModelStat{Model: model}
+		r.data.ByModel[model] = m
+	}
+	m.Billed++
+	m.Credits += u.Credits
+
+	// Reuse the timestamp from the cycle roll above, so a request landing on an
+	// hour boundary is attributed to the hour it was charged in.
+	key := time.UnixMilli(nowMs).Format(HourKeyFormat)
+	h := r.data.Hourly[key]
+	if h == nil {
+		h = &HourStat{Hour: key}
+		r.data.Hourly[key] = h
+	}
+	h.Billed++
+	h.Credits += u.Credits
 }
 
 // SetBillingCycle records the subscription boundary reported by /user/status.
@@ -634,11 +698,15 @@ func (r *Recorder) reportAt(nowMs int64) *Report {
 		CompletionTokens: r.data.CompletionTokens,
 		CachedTokens:     r.data.CachedTokens,
 		Credits:          r.data.Credits,
+		BilledRequests:   r.data.BilledRequests,
 		CycleCredits:     cycleCredits,
 		CycleStartMs:     cycleStartMs,
 		NextResetMs:      nextResetMs,
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
+	}
+	if r.data.BilledRequests > 0 {
+		rep.AvgCredits = r.data.Credits / float64(r.data.BilledRequests)
 	}
 	rep.Account = cloneAccount(r.data.Account)
 	if r.data.Total > 0 {
@@ -650,13 +718,19 @@ func (r *Recorder) reportAt(nowMs int64) *Report {
 		if m.Total > 0 {
 			rate = float64(m.Success) / float64(m.Total)
 		}
-		rep.ByModel = append(rep.ByModel, ModelRow{
+		row := ModelRow{
 			Model:       m.Model,
 			Total:       m.Total,
 			Success:     m.Success,
 			Failed:      m.Failed,
 			SuccessRate: rate,
-		})
+			Credits:     m.Credits,
+			Billed:      m.Billed,
+		}
+		if m.Billed > 0 {
+			row.AvgCredits = m.Credits / float64(m.Billed)
+		}
+		rep.ByModel = append(rep.ByModel, row)
 	}
 	sort.Slice(rep.ByModel, func(i, j int) bool {
 		if rep.ByModel[i].Total != rep.ByModel[j].Total {
@@ -675,6 +749,8 @@ func (r *Recorder) reportAt(nowMs int64) *Report {
 			row.Total = h.Total
 			row.Success = h.Success
 			row.Failed = h.Failed
+			row.Credits = h.Credits
+			row.Billed = h.Billed
 		}
 		rep.Hourly = append(rep.Hourly, row)
 	}

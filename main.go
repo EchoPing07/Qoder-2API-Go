@@ -14,6 +14,7 @@ import (
 	"qoder2api/admin"
 	"qoder2api/auth"
 	"qoder2api/bridge"
+	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
@@ -52,13 +53,19 @@ func (p *bridgeProvider) setOnPatChange(fn func()) {
 	p.mu.Unlock()
 }
 
-// resolveBridge validates the API key and returns the bridge for the current PAT.
-// Returns nil if the key is invalid or no PAT is configured.
-func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.OpenAiBridge {
-	if !p.store.ValidateKey(apiKey) {
+// resolveBridge validates the API key and returns the bridge for the current
+// PAT plus the key's metadata for request logging. Returns nil if the key is
+// invalid or no PAT is configured.
+func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
+	key, ok := p.store.LookupKey(apiKey)
+	if !ok {
 		return nil
 	}
-	return p.currentBridge()
+	b := p.currentBridge()
+	if b == nil {
+		return nil
+	}
+	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note}
 }
 
 // currentBridge returns the bridge for the current PAT, creating or recreating
@@ -195,12 +202,34 @@ func main() {
 	}
 	auth.SetStreamTimeouts(time.Duration(chatTimeout)*time.Second, time.Duration(idleTimeout)*time.Second)
 
+	// Request-log limits: env vars override the persisted config, which
+	// overrides the built-in defaults (same precedence as the timeouts above).
+	logRetention := st.GetLogRetentionDays()
+	if v := os.Getenv("QODER_LOG_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= store.MaxLogRetentionDays {
+			logRetention = n
+		} else {
+			log.Printf("[logs] WARN invalid QODER_LOG_RETENTION_DAYS=%q; using %d", v, logRetention)
+		}
+	}
+	logMaxEntries := st.GetLogMaxEntries()
+	if v := os.Getenv("QODER_LOG_MAX_ENTRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= store.MinLogMaxEntries && n <= store.MaxLogEntriesHardCap {
+			logMaxEntries = n
+		} else {
+			log.Printf("[logs] WARN invalid QODER_LOG_MAX_ENTRIES=%q; using %d", v, logMaxEntries)
+		}
+	}
+
 	provider := newBridgeProvider(st)
 
 	// Request statistics recorder with periodic persistence (30s cadence).
 	// The loop also drains a stop channel so graceful shutdown can trigger a
 	// final flush, avoiding loss of the last <=30s of stats.
 	rec := stats.NewRecorder(st)
+	// Request-log recorder: same persistence model as stats (in-memory on the
+	// request path, flushed out of band). Entries are metadata only.
+	logRec := logs.NewRecorder(st, logRetention, logMaxEntries)
 	// A PAT change invalidates the previous account's plan and allowance; drop
 	// the cached snapshot so the panel cannot keep showing it. The clear shares
 	// patWriteMu with the account loop's writes.
@@ -216,16 +245,20 @@ func main() {
 		defer close(statsDone)
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
+		flushAll := func(final bool) {
+			if err := rec.Flush(); err != nil {
+				log.Printf("[stats] WARN %sflush failed: %v", finalStr(final), err)
+			}
+			if err := logRec.Flush(); err != nil {
+				log.Printf("[logs] WARN %sflush failed: %v", finalStr(final), err)
+			}
+		}
 		for {
 			select {
 			case <-ticker.C:
-				if err := rec.Flush(); err != nil {
-					log.Printf("[stats] WARN flush failed: %v", err)
-				}
+				flushAll(false)
 			case <-statsStop:
-				if err := rec.Flush(); err != nil {
-					log.Printf("[stats] WARN final flush failed: %v", err)
-				}
+				flushAll(true)
 				return
 			}
 		}
@@ -320,7 +353,7 @@ func main() {
 	}()
 
 	// Initialize admin
-	adminInst := admin.New(st, modelFetcher, rec)
+	adminInst := admin.New(st, modelFetcher, rec, logRec)
 
 	// WebUI: pre-render all pages at startup (multi-page Alpine.js frontend,
 	// no build step, no external dependencies).
@@ -330,7 +363,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec))
+	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec, logRec))
 	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
 	mux.HandleFunc("/health", healthHandler(st))
 
@@ -393,6 +426,15 @@ func main() {
 	// Wait for the stats goroutine to finish its final flush before exiting.
 	<-statsDone
 	log.Printf("[server] stopped")
+}
+
+// finalStr labels a flush log line ("final " on shutdown) so periodic and
+// shutdown flushes stay distinguishable.
+func finalStr(final bool) string {
+	if final {
+		return "final "
+	}
+	return ""
 }
 
 // shutdown stops the background loops and drains in-flight requests. The drain

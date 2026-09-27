@@ -21,7 +21,7 @@ func TestAdminAPIAndWebUIRoutesCoexist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	adminInst := admin.New(s, func(ctx context.Context) []string { return nil }, nil)
+	adminInst := admin.New(s, func(ctx context.Context) []string { return nil }, nil, nil)
 	webHandler, err := web.New("vtest")
 	if err != nil {
 		t.Fatalf("web.New: %v", err)

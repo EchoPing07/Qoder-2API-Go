@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"qoder2api/auth"
+	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
@@ -31,7 +32,7 @@ func newAdmin(t *testing.T) (*Admin, *store.Store) {
 	mf := func(ctx context.Context) []string {
 		return models.DefaultCatalog().Keys()
 	}
-	return New(s, mf, nil), s
+	return New(s, mf, nil, nil), s
 }
 
 func doRequest(t *testing.T, handler http.HandlerFunc, method, path string, body interface{}) *httptest.ResponseRecorder {
@@ -222,7 +223,7 @@ func TestStatsEndpoint(t *testing.T) {
 	rec.Record("Qwen3.7-Max", true)
 	rec.Record("Qwen3.7-Max", false)
 	rec.Record("DeepSeek-V4-Pro", true)
-	a := New(s, mf, rec)
+	a := New(s, mf, rec, nil)
 
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 	if w.Code != 200 {
@@ -514,9 +515,9 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 		UserQuota:            &stats.Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
 		OrgResourcePackage:   &stats.OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
 	})
-	rec.RecordUsage(&stats.Usage{PromptTokens: 5, Credits: 1.25})
+	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{PromptTokens: 5, Credits: 1.25})
 
-	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 
 	var resp struct {
@@ -564,14 +565,90 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 	}
 }
 
+// The per-model and per-hour credit breakdown must reach the panel through the
+// stats endpoint; the UI renders it directly and has no other channel for it.
+func TestStatsEndpointExposesCreditBreakdown(t *testing.T) {
+	rec := stats.NewRecorder(nil)
+	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 1.5})
+	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 0.5})
+	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 3})
+	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 9, NonBillable: true})
+
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
+	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
+
+	var resp struct {
+		Credits        float64 `json:"credits"`
+		BilledRequests int64   `json:"billed_requests"`
+		AvgCredits     float64 `json:"avg_credits"`
+		ByModel        []struct {
+			Model      string  `json:"model"`
+			Credits    float64 `json:"credits"`
+			Billed     int64   `json:"billed"`
+			AvgCredits float64 `json:"avg_credits"`
+		} `json:"by_model"`
+		Hourly []struct {
+			Hour    string  `json:"hour"`
+			Credits float64 `json:"credits"`
+			Billed  int64   `json:"billed"`
+		} `json:"hourly"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.BilledRequests != 3 {
+		t.Errorf("expected 3 billed requests from the response, got %d", resp.BilledRequests)
+	}
+	// 5 credits over 3 billed frames: the non-billable 9 must be excluded from
+	// both the numerator and the denominator.
+	if want := 5.0 / 3; resp.Credits < 5-1e-9 || resp.AvgCredits < want-1e-9 || resp.AvgCredits > want+1e-9 {
+		t.Errorf("expected 5 credits at %v average, got credits=%v avg=%v", want, resp.Credits, resp.AvgCredits)
+	}
+
+	rows := map[string]float64{}
+	for _, m := range resp.ByModel {
+		rows[m.Model] = m.Credits
+		if m.Model == "Qwen3.7-Max" {
+			if m.Credits < 2-1e-9 || m.Billed != 2 {
+				t.Errorf("expected Qwen3.7-Max 2 credits over 2 billed, got %+v", m)
+			}
+			if m.AvgCredits < 1-1e-9 || m.AvgCredits > 1+1e-9 {
+				t.Errorf("expected Qwen3.7-Max average 1, got %v", m.AvgCredits)
+			}
+		}
+		if m.Model == "Kimi-K2.7-Code" && (m.Credits < 3-1e-9 || m.Billed != 1) {
+			t.Errorf("expected Kimi-K2.7-Code 3 credits over 1 billed (non-billable dropped), got %+v", m)
+		}
+	}
+	if _, ok := rows["Kimi-K2.7-Code"]; !ok {
+		t.Errorf("Kimi-K2.7-Code row missing from by_model: %+v", resp.ByModel)
+	}
+
+	// The current hour bucket must carry the attributed spend for the chart tip.
+	key := time.Now().Format(stats.HourKeyFormat)
+	found := false
+	for _, h := range resp.Hourly {
+		if h.Hour != key {
+			continue
+		}
+		found = true
+		if h.Credits < 5-1e-9 || h.Billed != 3 {
+			t.Errorf("expected the current hour to carry 5 credits over 3 billed, got %+v", h)
+		}
+	}
+	if !found {
+		t.Errorf("the current hour %s is missing from hourly: %+v", key, resp.Hourly)
+	}
+}
+
 // With no account status ever resolved the cycle fields stay zero and the
 // account is omitted, which is what makes the UI fall back to the lifetime
 // total instead of rendering a bogus "resetting soon".
 func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	rec.RecordUsage(&stats.Usage{Credits: 2})
+	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 2})
 
-	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec)
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 
 	var resp struct {
@@ -591,5 +668,210 @@ func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
 	}
 	if resp.Account != nil {
 		t.Errorf("expected account to be omitted, got %+v", resp.Account)
+	}
+}
+
+// -- Logs --
+
+func TestLogsEndpoint(t *testing.T) {
+	s := tempStore(t)
+	rec := logs.NewRecorder(nil, 90, 2000)
+	rec.Record(&logs.LogEntry{KeyID: "k1", KeyNote: "dev", Model: "Qwen3.7-Max", StatusCode: 200, TotalTokens: 42})
+	rec.Record(&logs.LogEntry{KeyID: "k2", Model: "DeepSeek-V4-Pro", StatusCode: 502, ErrorMsg: "upstream: boom"})
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+
+	w := doRequest(t, a.handleLogs, "GET", "/admin/api/logs", nil)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Logs     []logs.LogEntry `json:"logs"`
+		Total    int             `json:"total"`
+		Page     int             `json:"page"`
+		PageSize int             `json:"page_size"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.Total != 2 || len(resp.Logs) != 2 {
+		t.Fatalf("total=%d len=%d, want 2/2", resp.Total, len(resp.Logs))
+	}
+	// Newest first
+	if resp.Logs[0].Model != "DeepSeek-V4-Pro" {
+		t.Errorf("newest entry = %s, want DeepSeek-V4-Pro", resp.Logs[0].Model)
+	}
+	if resp.Logs[1].KeyNote != "dev" || resp.Logs[1].TotalTokens != 42 {
+		t.Errorf("entry metadata lost: %+v", resp.Logs[1])
+	}
+	if resp.Page != 1 || resp.PageSize != 20 {
+		t.Errorf("page=%d page_size=%d, want 1/20", resp.Page, resp.PageSize)
+	}
+}
+
+func TestLogsEndpointFilters(t *testing.T) {
+	s := tempStore(t)
+	rec := logs.NewRecorder(nil, 90, 2000)
+	rec.Record(&logs.LogEntry{KeyID: "k1", Model: "Qwen3.7-Max", StatusCode: 200})
+	rec.Record(&logs.LogEntry{KeyID: "k2", Model: "Qwen3.7-Max", StatusCode: 429, ErrorMsg: "busy"})
+	rec.Record(&logs.LogEntry{KeyID: "k1", Model: "DeepSeek-V4-Pro", StatusCode: 200})
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+
+	get := func(qs string) int {
+		w := doRequest(t, a.handleLogs, "GET", "/admin/api/logs"+qs, nil)
+		if w.Code != 200 {
+			t.Fatalf("GET %s: code %d: %s", qs, w.Code, w.Body.String())
+		}
+		var resp struct {
+			Logs  []logs.LogEntry `json:"logs"`
+			Total int             `json:"total"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("GET %s: bad JSON: %v", qs, err)
+		}
+		return resp.Total
+	}
+	if got := get("?model=deepseek"); got != 1 {
+		t.Errorf("model filter: total = %d, want 1", got)
+	}
+	if got := get("?key_id=k1"); got != 2 {
+		t.Errorf("key filter: total = %d, want 2", got)
+	}
+	if got := get("?status=error"); got != 1 {
+		t.Errorf("error filter: total = %d, want 1", got)
+	}
+	if got := get("?status=429"); got != 1 {
+		t.Errorf("status filter: total = %d, want 1", got)
+	}
+	if got := get("?status=bogus"); got != 3 {
+		t.Errorf("invalid status filter must be ignored: total = %d, want 3", got)
+	}
+	if got := get("?page=9&page_size=1"); got != 3 {
+		t.Errorf("out-of-range page still reports full total: got %d, want 3", got)
+	}
+}
+
+func TestLogsEndpointNilRecorder(t *testing.T) {
+	a, _ := newAdmin(t) // log recorder is nil
+	w := doRequest(t, a.handleLogs, "GET", "/admin/api/logs", nil)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	// An empty list must serialize as [] (not null) for the frontend.
+	if !strings.Contains(w.Body.String(), `"logs":[]`) {
+		t.Errorf("expected empty logs array, got: %s", w.Body.String())
+	}
+}
+
+func TestLogsEndpointMethodNotAllowed(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleLogs, "POST", "/admin/api/logs", nil)
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestLogsRequireAuth(t *testing.T) {
+	s := tempStore(t)
+	a := New(s, nil, nil, nil)
+	mux := http.NewServeMux()
+	a.RegisterRoutes(mux)
+
+	req := httptest.NewRequest("GET", "/admin/api/logs", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 401 {
+		t.Errorf("expected 401 without a session, got %d", w.Code)
+	}
+}
+
+// -- Config: log limits --
+
+func TestConfigLogLimitsRoundTrip(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "", "port": 0, "log_retention_days": 30, "log_max_entries": 500,
+	})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := s.GetLogRetentionDays(); got != 30 {
+		t.Errorf("retention = %d, want 30", got)
+	}
+	if got := s.GetLogMaxEntries(); got != 500 {
+		t.Errorf("max entries = %d, want 500", got)
+	}
+
+	// GET reports the persisted limits.
+	w = doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["log_retention_days"] != float64(30) || resp["log_max_entries"] != float64(500) {
+		t.Errorf("GET config log fields = %v/%v, want 30/500", resp["log_retention_days"], resp["log_max_entries"])
+	}
+
+	// Legacy callers that omit the fields keep the current values.
+	w = doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{"host": "", "port": 0})
+	if w.Code != 200 {
+		t.Fatalf("legacy save: code %d: %s", w.Code, w.Body.String())
+	}
+	if got := s.GetLogRetentionDays(); got != 30 {
+		t.Errorf("retention after legacy save = %d, want 30", got)
+	}
+}
+
+func TestConfigLogLimitsHotApplyToRecorder(t *testing.T) {
+	s := tempStore(t)
+	rec := logs.NewRecorder(nil, 90, 2000)
+	for i := 0; i < logs.MinMaxEntries+20; i++ {
+		rec.Record(&logs.LogEntry{Model: "m", CreatedAt: time.Now().Unix()})
+	}
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "", "port": 0, "log_max_entries": logs.MinMaxEntries,
+	})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// The lowered cap must prune the live recorder immediately.
+	if got := rec.Len(); got != logs.MinMaxEntries {
+		t.Errorf("recorder len after lowering cap = %d, want %d", got, logs.MinMaxEntries)
+	}
+}
+
+func TestConfigLogLimitsValidation(t *testing.T) {
+	a, _ := newAdmin(t)
+	for _, body := range []map[string]interface{}{
+		{"host": "", "port": 0, "log_retention_days": 0}, // 0 is fine (keep current)
+		{"host": "", "port": 0, "log_retention_days": -5},
+		{"host": "", "port": 0, "log_retention_days": 99999},
+		{"host": "", "port": 0, "log_max_entries": 10},
+		{"host": "", "port": 0, "log_max_entries": 999999},
+	} {
+		w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", body)
+		// 0 means "keep current" and must be accepted; other out-of-range
+		// values must be rejected with 400.
+		if body["log_retention_days"] == 0 && body["log_max_entries"] == nil {
+			if w.Code != 200 {
+				t.Errorf("body %v: code %d, want 200", body, w.Code)
+			}
+			continue
+		}
+		if w.Code != 400 {
+			t.Errorf("body %v: code %d, want 400 (%s)", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestConfigLogLimitsEnvPinned(t *testing.T) {
+	t.Setenv("QODER_LOG_RETENTION_DAYS", "7")
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": "", "port": 0, "log_retention_days": 30,
+	})
+	if w.Code != 400 {
+		t.Errorf("expected 400 when env pins log limits, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "QODER_LOG_RETENTION_DAYS") {
+		t.Errorf("error should name the pinning env var: %s", w.Body.String())
 	}
 }

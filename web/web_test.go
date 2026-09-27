@@ -112,9 +112,9 @@ func TestLoginPageStructure(t *testing.T) {
 	}
 }
 
-// TestPagesRendered 每页都应渲染出完整 HTML：含 data-page、标题、5 个 view 容器。
+// TestPagesRendered 每页都应渲染出完整 HTML：含 data-page、标题、全部 view 容器。
 //
-// 文档内常驻全部页面（软导航只切 .view 显隐，不重载文档），因此每份 HTML 都含 5 个
+// 文档内常驻全部页面（软导航只切 .view 显隐，不重载文档），因此每份 HTML 都含全部
 // <section class="space">；各页 <title> / data-page 仍然各自正确，深链与刷新不受影响。
 func TestPagesRendered(t *testing.T) {
 	h, _ := newTestRouter(t)
@@ -228,7 +228,8 @@ func TestMountRoutes(t *testing.T) {
 		{http.MethodGet, "/admin", http.StatusOK, ""},
 		{http.MethodGet, "/admin/keys", http.StatusOK, ""},
 		{http.MethodGet, "/admin/token", http.StatusOK, ""},
-		{http.MethodGet, "/admin/models", http.StatusOK, ""},
+		// 模型页已移除：模型列表迁入统计页，旧 URL 不再有页面（落到根处理器的 404）
+		{http.MethodGet, "/admin/models", http.StatusNotFound, ""},
 		{http.MethodGet, "/admin/settings", http.StatusOK, ""},
 		// 尾斜杠与首页别名：308 到规范 URL，保证每个页面只有一个规范路径
 		{http.MethodGet, "/admin/", http.StatusPermanentRedirect, "/admin"},
@@ -500,18 +501,75 @@ func TestPageJSRegistered(t *testing.T) {
 	}
 }
 
-// TestEmbedShape 内嵌文件清单稳定：shell + 5 页 + 3 资源 + 5 页脚本。
+// TestEmbedShape 内嵌文件清单稳定：shell + 每页 HTML + 每页脚本。
 func TestEmbedShape(t *testing.T) {
 	if _, err := fs.ReadFile(pageFS, "shell.html"); err != nil {
 		t.Fatalf("读取 shell.html: %v", err)
 	}
-	for _, k := range []string{"stats", "keys", "token", "models", "settings"} {
-		if _, err := fs.ReadFile(pageFS, "pages/"+k+".html"); err != nil {
-			t.Errorf("缺少 pages/%s.html: %v", k, err)
+	for _, p := range pages {
+		if _, err := fs.ReadFile(pageFS, "pages/"+p.key+".html"); err != nil {
+			t.Errorf("缺少 pages/%s.html: %v", p.key, err)
 		}
-		if _, err := fs.ReadFile(assetFS, "assets/pages/"+k+".js"); err != nil {
-			t.Errorf("缺少 assets/pages/%s.js: %v", k, err)
+		if _, err := fs.ReadFile(assetFS, "assets/pages/"+p.key+".js"); err != nil {
+			t.Errorf("缺少 assets/pages/%s.js: %v", p.key, err)
 		}
+	}
+}
+
+// TestMovedModelsAndTier 面板结构调整的回归：模型列表迁入统计页（点击复制语义不变），账号
+// 等级徽标移到令牌页，令牌页提供跳转 Qoder 集成页的创建令牌链接。断言基于页面源文件——
+// 每份文档都内嵌全部 view，对渲染产物断言「不存在」定位不到具体页面。
+func TestMovedModelsAndTier(t *testing.T) {
+	read := func(fsys fs.FS, name string) string {
+		t.Helper()
+		b, err := fs.ReadFile(fsys, name)
+		if err != nil {
+			t.Fatalf("读取 %s: %v", name, err)
+		}
+		return string(b)
+	}
+
+	// 模型页确实已移除（页面与页面层脚本都不再内嵌；/admin/models 的 404 见 TestMountRoutes）
+	for _, f := range []struct {
+		fsys fs.FS
+		name string
+	}{{pageFS, "pages/models.html"}, {assetFS, "assets/pages/models.js"}} {
+		if _, err := fs.ReadFile(f.fsys, f.name); err == nil {
+			t.Errorf("%s 应已移除（模型列表迁入统计页）", f.name)
+		}
+	}
+
+	stats := read(pageFS, "pages/stats.html")
+	for _, want := range []string{
+		`<h3>模型列表</h3>`,
+		`x-text="models.models.length + ' 个模型'"`,
+		`@click="copy(m)"`, // 点击卡片复制模型名的既有行为
+	} {
+		if !strings.Contains(stats, want) {
+			t.Errorf("统计页缺少迁入的模型列表元素 %s", want)
+		}
+	}
+	if strings.Contains(stats, `x-text="accountTag"`) {
+		t.Error("统计页不应再显示账号等级徽标（已移至令牌页）")
+	}
+
+	token := read(pageFS, "pages/token.html")
+	if !strings.Contains(token, `x-text="accountTag"`) {
+		t.Error("令牌页缺少账号等级徽标")
+	}
+	if !strings.Contains(token, `href="https://qoder.cn/account/integrations"`) {
+		t.Error("令牌页缺少跳转 Qoder 集成页创建令牌的链接")
+	}
+
+	// 令牌页要渲染等级徽标，其 load() 必须拉取 stats 快照（徽标数据源）
+	tokenJS := read(assetFS, "assets/pages/token.js")
+	if !strings.Contains(tokenJS, "this.loadStats()") {
+		t.Error("令牌页 load() 必须加载 stats 快照（等级徽标的数据源）")
+	}
+	// 模型列表迁入统计页后，其加载动作随之迁到 stats 页面层
+	statsJS := read(assetFS, "assets/pages/stats.js")
+	if !strings.Contains(statsJS, "this.loadModels()") {
+		t.Error("统计页 load() 必须加载模型列表（模型页已移除）")
 	}
 }
 
@@ -589,6 +647,71 @@ func TestQuotaSummaryOnlyCountsAvailablePools(t *testing.T) {
 	}
 }
 
+// The stats page must show what this service itself was charged, apart from the
+// account-wide pools (which include IDE/CLI traffic). The average divides by
+// billed_requests, not the request counter, which holds failures and uncharged
+// calls too.
+func TestStatsPageShowsActualCreditSpend(t *testing.T) {
+	src := statsPageJS(t)
+	for _, want := range []string{
+		"get totalCredits()", "get cycleCredits()", "get billedCount()", "get avgCredits()",
+		"get shownCredits()", "get creditsDetail()",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("本服务实际消耗需要 %s", want)
+		}
+	}
+	// 计数与均值必须取 billed_requests / avg_credits（服务端已按计费帧算好），
+	// 不能拿 total（含失败、未计费、无 usage 帧）当分母。
+	if !strings.Contains(src, "(this.stats||{}).billed_requests") {
+		t.Error("billedCount 必须读 billed_requests")
+	}
+	if !strings.Contains(src, "(this.stats||{}).avg_credits") {
+		t.Error("avgCredits 必须读服务端的 avg_credits")
+	}
+
+	h, _ := newTestRouter(t)
+	html := string(h.pages["stats"].HTML)
+	if !strings.Contains(html, "实际消耗 Credits") {
+		t.Error("统计页缺少「实际消耗 Credits」卡片")
+	}
+	if !strings.Contains(html, `fmtCredits(shownCredits)`) {
+		t.Error("实际消耗卡片必须以 shownCredits 渲染主体数字")
+	}
+	// 模型表必须分别展示消耗与平均：只有总量无法定位是哪个模型在花钱。
+	for _, want := range []string{`fmtCredits(m.credits)`, `fmtCredits(m.avg_credits)`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("按模型统计缺少消耗列 %s", want)
+		}
+	}
+}
+
+// A freshly rolled cycle legitimately holds 0 credits, so the card must pick the
+// cycle figure by the presence of a boundary, not by a non-zero total:
+// `cycle > 0 ? cycle : lifetime` would read as if the reset never happened.
+func TestStatsPageCycleSelectionDoesNotFallBackOnZero(t *testing.T) {
+	src := statsPageJS(t)
+	guard := "return this.hasCycle ? this.cycleCredits : this.totalCredits;"
+	if !strings.Contains(src, guard) {
+		t.Errorf("实际消耗必须是按周期边界选择口径；缺少 %q", guard)
+	}
+	for _, dead := range []string{"cycle_credits > 0 ?", "cycle > 0 ?"} {
+		if strings.Contains(src, dead) {
+			t.Errorf("零消耗周期不得回退到累计值（死分支 %q）", dead)
+		}
+	}
+}
+
+// An older build's snapshot carries credits but no billed count, so the card
+// must name the missing metric instead of reading "暂无计费请求" directly above
+// a non-zero total.
+func TestStatsPageExplainsLegacyDataWithoutBilledCount(t *testing.T) {
+	src := statsPageJS(t)
+	if !strings.Contains(src, "this.totalCredits > 0 ? '计费次数与均值自本版起统计'") {
+		t.Error("升级前的数据（只有 credits、无计费次数）必须说明口径，不得报「暂无计费请求」")
+	}
+}
+
 // fmtCredits never returns a negative string and total comes from
 // Number(pool.quota[...] || 0), so a '—' fallback branch for the total cell
 // would be dead code. The cell must render fmtCredits(p.total) directly
@@ -620,7 +743,7 @@ const loads = [];
 let navLinks = [];
 function makeNavLinks() {
   return [['/admin', ' 统计 '], ['/admin/keys', ' 密钥 '], ['/admin/token', ' 令牌 '],
-          ['/admin/models', ' 模型 '], ['/admin/settings', ' 设置 ']].map(function (p) {
+          ['/admin/logs', ' 日志 '], ['/admin/settings', ' 设置 ']].map(function (p) {
     return { getAttribute: function () { return p[0]; }, textContent: p[1] };
   });
 }
@@ -667,6 +790,7 @@ function count(name) { return loads.filter(function (x) { return x === name; }).
 inst.afterLogin();
 if (count('enter:stats') !== 1) fail('首屏页 stats 应恰好进场一次');
 if (count('loadStats') !== 1) fail('首屏页 stats 的 load() 未把数据请求发出去');
+if (count('loadModels') !== 1) fail('首屏页 stats 的 load() 未把模型列表请求发出去（模型页已迁入统计页）');
 
 // 2) 切页：目标页进场一次，view 切换，URL 换成 /admin/<key>，移动端侧栏收起
 inst.mobileNav = true;
@@ -683,18 +807,18 @@ if (count('enter:stats') !== 1) fail('切回已进场页时重复进场');
 
 // 4) 前进/后退：换页时同样收起侧栏并让未进场页进场
 inst.mobileNav = true;
-inst.onPop({ state: { view: 'models' } });
-if (inst.view !== 'models') fail('onPop 未切换 view');
-if (count('enter:models') !== 1) fail('onPop 到未进场页时应进场');
+inst.onPop({ state: { view: 'logs' } });
+if (inst.view !== 'logs') fail('onPop 未切换 view');
+if (count('enter:logs') !== 1) fail('onPop 到未进场页时应进场');
 if (inst.mobileNav !== false) fail('onPop 换页时未收起移动端侧栏');
 
 // 5) 页名映射：壳层不在 DOM 时的空采集不得写入缓存（写入后不再更新）
 inst._titles = undefined;
 navLinks = [];
-inst.applyTitle('models');           // 空采集：不应写入 _titles
+inst.applyTitle('logs');            // 空采集：不应写入 _titles
 navLinks = makeNavLinks();
-inst.applyTitle('models');
-if (!/模型$/.test(document.title)) {
+inst.applyTitle('logs');
+if (!/日志$/.test(document.title)) {
   fail('空采集污染了页名映射，标题不再更新: ' + document.title);
 }
 inst.navigate('settings');         // 常规软导航也要更新标题

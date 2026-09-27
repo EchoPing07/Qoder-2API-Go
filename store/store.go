@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"qoder2api/logs"
 	"qoder2api/stats"
 )
 
@@ -35,6 +36,15 @@ type Config struct {
 	Password string      `json:"password"`
 	APIKeys  []APIKey    `json:"api_keys"`
 	Stats    *stats.Data `json:"stats,omitempty"`
+	// Logs is the persisted request-log ring (metadata only), flushed out of
+	// band by the logs recorder — the JSON equivalent of Buddy-2API's logs
+	// table.
+	Logs []logs.LogEntry `json:"logs,omitempty"`
+	// Request-log limits: RetentionDays bounds how long entries live,
+	// MaxEntries the slice length, so data.json (rewritten on every flush)
+	// cannot grow without limit.
+	LogRetentionDays int `json:"log_retention_days"`
+	LogMaxEntries    int `json:"log_max_entries"`
 	// ChatTimeoutSeconds bounds how long the upstream chat stream may take
 	// to start responding (time to response headers). IdleTimeoutSeconds
 	// bounds how long an established SSE stream may stay silent.
@@ -61,6 +71,32 @@ const (
 	MaxIdleTimeoutSeconds     = 3600
 )
 
+// Request-log limits mirrored from the logs package, so callers that only see
+// the store (admin config validation) need no logs import.
+const (
+	DefaultLogRetentionDays = logs.DefaultRetentionDays
+	MaxLogRetentionDays     = logs.MaxRetentionDays
+	DefaultLogMaxEntries    = logs.DefaultMaxEntries
+	MinLogMaxEntries        = logs.MinMaxEntries
+	MaxLogEntriesHardCap    = logs.MaxEntriesHardCap
+)
+
+// ValidateLogRetentionDays checks that n is a usable retention in days.
+func ValidateLogRetentionDays(n int) error {
+	if n < 1 || n > MaxLogRetentionDays {
+		return fmt.Errorf("日志保留天数需在 1-%d 之间", MaxLogRetentionDays)
+	}
+	return nil
+}
+
+// ValidateLogMaxEntries checks that n is a usable entry cap.
+func ValidateLogMaxEntries(n int) error {
+	if n < MinLogMaxEntries || n > MaxLogEntriesHardCap {
+		return fmt.Errorf("日志条数上限需在 %d-%d 之间", MinLogMaxEntries, MaxLogEntriesHardCap)
+	}
+	return nil
+}
+
 // ValidateTimeoutSeconds checks that n is a usable timeout in seconds.
 func ValidateTimeoutSeconds(n, max int) error {
 	if n < 1 || n > max {
@@ -86,6 +122,8 @@ func New(filePath string) (*Store, error) {
 			Port:               DefaultPort,
 			ChatTimeoutSeconds: DefaultChatTimeoutSeconds,
 			IdleTimeoutSeconds: DefaultIdleTimeoutSeconds,
+			LogRetentionDays:   DefaultLogRetentionDays,
+			LogMaxEntries:      DefaultLogMaxEntries,
 			APIKeys:            []APIKey{},
 		},
 	}
@@ -133,6 +171,14 @@ func (s *Store) load() error {
 	}
 	if cfg.IdleTimeoutSeconds <= 0 {
 		cfg.IdleTimeoutSeconds = DefaultIdleTimeoutSeconds
+		needsSave = true
+	}
+	if cfg.LogRetentionDays <= 0 {
+		cfg.LogRetentionDays = DefaultLogRetentionDays
+		needsSave = true
+	}
+	if cfg.LogMaxEntries <= 0 {
+		cfg.LogMaxEntries = DefaultLogMaxEntries
 		needsSave = true
 	}
 	// Clamp out-of-range values (hand-edited files, older versions) instead
@@ -318,6 +364,80 @@ func (s *Store) SaveStats(d *stats.Data) error {
 	return s.save()
 }
 
+// --- Request Logs ---
+
+// LoadLogs returns a copy of the persisted request-log entries, or nil if
+// none exist — copied so the caller never aliases the marshaled slice.
+func (s *Store) LoadLogs() []logs.LogEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.config.Logs) == 0 {
+		return nil
+	}
+	return append([]logs.LogEntry(nil), s.config.Logs...)
+}
+
+// SaveLogs persists the request-log entries into the config file.
+func (s *Store) SaveLogs(entries []logs.LogEntry) error {
+	s.mu.Lock()
+	s.config.Logs = entries
+	s.mu.Unlock()
+	return s.save()
+}
+
+// GetLogRetentionDays returns the configured log retention in days
+// (0-normalized to the default; clamped to the max).
+func (s *Store) GetLogRetentionDays() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if n := s.config.LogRetentionDays; n > 0 {
+		if n > MaxLogRetentionDays {
+			return MaxLogRetentionDays
+		}
+		return n
+	}
+	return DefaultLogRetentionDays
+}
+
+// SetLogRetentionDays validates and persists the log retention in days.
+func (s *Store) SetLogRetentionDays(n int) error {
+	if err := ValidateLogRetentionDays(n); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.config.LogRetentionDays = n
+	s.mu.Unlock()
+	return s.save()
+}
+
+// GetLogMaxEntries returns the configured log entry cap
+// (0-normalized to the default; clamped into its valid range).
+func (s *Store) GetLogMaxEntries() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if n := s.config.LogMaxEntries; n > 0 {
+		if n < MinLogMaxEntries {
+			return MinLogMaxEntries
+		}
+		if n > MaxLogEntriesHardCap {
+			return MaxLogEntriesHardCap
+		}
+		return n
+	}
+	return DefaultLogMaxEntries
+}
+
+// SetLogMaxEntries validates and persists the log entry cap.
+func (s *Store) SetLogMaxEntries(n int) error {
+	if err := ValidateLogMaxEntries(n); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.config.LogMaxEntries = n
+	s.mu.Unlock()
+	return s.save()
+}
+
 // --- API Keys ---
 
 // ListKeys returns a copy of all API keys.
@@ -397,6 +517,21 @@ func (s *Store) ValidateKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// LookupKey returns the metadata (ID, note) of the given key and whether it
+// exists. Comparison is constant-time, as in ValidateKey: the key material is
+// a secret and must not leak through early-exit timing either.
+func (s *Store) LookupKey(key string) (APIKey, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	kb := []byte(key)
+	for _, k := range s.config.APIKeys {
+		if subtle.ConstantTimeCompare([]byte(k.Key), kb) == 1 {
+			return k, true
+		}
+	}
+	return APIKey{}, false
 }
 
 // --- Generators ---

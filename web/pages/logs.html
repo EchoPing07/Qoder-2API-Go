@@ -1,0 +1,59 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>日志</h1>
+          <div class="page-actions">
+            <span class="muted-xs">仅记录请求元信息（模型、密钥、用量、状态与错误），不保存对话内容</span>
+            <span class="muted-xs" x-text="'共 ' + fmt(logTotal) + ' 条'"></span>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="filters">
+            <input class="input input-sm" style="width:170px" x-model="logFilter.model" @input="loadLogsDebounced()" placeholder="模型（模糊匹配）">
+            <select class="select select-sm" style="width:150px" x-model="logFilter.key_id" @change="loadLogs(1)">
+              <option value="">全部密钥</option>
+              <template x-for="k in keys" :key="k.id"><option :value="k.id" x-text="k.note || k.id"></option></template>
+            </select>
+            <select class="select select-sm" style="width:130px" x-model="logFilter.status" @change="loadLogs(1)">
+              <option value="">全部状态</option>
+              <option value="error">仅失败</option>
+              <option value="200">200</option>
+              <option value="400">400</option>
+              <option value="429">429</option>
+              <option value="499">499</option>
+              <option value="500">500</option>
+              <option value="502">502</option>
+            </select>
+          </div>
+
+          <div class="table-wrap" x-show="logs.length">
+            <table>
+              <thead><tr><th>时间</th><th>模型</th><th>密钥</th><th>流式</th><th>输入 / 输出 / 总计</th><th>消耗</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
+              <tbody>
+                <template x-for="l in logs" :key="l.id">
+                  <tr>
+                    <td class="muted-xs" x-text="ts(l.created_at,true)"></td>
+                    <td><span class="mono" x-text="l.model||'—'"></span></td>
+                    <td class="muted-xs" x-text="l.key_note || l.key_id || '—'"></td>
+                    <td class="muted-xs" x-text="l.stream?'流式':'—'"></td>
+                    <td class="muted-xs mono" x-text="(l.prompt_tokens||0)+' / '+(l.completion_tokens||0)+' / '+(l.total_tokens||0)"></td>
+                    <td class="muted-xs" x-text="l.credits?fmtCredits(l.credits):''"></td>
+                    <td class="muted-xs" x-text="l.duration_ms!=null&&l.duration_ms>0?l.duration_ms+'ms':''"></td>
+                    <td><span class="badge" :class="l.status_code>=400?'badge-err':'badge-ok'" x-text="l.status_code||'—'"></span></td>
+                    <td class="muted-xs wrap" style="max-width:260px" :title="l.error_msg" x-text="l.error_msg"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!logs.length">
+            <span class="ic ic-lg" x-html="ic('logs')"></span>暂无日志，请求处理完成后会自动记录
+          </div>
+
+          <div class="pager" x-show="logTotal>0">
+            <button class="btn btn-ghost btn-icon btn-sm" @click="loadLogs(logPage-1)" :disabled="logPage<=1" x-html="ic('chevronL')"></button>
+            <span x-text="logPage+' / '+Math.max(1,Math.ceil(logTotal/logPageSize))+' 页'"></span>
+            <button class="btn btn-ghost btn-icon btn-sm" @click="loadLogs(logPage+1)" :disabled="logPage>=Math.ceil(logTotal/logPageSize)" x-html="ic('chevronR')"></button>
+          </div>
+        </div>
+      </section>

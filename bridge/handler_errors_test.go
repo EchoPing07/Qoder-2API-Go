@@ -39,7 +39,7 @@ func TestChatRouteStreamUpstreamRejectionReturnsRealStatus(t *testing.T) {
 			}
 			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: retryAfter}
 			b := newRejectingBridge(t, gw)
-			handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 			req := httptest.NewRequest("POST", "/v1/chat/completions",
 				strings.NewReader(`{"model":"Fake-Model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
@@ -71,7 +71,7 @@ func TestChatRouteStreamErrorAfterContentKeepsSSE(t *testing.T) {
 		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "partial"}}}}),
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
@@ -101,7 +101,7 @@ func TestChatRouteStreamErrorAfterContentKeepsSSE(t *testing.T) {
 func TestChatRouteMapsUpstreamAuthErrorTo502(t *testing.T) {
 	gw := &rejectingGateway{status: 401, body: `{"code":"401","message":"session token expired"}`}
 	b := newRejectingBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -127,7 +127,7 @@ func TestChatRouteMapsUpstreamAuthErrorTo502(t *testing.T) {
 func TestChatRouteForwardsNumbersVerbatimThroughDecoder(t *testing.T) {
 	gw := &fakeGateway{chatLines: []string{"data: [DONE]"}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],`+
@@ -220,7 +220,7 @@ func TestHandleChatForwardsMaxThinkingTokens(t *testing.T) {
 	// Type errors are a local 400, not a silent drop.
 	gw := &fakeGateway{chatLines: []string{"data: [DONE]"}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","max_thinking_tokens":"2048","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")

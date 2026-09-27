@@ -9,7 +9,7 @@
           </div>
         </header>
 
-        <div class="grid metrics-4">
+        <div class="grid metrics-5">
           <article class="metric">
             <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total)"></div>
@@ -20,12 +20,17 @@
               <span class="metric-label">Token 总数</span>
               <span class="row" style="gap:6px">
                 <span class="badge badge-err" x-show="accountExceeded">额度已超</span>
-                <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
                 <span class="ic" x-html="ic('type')"></span>
               </span>
             </header>
             <div class="metric-value" x-text="fmt(totalTokens)"></div>
             <p class="metric-detail" :title="creditsTitle" x-text="creditsHeadline"></p>
+          </article>
+          <!-- 实际消耗：本服务 usage 帧累加的真实扣费，与官方额度池（含其它客户端）分开呈现 -->
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">实际消耗 Credits</span><span class="ic" x-html="ic('dollar')"></span></header>
+            <div class="metric-value" x-text="fmtCredits(shownCredits)"></div>
+            <p class="metric-detail" :title="creditsTitle" x-text="creditsDetail"></p>
           </article>
           <article class="metric">
             <header class="metric-head"><span class="metric-label">总输入</span><span class="ic" x-html="ic('download')"></span></header>
@@ -70,24 +75,54 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h3>近 24 小时请求量</h3>
-            <div class="spacer"></div>
-            <div class="legend">
-              <span class="lg lg-bar"><i style="background:var(--chart-bar-hl)"></i>成功</span>
-              <span class="lg"><i style="background:var(--err-fg)"></i>失败</span>
-              <span class="muted-xs" x-text="hourlyPeak"></span>
+        <!-- 图表 + 模型列表并排：≥1024 按 3:2 分栏，窄屏单列堆叠 -->
+        <div class="grid charts">
+          <div class="card">
+            <div class="card-head">
+              <h3>近 24 小时请求量</h3>
+              <div class="spacer"></div>
+              <div class="legend">
+                <span class="lg lg-bar"><i style="background:var(--chart-bar-hl)"></i>成功</span>
+                <span class="lg"><i style="background:var(--err-fg)"></i>失败</span>
+                <span class="muted-xs" x-text="hourlyPeak"></span>
+              </div>
             </div>
+            <div id="chartHourly" class="chart-box"></div>
           </div>
-          <div id="chartHourly" class="chart-box"></div>
+
+          <!-- 模型列表（自「模型」页迁入）：点击卡片复制模型名 -->
+          <div class="card">
+            <div class="card-head">
+              <h3>模型列表</h3>
+              <span class="muted-xs">点击卡片复制名称</span>
+              <div class="spacer"></div>
+              <span class="muted-xs" x-show="!models.loading && models.models.length" x-text="models.models.length + ' 个模型'"></span>
+            </div>
+            <div x-show="!models.loading && models.models.length">
+              <div class="model-chips">
+                <template x-for="m in models.models" :key="m">
+                  <span class="model-chip" style="cursor:pointer" role="button" tabindex="0" @click="copy(m)" @keydown.enter.prevent="copy(m)" :title="'点击复制：' + m">
+                    <span class="model-chip-name" x-text="m"></span>
+                    <span class="ic ic-sm" style="color:var(--muted-fg)" x-html="ic('copy')"></span>
+                  </span>
+                </template>
+              </div>
+            </div>
+            <div class="empty" x-show="!models.loading && !models.models.length">
+              <span class="ic ic-lg" x-html="ic('box')"></span>暂无可用模型
+            </div>
+            <div class="empty" x-show="models.loading"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+          </div>
         </div>
 
         <div class="card">
-          <div class="card-head"><h3>按模型统计</h3></div>
+          <div class="card-head">
+            <h3>按模型统计</h3>
+            <span class="muted-xs">消耗为本服务实际扣费（仅计费帧），平均为每次计费请求</span>
+          </div>
           <div class="table-wrap" x-show="(stats.by_model||[]).length">
             <table>
-              <thead><tr><th>模型</th><th style="text-align:right">请求</th><th style="text-align:right">成功</th><th style="text-align:right">失败</th><th style="width:200px">成功率</th></tr></thead>
+              <thead><tr><th>模型</th><th style="text-align:right">请求</th><th style="text-align:right">成功</th><th style="text-align:right">失败</th><th style="width:200px">成功率</th><th style="text-align:right">消耗</th><th style="text-align:right">平均</th></tr></thead>
               <tbody>
                 <template x-for="m in (stats.by_model||[])" :key="m.model">
                   <tr>
@@ -101,6 +136,8 @@
                         <span class="muted-xs" style="min-width:44px;text-align:right" x-text="pctStr(m.success_rate)"></span>
                       </div>
                     </td>
+                    <td style="text-align:right" x-text="fmtCredits(m.credits)"></td>
+                    <td style="text-align:right" class="muted-xs" x-text="m.billed > 0 ? fmtCredits(m.avg_credits) : '—'"></td>
                   </tr>
                 </template>
               </tbody>

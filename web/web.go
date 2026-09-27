@@ -15,10 +15,10 @@
 //
 // 路由布局（全部挂在 /admin 命名空间下，与 /admin/api/* 管理端点并行）：
 //
-//	/admin          统计页（命名空间根，页面清单首项）
+//	/admin          统计页（命名空间根，页面清单首项；模型列表亦在此页）
 //	/admin/keys     密钥页
-//	/admin/token    令牌页
-//	/admin/models   模型页
+//	/admin/token    令牌页（PAT 配置 + 账号等级徽标）
+//	/admin/logs     日志页
 //	/admin/settings 设置页
 //	/admin/assets/* 静态资源
 //
@@ -69,7 +69,7 @@ var pages = []pageDef{
 	{key: "stats", title: "统计", icon: "dashboard"},
 	{key: "keys", title: "密钥", icon: "keys"},
 	{key: "token", title: "令牌", icon: "token"},
-	{key: "models", title: "模型", icon: "box"},
+	{key: "logs", title: "日志", icon: "logs"},
 	{key: "settings", title: "设置", icon: "settings"},
 }
 

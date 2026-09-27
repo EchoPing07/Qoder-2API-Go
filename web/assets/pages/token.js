@@ -21,6 +21,7 @@ PAGE('token', {
     })();
   },
 
-  /* ── 进场：本页所需数据 ── */
-  load(){ this.loadPAT(); },
+  /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
+   * 不参与统计页的定时刷新） ── */
+  load(){ this.loadPAT(); this.loadStats(); },
 });

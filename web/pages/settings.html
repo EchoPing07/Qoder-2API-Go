@@ -41,6 +41,21 @@
             </div>
             <p class="field-hint">Chat 响应超时：等待上游开始响应（返回响应头）的最长时间；流空闲超时：流式响应中持续无数据的最长等待，只要数据持续到达就不会中断。保存后立即生效，无需重启；留空表示保持当前值</p>
           </div>
+
+          <div class="card">
+            <div class="card-head"><h3>日志配置</h3></div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">日志保留（天）</label>
+                <input class="input" type="number" min="1" max="3650" x-model.number="config.log_retention_days" placeholder="90">
+              </div>
+              <div class="form-row">
+                <label class="label">日志条数上限</label>
+                <input class="input" type="number" min="100" max="100000" x-model.number="config.log_max_entries" placeholder="2000">
+              </div>
+            </div>
+            <p class="field-hint">请求日志仅存元信息，不保存对话内容；超期或超量的最旧日志会被自动删除，两个限制同时生效。保存后立即生效，无需重启；留空表示保持当前值</p>
+          </div>
           </div>
 
           <div class="space">

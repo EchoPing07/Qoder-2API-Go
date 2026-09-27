@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"qoder2api/auth"
+	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
@@ -32,6 +34,7 @@ type Admin struct {
 	store        *store.Store
 	modelFetcher ModelFetcher
 	stats        *stats.Recorder
+	logRec       *logs.Recorder
 	sessions     map[string]time.Time
 	sessionMu    sync.Mutex
 	limiter      *loginLimiter
@@ -40,12 +43,13 @@ type Admin struct {
 // ModelFetcher returns the current model catalog (dynamic or fallback).
 type ModelFetcher func(ctx context.Context) []string
 
-// New creates an Admin instance. rec may be nil.
-func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder) *Admin {
+// New creates an Admin instance. rec and lr may be nil.
+func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder) *Admin {
 	return &Admin{
 		store:        s,
 		modelFetcher: mf,
 		stats:        rec,
+		logRec:       lr,
 		sessions:     make(map[string]time.Time),
 		limiter:      newLoginLimiter(),
 	}
@@ -67,6 +71,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/pat", a.requireAuth(a.handlePAT))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
+	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
 	mux.HandleFunc("/admin/api/config", a.requireAuth(a.handleConfig))
 	mux.HandleFunc("/admin/api/password", a.requireAuth(a.handlePassword))
 }
@@ -429,17 +434,31 @@ func timeoutEnvManaged() bool {
 		os.Getenv("QODER_IDLE_TIMEOUT_SECONDS") != ""
 }
 
+// logLimitsEnvManaged reports whether the log limits are pinned by env vars,
+// in which case the panel must not change them (same policy as the timeouts).
+func logLimitsEnvManaged() bool {
+	return os.Getenv("QODER_LOG_RETENTION_DAYS") != "" ||
+		os.Getenv("QODER_LOG_MAX_ENTRIES") != ""
+}
+
 func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		// Report the effective stream timeouts (env startup overrides are
-		// already folded into them), not just the persisted file values.
+		// Report effective values, not the persisted file values: env startup
+		// overrides are already folded into the stream timeouts and into the
+		// log limits held by the recorder.
 		timeouts := auth.CurrentStreamTimeouts()
+		retentionDays, maxEntries := a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries()
+		if a.logRec != nil {
+			retentionDays, maxEntries = a.logRec.Limits()
+		}
 		writeJSON(w, 200, map[string]interface{}{
 			"host":                 a.store.GetHost(),
 			"port":                 a.store.GetPort(),
 			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
 			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
+			"log_retention_days":   retentionDays,
+			"log_max_entries":      maxEntries,
 		})
 	case http.MethodPost:
 		var body struct {
@@ -447,6 +466,8 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			Port               int    `json:"port"`
 			ChatTimeoutSeconds int    `json:"chat_timeout_seconds"`
 			IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
+			LogRetentionDays   int    `json:"log_retention_days"`
+			LogMaxEntries      int    `json:"log_max_entries"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -482,6 +503,25 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Log limits share the timeout convention: 0 = keep current, and a
+		// value pinned by env vars is rejected.
+		wantsLogLimits := body.LogRetentionDays != 0 || body.LogMaxEntries != 0
+		if wantsLogLimits && logLimitsEnvManaged() {
+			writeJSONError(w, 400, "日志配置由环境变量 QODER_LOG_RETENTION_DAYS / QODER_LOG_MAX_ENTRIES 管理，无法在面板中修改")
+			return
+		}
+		if body.LogRetentionDays != 0 {
+			if err := store.ValidateLogRetentionDays(body.LogRetentionDays); err != nil {
+				writeJSONError(w, 400, "日志保留天数："+err.Error())
+				return
+			}
+		}
+		if body.LogMaxEntries != 0 {
+			if err := store.ValidateLogMaxEntries(body.LogMaxEntries); err != nil {
+				writeJSONError(w, 400, "日志条数上限："+err.Error())
+				return
+			}
+		}
 		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
@@ -498,6 +538,23 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if body.LogRetentionDays != 0 {
+			if err := a.store.SetLogRetentionDays(body.LogRetentionDays); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if body.LogMaxEntries != 0 {
+			if err := a.store.SetLogMaxEntries(body.LogMaxEntries); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		// Hot-apply the log limits so a lowered cap prunes the live recorder at
+		// once, not at the next request or flush.
+		if wantsLogLimits && a.logRec != nil {
+			a.logRec.SetLimits(a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries())
+		}
 		// Hot-apply only when the request actually carried timeout fields:
 		// re-applying store values unconditionally would clobber env-pinned
 		// timeouts on a legacy host/port-only save.
@@ -508,12 +565,18 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		timeouts := auth.CurrentStreamTimeouts()
+		retentionDays, maxEntries := a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries()
+		if a.logRec != nil {
+			retentionDays, maxEntries = a.logRec.Limits()
+		}
 		writeJSON(w, 200, map[string]interface{}{
 			"host":                 body.Host,
 			"port":                 body.Port,
 			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
 			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
-			"restart":              "修改主机或端口后需要重启服务才能生效（超时配置已即时生效）",
+			"log_retention_days":   retentionDays,
+			"log_max_entries":      maxEntries,
+			"restart":              "修改主机或端口后需要重启服务才能生效（超时与日志配置已即时生效）",
 		})
 	default:
 		writeJSONError(w, 405, "方法不允许")
@@ -577,6 +640,52 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.stats.Report())
+}
+
+// --- Logs endpoint ---
+
+// handleLogs serves GET /admin/api/logs: a paginated, filterable request log.
+// Query params: model (substring), key_id (exact), status ("error" or a code),
+// page, page_size.
+func (a *Admin) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if a.logRec == nil {
+		writeJSON(w, 200, logs.Result{Logs: []logs.LogEntry{}})
+		return
+	}
+	q := r.URL.Query()
+	f := logs.Filter{
+		Model:    strings.TrimSpace(q.Get("model")),
+		KeyID:    strings.TrimSpace(q.Get("key_id")),
+		Page:     atoiDefault(q.Get("page"), 1),
+		PageSize: atoiDefault(q.Get("page_size"), 20),
+	}
+	switch v := q.Get("status"); v {
+	case "error":
+		f.Status = -1
+	case "":
+		// no status filter
+	default:
+		if n, err := strconv.Atoi(v); err == nil {
+			f.Status = n
+		}
+	}
+	writeJSON(w, 200, a.logRec.Query(f))
+}
+
+// atoiDefault parses s as an int, falling back to def when empty or invalid.
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // maskPAT returns a masked version of the PAT for display.

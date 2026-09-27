@@ -1,11 +1,18 @@
       <section x-cloak class="space">
         <header class="page-head">
           <h1>令牌</h1>
+          <div class="page-actions">
+            <a class="btn btn-secondary btn-sm" href="https://qoder.cn/account/integrations" target="_blank" rel="noreferrer">
+              <span class="ic" x-html="ic('external')"></span>创建令牌
+            </a>
+          </div>
         </header>
 
         <div class="card">
           <div class="card-head">
             <h3>访问令牌</h3>
+            <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
+            <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
             <span class="muted-xs">Qoder 个人访问令牌，API 桥接运行必须配置</span>
           </div>

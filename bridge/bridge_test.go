@@ -24,7 +24,7 @@ import (
 )
 
 func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
-	handler := MakeChatHandler(nil, nil)
+	handler := MakeChatHandler(nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -40,8 +40,8 @@ func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
 }
 
 func TestChatRouteRejectsInvalidApiKey(t *testing.T) {
-	resolver := func(apiKey string) *OpenAiBridge { return nil }
-	handler := MakeChatHandler(resolver, nil)
+	resolver := func(apiKey string) *ResolvedBridge { return nil }
+	handler := MakeChatHandler(resolver, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -93,7 +93,7 @@ func TestModelsRouteReturnsAllModels(t *testing.T) {
 // Unauthorized requests (missing/invalid key) must not be counted.
 func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	handler := MakeChatHandler(nil, rec)
+	handler := MakeChatHandler(nil, rec, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -111,8 +111,8 @@ func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 // Malformed JSON with a valid key must be rejected and not counted.
 func TestChatRouteDoesNotRecordInvalidJSON(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	resolver := func(apiKey string) *OpenAiBridge { return &OpenAiBridge{} }
-	handler := MakeChatHandler(resolver, rec)
+	resolver := func(apiKey string) *ResolvedBridge { return &ResolvedBridge{Bridge: &OpenAiBridge{}} }
+	handler := MakeChatHandler(resolver, rec, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model": `))
@@ -250,14 +250,21 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 type fakeGateway struct {
 	chatLines []string // raw SSE lines ("data: {...}")
 
-	mu       sync.Mutex
-	chatBody []byte
+	mu          sync.Mutex
+	chatBody    []byte
+	chatHeaders http.Header
 }
 
 func (g *fakeGateway) lastChatBody() []byte {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]byte(nil), g.chatBody...)
+}
+
+func (g *fakeGateway) lastChatHeaders() http.Header {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.chatHeaders.Clone()
 }
 
 func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
@@ -279,6 +286,7 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 		body, _ := io.ReadAll(r.Body)
 		gw.mu.Lock()
 		gw.chatBody = body
+		gw.chatHeaders = r.Header.Clone()
 		gw.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
@@ -298,6 +306,77 @@ func sseFrame(t *testing.T, inner map[string]interface{}) string {
 	b, _ := json.Marshal(inner)
 	line, _ := json.Marshal(map[string]interface{}{"body": string(b)})
 	return "data: " + string(line)
+}
+
+// Regression for issue #1（实际执行任务模型与请求模型不符合）: the real
+// gateway labels every SSE frame "model":"auto". The bridge must send the
+// resolved qoder key upstream (body + x-model-key header) and stamp the
+// client's requested model on every client-facing chunk and on the sync
+// response, so "auto" never leaks to clients.
+func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
+	for _, tc := range []struct{ name string; stream bool }{
+		{"stream", true},
+		{"sync", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &fakeGateway{chatLines: []string{
+				sseFrame(t, map[string]interface{}{"model": "auto", "choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"role": "assistant", "content": "hi"}}}}),
+				sseFrame(t, map[string]interface{}{"model": "auto", "choices": []interface{}{}, "usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "credits": 0.1}}),
+				"data: [DONE]",
+			}}
+			b := newFakeBridge(t, gw)
+
+			w := httptest.NewRecorder()
+			err := b.HandleChat(context.Background(), w, map[string]interface{}{
+				"model":   "Fake-Model",
+				"stream":  tc.stream,
+				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "q"}},
+			}, nil)
+			if err != nil {
+				t.Fatalf("HandleChat: %v", err)
+			}
+			body := w.Body.String()
+			if strings.Contains(body, `"model":"auto"`) {
+				t.Errorf("upstream 'auto' label leaked into client response:\n%s", body)
+			}
+			want := 1 // sync: a single response object
+			if tc.stream {
+				want = 2 // chunks + terminal frame all carry the stamp
+			}
+			if n := strings.Count(body, `"model":"Fake-Model"`); n < want {
+				t.Errorf("client response must stamp the requested model on every chunk (found %d):\n%s", n, body)
+			}
+
+			// The upstream request must carry the resolved qoder key in both the
+			// body's model_config and the x-model-key header (the routing key).
+			if got := gw.lastChatHeaders().Get("x-model-key"); got != "qmodel_latest" {
+				t.Errorf("x-model-key = %q, want qmodel_latest", got)
+			}
+			plain, derr := auth.Decode(string(gw.lastChatBody()))
+			if derr != nil {
+				t.Fatalf("decode upstream body: %v", derr)
+			}
+			var sent struct {
+				ModelConfig struct {
+					Key string `json:"key"`
+				} `json:"model_config"`
+				ChatContext struct {
+					Extra struct {
+						ModelConfig struct {
+								Key string `json:"key"`
+						} `json:"modelConfig"`
+					} `json:"extra"`
+				} `json:"chat_context"`
+			}
+			if jerr := json.Unmarshal(plain, &sent); jerr != nil {
+				t.Fatalf("parse upstream body: %v", jerr)
+			}
+			if sent.ModelConfig.Key != "qmodel_latest" || sent.ChatContext.Extra.ModelConfig.Key != "qmodel_latest" {
+				t.Errorf("upstream body model keys = %q/%q, want qmodel_latest/qmodel_latest",
+					sent.ModelConfig.Key, sent.ChatContext.Extra.ModelConfig.Key)
+			}
+		})
+	}
 }
 
 // Streaming path: content deltas flow as OpenAI chunks; usage frame is
@@ -611,7 +690,7 @@ func TestChatRouteRejectsMalformedParamTypes(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":"8000"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -634,7 +713,7 @@ func TestChatRouteRejectsMultiChoice(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"n":3}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -776,7 +855,7 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	// The failure frames carry no content, so nothing is committed to the
 	// client and the rejection must surface as a real HTTP status carrying the
 	// embedded 429 — not a 200 SSE stream whose success every SDK would read.
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1126,7 +1205,7 @@ func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
 	gw := &busyGateway{busyFirstN: 99}
 	b := newBusyBridge(t, gw)
 
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -1795,7 +1874,7 @@ func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, rec)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1811,6 +1890,52 @@ func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
 	}
 	if report.Credits != 0 || report.CycleCredits != 0 {
 		t.Errorf("non-billable credits must be dropped, got credits=%v cycle=%v", report.Credits, report.CycleCredits)
+	}
+	if report.BilledRequests != 0 {
+		t.Errorf("a non-billable frame must not count as billed, got %d", report.BilledRequests)
+	}
+}
+
+// A billable usage frame must be attributed to the model the CLIENT asked for:
+// the per-model spend column is what identifies "which model is eating the
+// allowance", so attributing it to the upstream's own model label (the gateway
+// answers "auto") would make the column useless.
+func TestHandleChatAttributesCreditsToRequestedModel(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{
+			"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5, "credits": 0.75}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	rec := stats.NewRecorder(nil)
+
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+
+	report := rec.Report()
+	if report.BilledRequests != 1 {
+		t.Fatalf("expected 1 billed request, got %d", report.BilledRequests)
+	}
+	var found bool
+	for _, row := range report.ByModel {
+		if row.Model != "Fake-Model" {
+			continue
+		}
+		found = true
+		if row.Credits < 0.75-1e-9 || row.Credits > 0.75+1e-9 || row.Billed != 1 {
+			t.Errorf("expected Fake-Model to carry 0.75 credits over 1 billed request, got %+v", row)
+		}
+	}
+	if !found {
+		t.Errorf("the requested model has no credits row: %+v", report.ByModel)
 	}
 }
 
@@ -1892,7 +2017,7 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: tc.retryAfter}
 			b := newRejectingBridge(t, gw)
-			handler := MakeChatHandler(func(string) *OpenAiBridge { return b }, nil)
+			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
 
 			req := httptest.NewRequest("POST", "/v1/chat/completions",
 				strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))

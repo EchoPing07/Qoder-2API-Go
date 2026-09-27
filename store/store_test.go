@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"qoder2api/logs"
 	"qoder2api/stats"
 )
 
@@ -375,5 +376,98 @@ func TestStreamTimeoutNegativeOnLoad(t *testing.T) {
 	}
 	if strings.Contains(string(data), "-5") {
 		t.Errorf("normalized values should be persisted back, file still has -5:\n%s", data)
+	}
+}
+
+// -- Request Logs --
+
+func TestLogsRoundTrip(t *testing.T) {
+	s := tempStore(t)
+	entries := []logs.LogEntry{
+		{ID: 1, Model: "Qwen3.7-Max", StatusCode: 200, TotalTokens: 42, CreatedAt: 100},
+		{ID: 2, Model: "DeepSeek-V4-Pro", StatusCode: 502, ErrorMsg: "boom", CreatedAt: 200},
+	}
+	if err := s.SaveLogs(entries); err != nil {
+		t.Fatalf("SaveLogs: %v", err)
+	}
+	loaded := s.LoadLogs()
+	if len(loaded) != 2 || loaded[0].Model != "Qwen3.7-Max" || loaded[1].ErrorMsg != "boom" {
+		t.Fatalf("LoadLogs = %+v", loaded)
+	}
+	// The returned slice must be a copy: mutating it cannot corrupt the store.
+	loaded[0].Model = "mutated"
+	if s.LoadLogs()[0].Model != "Qwen3.7-Max" {
+		t.Error("LoadLogs aliased the internal slice")
+	}
+	// SaveStats must not clobber the logs (same config file).
+	if err := s.SaveStats(&stats.Data{Total: 5}); err != nil {
+		t.Fatalf("SaveStats: %v", err)
+	}
+	if got := s.LoadLogs(); len(got) != 2 {
+		t.Errorf("logs lost after SaveStats: %+v", got)
+	}
+}
+
+func TestLogsDefaultEmpty(t *testing.T) {
+	s := tempStore(t)
+	if got := s.LoadLogs(); got != nil {
+		t.Errorf("LoadLogs on empty store = %v, want nil", got)
+	}
+}
+
+func TestLogLimitsDefaultsAndValidation(t *testing.T) {
+	s := tempStore(t)
+	if got := s.GetLogRetentionDays(); got != DefaultLogRetentionDays {
+		t.Errorf("default retention = %d, want %d", got, DefaultLogRetentionDays)
+	}
+	if got := s.GetLogMaxEntries(); got != DefaultLogMaxEntries {
+		t.Errorf("default max entries = %d, want %d", got, DefaultLogMaxEntries)
+	}
+	if err := s.SetLogRetentionDays(30); err != nil {
+		t.Fatalf("SetLogRetentionDays: %v", err)
+	}
+	if err := s.SetLogMaxEntries(500); err != nil {
+		t.Fatalf("SetLogMaxEntries: %v", err)
+	}
+	if s.GetLogRetentionDays() != 30 || s.GetLogMaxEntries() != 500 {
+		t.Errorf("limits not persisted: %d/%d", s.GetLogRetentionDays(), s.GetLogMaxEntries())
+	}
+	for _, err := range []error{
+		s.SetLogRetentionDays(0),
+		s.SetLogRetentionDays(-1),
+		s.SetLogRetentionDays(99999),
+		s.SetLogMaxEntries(10),
+		s.SetLogMaxEntries(9999999),
+	} {
+		if err == nil {
+			t.Error("out-of-range log limit must be rejected")
+		}
+	}
+	// A hand-edited file with zero/invalid values falls back to defaults on load.
+	s2 := tempStore(t)
+	if err := s2.SetLogRetentionDays(7); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s3, err := New(s2.filePath)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := s3.GetLogRetentionDays(); got != 7 {
+		t.Errorf("retention after reload = %d, want 7", got)
+	}
+}
+
+func TestLookupKey(t *testing.T) {
+	s := tempStore(t)
+	added, err := s.AddKey("sk-lookup", "note-1")
+	if err != nil {
+		t.Fatalf("AddKey: %v", err)
+	}
+	k, ok := s.LookupKey("sk-lookup")
+	if !ok || k.ID != added.ID || k.Note != "note-1" {
+		t.Fatalf("LookupKey = %+v ok=%v, want id=%s note=note-1", k, ok, added.ID)
+	}
+	if _, ok := s.LookupKey("sk-missing"); ok {
+		t.Error("LookupKey must report false for a missing key")
 	}
 }

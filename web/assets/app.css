@@ -149,8 +149,9 @@ a{color:inherit;text-decoration:none}
 .grid{display:grid;gap:12px}
 .metrics{grid-template-columns:1fr}
 .metrics-4{grid-template-columns:1fr}
-@media(min-width:640px){.metrics,.metrics-4{grid-template-columns:repeat(2,1fr)}}
-@media(min-width:1280px){.metrics{grid-template-columns:repeat(5,1fr)}.metrics-4{grid-template-columns:repeat(4,1fr)}}
+.metrics-5{grid-template-columns:1fr}
+@media(min-width:640px){.metrics,.metrics-4,.metrics-5{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:1280px){.metrics{grid-template-columns:repeat(5,1fr)}.metrics-4{grid-template-columns:repeat(4,1fr)}.metrics-5{grid-template-columns:repeat(5,1fr)}}
 .charts{grid-template-columns:1fr}
 @media(min-width:1024px){.charts{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}}
 .g2{grid-template-columns:1fr}

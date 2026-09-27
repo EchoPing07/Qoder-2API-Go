@@ -48,7 +48,7 @@ func TestFrontendAPIPathsMatchAdminRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	a := admin.New(st, func(ctx context.Context) []string { return nil }, nil)
+	a := admin.New(st, func(ctx context.Context) []string { return nil }, nil, nil)
 	mux := http.NewServeMux()
 	a.RegisterRoutes(mux)
 
