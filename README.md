@@ -57,8 +57,8 @@ go build -o qoder2api .
 # 使用 docker-compose
 docker-compose up -d
 
-# 或手动构建
-docker build -t qoder2api .
+# 或手动构建（可传 VERSION 构建参数，登录页将显示对应版本号，缺省为 dev）
+docker build --build-arg VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -t qoder2api .
 docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app/data/data.json qoder2api
 ```
 
