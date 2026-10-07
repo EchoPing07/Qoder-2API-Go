@@ -25,19 +25,24 @@ func enableFlag(v interface{}) bool {
 }
 
 // DefaultModelMap is the built-in fallback map (display_name -> qoder internal key).
-// Matches catalog-v6 (2026-08-15) chat scene. Only used when dynamic fetch fails.
-// Notable vs v5: Qwen3.8-Max graduated from preview (qmodel_preview ->
-// qmodel_38max, renamed without "-Preview"); GLM-5.3 (gmodel) added.
+// Matches catalog-v7 (2026-09-22) chat scene. Only used when dynamic fetch fails.
+// Notable vs v6: Qwen3.8-Flash (qfmodel) added; DeepSeek-V4-Flash renamed to
+// DeepSeek-Flash (same key dfmodel); Kimi-K2.7-Code -> Kimi-K3 (kmodel_latest,
+// K2.8-Preview keeps kmodel); GLM-5.3-Flash (gfmodel) and Qwen3.7-Flash
+// (q37fmodel) added; Qwen3.6-Flash (q36fmodel) retired.
 var DefaultModelMap = map[string]string{
 	"Qwen3.8-Max":       "qmodel_38max",
+	"Qwen3.8-Flash":     "qfmodel",
 	"Qwen3.7-Max":       "qmodel_latest",
 	"Qwen3.7-Plus":      "qmodel",
-	"Qwen3.6-Flash":     "q36fmodel",
+	"Qwen3.7-Flash":     "q37fmodel",
 	"DeepSeek-V4-Pro":   "dmodel",
-	"DeepSeek-V4-Flash": "dfmodel",
+	"DeepSeek-Flash":    "dfmodel",
 	"GLM-5.3":           "gmodel",
+	"GLM-5.3-Flash":     "gfmodel",
 	"GLM-5.2":           "gm51model",
-	"Kimi-K2.7-Code":    "kmodel",
+	"Kimi-K3":           "kmodel_latest",
+	"Kimi-K2.8-Preview": "kmodel",
 	"MiniMax-M2.7":      "mmodel",
 }
 
@@ -46,14 +51,17 @@ var DefaultModelMap = map[string]string{
 // unreliable — do not treat this as an authoritative capability matrix.
 var DefaultVisionModels = map[string]bool{
 	"Qwen3.8-Max":       true,
+	"Qwen3.8-Flash":     true,
 	"Qwen3.7-Max":       true,
 	"Qwen3.7-Plus":      true,
-	"Qwen3.6-Flash":     true,
+	"Qwen3.7-Flash":     true,
 	"DeepSeek-V4-Pro":   true,
-	"DeepSeek-V4-Flash": true,
+	"DeepSeek-Flash":    true,
 	"GLM-5.3":           true,
+	"GLM-5.3-Flash":     true,
 	"GLM-5.2":           true,
-	"Kimi-K2.7-Code":    true,
+	"Kimi-K3":           true,
+	"Kimi-K2.8-Preview": true,
 }
 
 // PreferredDefaultKey is the default model key when model param is None/empty.

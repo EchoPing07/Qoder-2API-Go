@@ -23,17 +23,20 @@
 | 显示名称 | 内部 Key |
 | ----------------- | -------------- |
 | Qwen3.8-Max | qmodel_38max |
+| Qwen3.8-Flash | qfmodel |
 | Qwen3.7-Max | qmodel_latest |
 | Qwen3.7-Plus | qmodel |
-| Qwen3.6-Flash | q36fmodel |
+| Qwen3.7-Flash | q37fmodel |
 | DeepSeek-V4-Pro | dmodel |
-| DeepSeek-V4-Flash | dfmodel |
+| DeepSeek-Flash | dfmodel |
 | GLM-5.3 | gmodel |
+| GLM-5.3-Flash | gfmodel |
 | GLM-5.2 | gm51model |
-| Kimi-K2.7-Code | kmodel |
+| Kimi-K3 | kmodel_latest |
+| Kimi-K2.8-Preview | kmodel |
 | MiniMax-M2.7 | mmodel |
 
-> 以上为内置默认列表（catalog-v6，2026-08-15），实际可用模型以网关动态返回为准。
+> 以上为内置默认列表（catalog-v7，2026-10-07），实际可用模型以网关动态返回为准。
 >
 > **关于图片输入**：部分模型并非原生多模态，而是由网关对图片附带辅助识别（非原生多模态模型加上辅助后实际可以识图），因此上表不再标注是否支持视觉；识图效果以实际调用结果为准。
 
@@ -144,7 +147,7 @@ curl http://localhost:10081/v1/chat/completions \
   -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3.7-Max",
+    "model": "Qwen3.8-Flash",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'

@@ -299,6 +299,11 @@ textarea.input{height:auto;padding:8px 11px;line-height:1.5}
 .stat-v{font-size:var(--fs-lg);font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 动作行：卡片底部独立一行，与统计/表格区用分隔线隔开，避免按钮混进信息堆 */
 .action-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid color-mix(in oklab,var(--border) 55%,transparent)}
+/* 调用示例（密钥页「调用」卡片）：多行命令保持原样换行，窄屏横向滚动而不折行；
+   复制按钮浮于右上角 */
+.code-wrap{position:relative;margin-top:12px}
+.code-block{margin:0;background:var(--secondary);border-radius:8px;padding:11px 38px 11px 13px;font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:var(--fs-xs);line-height:1.7;color:var(--fg);white-space:pre;overflow-x:auto}
+.code-copy{position:absolute;top:6px;right:6px;background:var(--secondary)}
 
 /* ── 任务 ── */
 .hm-cells{display:flex;flex-wrap:wrap;gap:3px;padding:2px 0;max-height:150px;overflow-y:auto}

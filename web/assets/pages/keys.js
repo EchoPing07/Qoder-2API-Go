@@ -2,6 +2,22 @@
 PAGE('keys', {
   realtime: true,
 
+  /* ── 调用卡片 ──
+   * Base URL 由浏览器当前来源（location.origin）推导：用户可能用任意 IP / 端口部署，
+   * 写死 localhost 的示例无法直接复制。面板与 API 同源；经反向代理改变对外域名时
+   * 以代理暴露的地址为准（卡片内亦有提示）。
+   */
+  get callBase(){ return location.origin + '/v1'; },
+  get callChat(){ return this.callBase + '/chat/completions'; },
+  get callModels(){ return this.callBase + '/models'; },
+  /* 示例中的密钥用占位符：真实密钥在上方列表里，避免截图 / 录屏连带泄露 */
+  get callCurl(){
+    return `curl ${this.callChat} \\
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"Qwen3.8-Flash","messages":[{"role":"user","content":"你好"}],"stream":true}'`;
+  },
+
   /* ── Keys ── */
   async loadKeys(){
     try{ const r = await this.api('/admin/api/keys'); this.keys = r.keys||[]; }

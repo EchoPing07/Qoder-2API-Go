@@ -573,6 +573,41 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 }
 
+// TestKeysPageCallCard 密钥页的「调用」卡片：地址必须由浏览器当前来源推导
+// （location.origin），不能写死 localhost —— 用户会用不同的 IP / 端口部署，
+// 写死的示例无法直接复制；卡片同时给出 Base URL、两个端点的复制入口与调用示例。
+func TestKeysPageCallCard(t *testing.T) {
+	read := func(fsys fs.FS, name string) string {
+		t.Helper()
+		b, err := fs.ReadFile(fsys, name)
+		if err != nil {
+			t.Fatalf("读取 %s: %v", name, err)
+		}
+		return string(b)
+	}
+
+	html := read(pageFS, "pages/keys.html")
+	for _, want := range []string{
+		`<h3>调用</h3>`,
+		`x-text="callBase"`, `x-text="callChat"`, `x-text="callModels"`, `x-text="callCurl"`,
+		`@click="copy(callBase)"`, `@click="copy(callChat)"`, `@click="copy(callModels)"`, `@click="copy(callCurl)"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("密钥页「调用」卡片缺少 %s", want)
+		}
+	}
+
+	js := read(assetFS, "assets/pages/keys.js")
+	if !strings.Contains(js, "location.origin") {
+		t.Error("调用地址必须由 location.origin 推导（用户以不同 IP / 端口部署）")
+	}
+	for _, dead := range []string{"http://localhost", "http://127.0.0.1"} {
+		if strings.Contains(html, dead) || strings.Contains(js, dead) {
+			t.Errorf("调用地址不得写死 %s（应由当前访问来源推导）", dead)
+		}
+	}
+}
+
 // TestNoTemplateLeak 渲染产物不得残留模板指令。
 func TestNoTemplateLeak(t *testing.T) {
 	h, _ := newTestRouter(t)

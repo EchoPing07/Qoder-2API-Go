@@ -9,7 +9,7 @@
         <div class="card">
           <div class="table-wrap" x-show="keys.length">
             <table>
-              <thead><tr><th>密钥</th><th>备注</th><th>创建时间</th><th></th></tr></thead>
+              <thead><tr><th>API Key</th><th>备注</th><th>创建时间</th><th></th></tr></thead>
               <tbody>
                 <template x-for="k in keys" :key="k.id">
                   <tr>
@@ -30,6 +30,33 @@
           <div class="empty" x-show="!keys.length">
             <span class="ic ic-lg" x-html="ic('keys')"></span>
             暂无密钥，点击右上角创建第一个密钥
+          </div>
+        </div>
+
+        <!-- 调用：地址由浏览器当前来源推导（location.origin），用户以不同 IP / 端口部署时
+             无需手动替换示例里的 localhost -->
+        <div class="card">
+          <div class="card-head">
+            <h3>调用</h3>
+          </div>
+          <div class="kv">
+            <span class="k">Base URL</span>
+            <span class="v mono" x-text="callBase"></span>
+            <button class="btn btn-ghost btn-sm" style="margin-left:auto" @click="copy(callBase)">复制</button>
+          </div>
+          <div class="kv">
+            <span class="k">对话补全</span>
+            <span class="v mono" x-text="callChat"></span>
+            <button class="btn btn-ghost btn-sm" style="margin-left:auto" @click="copy(callChat)">复制</button>
+          </div>
+          <div class="kv">
+            <span class="k">模型列表</span>
+            <span class="v mono" x-text="callModels"></span>
+            <button class="btn btn-ghost btn-sm" style="margin-left:auto" @click="copy(callModels)">复制</button>
+          </div>
+          <div class="code-wrap">
+            <pre class="code-block" x-text="callCurl"></pre>
+            <button class="btn btn-ghost btn-sm btn-icon code-copy" title="复制调用示例" aria-label="复制调用示例" @click="copy(callCurl)"><span class="ic" x-html="ic('copy')"></span></button>
           </div>
         </div>
       </section>
