@@ -133,10 +133,13 @@ const (
 // Defaults for the routing knobs.
 const (
 	DefaultAutoSwitchThreshold = 20
-	DefaultStickyLimit         = 10
-	DefaultMaxRetryAccounts    = 3
-	MinMaxRetryAccounts        = 1
-	MaxMaxRetryAccounts        = 16
+	// DefaultStickyLimit is how many requests one conversation may stay on a
+	// single account before rotating. 30 balances context affinity against the
+	// per-account rate limiter; the panel lets the user tune it.
+	DefaultStickyLimit      = 30
+	DefaultMaxRetryAccounts = 3
+	MinMaxRetryAccounts     = 1
+	MaxMaxRetryAccounts     = 16
 )
 
 // DefaultHost is the default listen host.

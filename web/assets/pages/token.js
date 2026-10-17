@@ -104,7 +104,7 @@ PAGE('token', {
         enabled: !!r.enabled,
         threshold: r.threshold || 20,
         strategy: r.strategy || 'sticky',
-        sticky_limit: r.sticky_limit || 10,
+        sticky_limit: r.sticky_limit || 30,
         max_retry_accounts: r.max_retry_accounts || 3,
       };
     }catch(e){ this.toast(e.message,'err'); }
