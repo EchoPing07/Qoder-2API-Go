@@ -40,7 +40,7 @@ func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
 }
 
 func TestChatRouteRejectsInvalidApiKey(t *testing.T) {
-	resolver := func(apiKey string) *ResolvedBridge { return nil }
+	resolver := func(ResolveRequest) *ResolvedBridge { return nil }
 	handler := MakeChatHandler(resolver, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
@@ -111,7 +111,7 @@ func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 // Malformed JSON with a valid key must be rejected and not counted.
 func TestChatRouteDoesNotRecordInvalidJSON(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	resolver := func(apiKey string) *ResolvedBridge { return &ResolvedBridge{Bridge: &OpenAiBridge{}} }
+	resolver := func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: &OpenAiBridge{}} }
 	handler := MakeChatHandler(resolver, rec, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
@@ -693,7 +693,7 @@ func TestChatRouteRejectsMalformedParamTypes(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":"8000"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -716,7 +716,7 @@ func TestChatRouteRejectsMultiChoice(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"n":3}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -858,7 +858,7 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	// The failure frames carry no content, so nothing is committed to the
 	// client and the rejection must surface as a real HTTP status carrying the
 	// embedded 429 — not a 200 SSE stream whose success every SDK would read.
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1208,7 +1208,7 @@ func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
 	gw := &busyGateway{busyFirstN: 99}
 	b := newBusyBridge(t, gw)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -1877,7 +1877,7 @@ func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1913,7 +1913,7 @@ func TestHandleChatAttributesCreditsToRequestedModel(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -2020,7 +2020,7 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: tc.retryAfter}
 			b := newRejectingBridge(t, gw)
-			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
+			handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 			req := httptest.NewRequest("POST", "/v1/chat/completions",
 				strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -2131,5 +2131,56 @@ func TestCNQuotaUsesCOSYToken(t *testing.T) {
 	}
 	if got := quotaAuth.Load(); got != "Bearer sot" {
 		t.Errorf("CN quota Authorization = %v, want the COSY token", got)
+	}
+}
+
+// TestChatHandlerStripsRegionPrefix 模型名区域前缀在进入 bridge 前被剥离，
+// 统计标签用裸模型名；解析出的 region 传给 resolver。
+func TestChatHandlerStripsRegionPrefix(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	var gotReq ResolveRequest
+	handler := MakeChatHandler(func(req ResolveRequest) *ResolvedBridge {
+		gotReq = req
+		return &ResolvedBridge{Bridge: b, KeyID: "k"}
+	}, nil, nil, nil, nil)
+
+	handler(httptest.NewRecorder(), mkChatReq(`{"model":"gl/Qwen3.8-Flash","messages":[{"role":"user","content":"hi"}]}`))
+
+	if gotReq.Model != "Qwen3.8-Flash" {
+		t.Errorf("resolver model = %q, want bare Qwen3.8-Flash", gotReq.Model)
+	}
+	if gotReq.Region != models.RegionGlobal {
+		t.Errorf("resolver region = %v, want global", gotReq.Region)
+	}
+}
+
+// TestChatHandlerFailoverRetriesOnAnotherAccount 多账号重试：首次鉴权失败后
+// 走 failover 到另一个账号，客户端无感。
+func TestChatHandlerFailoverRetriesOnAnotherAccount(t *testing.T) {
+	bad := newFailoverBridge(t, &failoverGateway{unauthorizedFirstN: 99})
+	good := newFailoverBridge(t, &failoverGateway{})
+	calls := 0
+	failover := func(failed string, req ResolveRequest, excluded map[string]bool) *ResolvedBridge {
+		calls++
+		if !excluded[failed] {
+			t.Errorf("failed account %q must be in the excluded set", failed)
+		}
+		return &ResolvedBridge{Bridge: good, AccountID: "acc2"}
+	}
+	handler := MakeChatHandler(
+		func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: bad, AccountID: "acc1"} },
+		nil, nil, failover, nil)
+
+	w := httptest.NewRecorder()
+	handler(w, mkChatReq(failoverChatReq(true)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failover\n%s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("failover calls = %d, want 1", calls)
 	}
 }

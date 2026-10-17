@@ -36,6 +36,10 @@ const adminMaxBody = 1 << 16 // 64 KiB
 // bridge wiring.
 type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
 
+// InFlightFunc reports the number of in-flight requests currently served by an
+// account, so the panel can show how requests are spread. May be nil.
+type InFlightFunc func(accountID string) int
+
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
 	store          *store.Store
@@ -43,6 +47,7 @@ type Admin struct {
 	stats          *stats.Recorder
 	logRec         *logs.Recorder
 	accountChecker AccountChecker
+	inFlight       InFlightFunc
 	sessions       map[string]time.Time
 	sessionMu      sync.Mutex
 	limiter        *loginLimiter
@@ -67,6 +72,12 @@ func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder
 // /admin/api/accounts/check. Wiring happens before the server starts serving.
 func (a *Admin) SetAccountChecker(fn AccountChecker) {
 	a.accountChecker = fn
+}
+
+// SetInFlight installs the per-account in-flight reporter used by the account
+// list. Wiring happens before the server starts serving.
+func (a *Admin) SetInFlight(fn InFlightFunc) {
+	a.inFlight = fn
 }
 
 // RegisterRoutes registers all admin API routes on the given mux.
@@ -655,17 +666,22 @@ type accountView struct {
 	Region    string                 `json:"region"`
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
+	InFlight  int                    `json:"in_flight"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
 }
 
 // accountViews maps the pool to its wire form, marking the active entry.
-func accountViews(accounts []store.Account, activeID string) []accountView {
+func accountViews(accounts []store.Account, activeID string, inFlight InFlightFunc) []accountView {
 	out := make([]accountView, 0, len(accounts))
 	for i := range accounts {
 		acc := accounts[i]
 		region := acc.Region
 		if region == "" {
 			region = "cn"
+		}
+		inflight := 0
+		if inFlight != nil {
+			inflight = inFlight(acc.ID)
 		}
 		out = append(out, accountView{
 			ID:        acc.ID,
@@ -674,6 +690,7 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 			Region:    region,
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
+			InFlight:  inflight,
 			Snapshot:  acc.Snapshot,
 		})
 	}
@@ -687,7 +704,7 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
+		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID(), a.inFlight)})
 	case http.MethodPost:
 		var body struct {
 			PAT    string `json:"pat"`
@@ -848,17 +865,38 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		as := a.store.GetAutoSwitch()
-		writeJSON(w, 200, map[string]interface{}{"enabled": as.Enabled, "threshold": as.Threshold})
+		writeJSON(w, 200, map[string]interface{}{
+			"enabled":            as.Enabled,
+			"threshold":          as.Threshold,
+			"strategy":           as.Strategy,
+			"sticky_limit":       as.StickyLimit,
+			"max_retry_accounts": as.MaxRetryAccounts,
+		})
 	case http.MethodPost:
 		var body struct {
-			Enabled   bool    `json:"enabled"`
-			Threshold float64 `json:"threshold"`
+			Enabled          bool    `json:"enabled"`
+			Threshold        float64 `json:"threshold"`
+			Strategy         string  `json:"strategy"`
+			StickyLimit      int     `json:"sticky_limit"`
+			MaxRetryAccounts int     `json:"max_retry_accounts"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}
-		if err := a.store.SetAutoSwitch(body.Enabled, body.Threshold); err != nil {
+		cfg := a.store.GetAutoSwitch()
+		cfg.Enabled = body.Enabled
+		cfg.Threshold = body.Threshold
+		if body.Strategy != "" {
+			cfg.Strategy = body.Strategy
+		}
+		if body.StickyLimit > 0 {
+			cfg.StickyLimit = body.StickyLimit
+		}
+		if body.MaxRetryAccounts > 0 {
+			cfg.MaxRetryAccounts = body.MaxRetryAccounts
+		}
+		if err := a.store.SetAutoSwitchConfig(cfg); err != nil {
 			writeJSONError(w, 400, err.Error())
 			return
 		}

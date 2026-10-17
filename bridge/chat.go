@@ -271,6 +271,8 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 		}
 	}
 	defer func() { <-b.chatSlots }()
+	b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
 
 	jsonBody, err := marshalNoEscape(body)
 	if err != nil {

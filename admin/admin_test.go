@@ -1176,3 +1176,27 @@ func TestAccountCheckPassesRegion(t *testing.T) {
 		t.Errorf("checker region = %q, want global", gotRegion)
 	}
 }
+
+// TestAutoSwitchRoutingFields auto 端点往返路由字段。
+func TestAutoSwitchRoutingFields(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto", map[string]interface{}{
+		"enabled": true, "threshold": 25, "strategy": "least-inflight",
+		"sticky_limit": 7, "max_retry_accounts": 5,
+	})
+	if w.Code != 200 {
+		t.Fatalf("POST status = %d: %s", w.Code, w.Body.String())
+	}
+	cfg := s.GetAutoSwitch()
+	if cfg.Strategy != "least-inflight" || cfg.StickyLimit != 7 || cfg.MaxRetryAccounts != 5 || !cfg.Enabled || cfg.Threshold != 25 {
+		t.Errorf("stored config = %+v", cfg)
+	}
+	w = doRequest(t, a.handleAutoSwitch, "GET", "/admin/api/accounts/auto", nil)
+	var got map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["strategy"] != "least-inflight" || got["sticky_limit"].(float64) != 7 || got["max_retry_accounts"].(float64) != 5 {
+		t.Errorf("GET payload = %+v", got)
+	}
+}

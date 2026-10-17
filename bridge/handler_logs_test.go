@@ -30,7 +30,9 @@ func TestChatHandlerLogsSuccessfulRequest(t *testing.T) {
 	lr := logs.NewRecorder(nil, 90, 2000)
 
 	handler := MakeChatHandler(
-		func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b, KeyID: "abc123", KeyNote: "dev key"} },
+		func(ResolveRequest) *ResolvedBridge {
+			return &ResolvedBridge{Bridge: b, KeyID: "abc123", KeyNote: "dev key"}
+		},
 		nil, lr, nil, nil)
 	handler(httptest.NewRecorder(), mkChatReq(`{"model":"Fake-Model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 
@@ -75,7 +77,7 @@ func TestChatHandlerDoesNotLogAuthFailures(t *testing.T) {
 	}
 
 	// Invalid key (resolver returns nil).
-	handler = MakeChatHandler(func(string) *ResolvedBridge { return nil }, nil, lr, nil, nil)
+	handler = MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return nil }, nil, lr, nil, nil)
 	w = httptest.NewRecorder()
 	handler(w, mkChatReq(`{}`))
 	if w.Code != 401 {
@@ -91,7 +93,7 @@ func TestChatHandlerDoesNotLogAuthFailures(t *testing.T) {
 func TestChatHandlerLogsInvalidJSON(t *testing.T) {
 	b := &OpenAiBridge{}
 	lr := logs.NewRecorder(nil, 90, 2000)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
 
 	w := httptest.NewRecorder()
 	handler(w, mkChatReq(`{"model": `))
@@ -117,7 +119,7 @@ func TestChatHandlerLogsClientStatusForUpstreamErrors(t *testing.T) {
 	gw := &rejectingGateway{status: 500, body: `{"code":"internal_error","message":"boom"}`}
 	b := newRejectingBridge(t, gw)
 	lr := logs.NewRecorder(nil, 90, 2000)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
 
 	w := httptest.NewRecorder()
 	handler(w, mkChatReq(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -140,7 +142,7 @@ func TestChatHandlerTruncatesLoggedError(t *testing.T) {
 	gw := &rejectingGateway{status: 400, body: strings.Repeat("x", 2000)}
 	b := newRejectingBridge(t, gw)
 	lr := logs.NewRecorder(nil, 90, 2000)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
 
 	w := httptest.NewRecorder()
 	handler(w, mkChatReq(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -161,7 +163,7 @@ func TestChatHandlerTruncatesLoggedError(t *testing.T) {
 func TestChatHandlerLogsBridgeBootstrapFailure(t *testing.T) {
 	b := &OpenAiBridge{}
 	lr := logs.NewRecorder(nil, 90, 2000)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, lr, nil, nil)
 	w := httptest.NewRecorder()
 	handler(w, mkChatReq(`{"model":"Fake-Model","messages":[]}`))
 	if w.Code != 502 {

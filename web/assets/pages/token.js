@@ -100,17 +100,28 @@ PAGE('token', {
   async loadAutoSwitch(){
     try{
       const r = await this.api('/admin/api/accounts/auto');
-      this.autoSwitch = {enabled: !!r.enabled, threshold: r.threshold || 20};
+      this.autoSwitch = {
+        enabled: !!r.enabled,
+        threshold: r.threshold || 20,
+        strategy: r.strategy || 'sticky',
+        sticky_limit: r.sticky_limit || 10,
+        max_retry_accounts: r.max_retry_accounts || 3,
+      };
     }catch(e){ this.toast(e.message,'err'); }
   },
   async saveAutoSwitch(){
     const as = this.autoSwitch;
     const t = Number(as.threshold);
     if(!Number.isFinite(t) || t < 1){ this.toast('阈值需不小于 1 积分','err'); return; }
+    const sticky = Number(as.sticky_limit);
+    if(!Number.isFinite(sticky) || sticky < 1){ this.toast('粘性次数需不小于 1','err'); return; }
+    const retry = Number(as.max_retry_accounts);
+    if(!Number.isFinite(retry) || retry < 1 || retry > 16){ this.toast('最大重试账号数需在 1..16 之间','err'); return; }
     this.busy(async()=>{
       await this.api('/admin/api/accounts/auto',{method:'POST',body:JSON.stringify({
-        enabled: !!as.enabled, threshold: t })});
-      this.toast('自动切换设置已保存','ok');
+        enabled: !!as.enabled, threshold: t, strategy: as.strategy,
+        sticky_limit: sticky, max_retry_accounts: retry })});
+      this.toast('负载均衡设置已保存','ok');
     })();
   },
 

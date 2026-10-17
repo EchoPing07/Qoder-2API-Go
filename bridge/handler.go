@@ -20,8 +20,8 @@ import (
 	"qoder2api/transform"
 )
 
-// ResolvedBridge is what a BridgeResolver returns: the bridge for the current
-// PAT plus the authenticated key's metadata, which labels the request log.
+// ResolvedBridge is what a BridgeResolver returns: the bridge for the chosen
+// account plus the authenticated key's metadata, which labels the request log.
 // Only the key's ID and note are carried — never the raw key material.
 type ResolvedBridge struct {
 	Bridge  *OpenAiBridge
@@ -30,25 +30,41 @@ type ResolvedBridge struct {
 	// AccountID identifies the Qoder account serving this request. Empty when
 	// the caller does not track accounts (single-PAT deployments, tests). It
 	// gives the failover callback the identity of the account that failed so
-	// concurrent failures can dedupe against the already-switched account.
+	// the router can exclude it from the retry.
 	AccountID string
+	// OnSuccess, when set, runs after the request completes without error. The
+	// router uses it to bind the sticky session to the account only after a
+	// real success (a failed account must never be pinned).
+	OnSuccess func()
 }
 
-// FailoverFunc reports an upstream auth failure on the given account and lets
-// the caller switch to another one. It returns the replacement bridge (nil =
-// give up, surface the original error). Implemented by the caller (main
-// package); nil keeps the legacy behaviour (no failover).
-type FailoverFunc func(failedAccountID string) *ResolvedBridge
+// ResolveRequest carries the routing inputs a resolver needs: the API key, the
+// bare model name (region prefix already stripped), the parsed region filter,
+// a conversation seed for sticky routing, and the accounts already tried by
+// this request (excluded from re-selection during failover).
+type ResolveRequest struct {
+	APIKey     string
+	Model      string
+	Region     models.RegionFilter
+	StickySeed string
+	Exclude    map[string]bool
+}
+
+// FailoverFunc reports an upstream auth failure on the given account and asks
+// the router for a replacement account (excluding every account already tried).
+// It returns the replacement bridge (nil = give up, surface the original error).
+// Implemented by the caller (main package); nil keeps the legacy behaviour.
+type FailoverFunc func(failedAccountID string, req ResolveRequest, excluded map[string]bool) *ResolvedBridge
 
 // UsageHook receives every usage frame together with the account that served
 // the request (empty when unknown), enabling passive credit deduction for
 // automatic switching. May be nil; it never affects the response.
 type UsageHook func(accountID string, u *transform.Usage)
 
-// BridgeResolver resolves an API key to the current bridge plus its key
-// metadata, or nil if the key is invalid or no PAT is configured. Implemented
-// by the caller (main package).
-type BridgeResolver func(apiKey string) *ResolvedBridge
+// BridgeResolver resolves an API key + routing request to the chosen bridge
+// plus its key metadata, or nil if the key is invalid or no account is
+// available. Implemented by the caller (main package).
+type BridgeResolver func(req ResolveRequest) *ResolvedBridge
 
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
@@ -74,14 +90,20 @@ func writeError(w http.ResponseWriter, statusCode int, errType, message string) 
 	w.Write(b)
 }
 
+// maxFailoverAttempts is a defensive ceiling on the failover loop. The
+// resolver's own MaxRetryAccounts normally ends it first; this only guards
+// against a misbehaving callback.
+const maxFailoverAttempts = 16
+
 // MakeChatHandler creates the /v1/chat/completions handler. The resolver
-// validates the API key and returns the single bridge instance. rec records
-// request statistics and lr audit-log entries (metadata only); both may be nil.
+// validates the API key, parses the optional region prefix from the model name,
+// and returns the bridge for the routed account. rec records request statistics
+// and lr audit-log entries (metadata only); both may be nil.
 // failover may be nil: an upstream auth failure then surfaces as a plain
 // 502 upstream_error. With it, an AuthError seen before any byte reached the
-// client is reported to the callback, which may return a replacement bridge
-// (already resolved for another account); the request is then retried once on
-// it — invisible to the client.
+// client is reported to the callback, which routes to another account and
+// returns a replacement bridge; the request is retried on it — invisible to
+// the client.
 func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Recorder, failover FailoverFunc, usageHook UsageHook) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -90,9 +112,44 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			writeError(w, 401, "invalid_request_error", "Missing Authorization: Bearer <key>")
 			return
 		}
+
+		// Cap request body to bound memory use against oversized payloads.
+		r.Body = http.MaxBytesReader(w, r.Body, chatMaxBodyBytes)
+
+		var reqBody map[string]interface{}
+		// UseNumber keeps client numbers as json.Number so their exact token
+		// (1e18, 9007199254740993, long fractions) survives re-marshaling into
+		// the gateway request verbatim instead of being rounded through float64.
+		dec := json.NewDecoder(r.Body)
+		dec.UseNumber()
+		if err := dec.Decode(&reqBody); err != nil {
+			msg := truncateRunes("Invalid JSON body: "+err.Error(), 500)
+			if lr != nil {
+				lr.Record(&logs.LogEntry{StatusCode: 400, ErrorMsg: msg})
+			}
+			writeError(w, 400, "invalid_request_error", "Invalid JSON body: "+err.Error())
+			return
+		}
+
+		// Optional region prefix on the model name (cn/ gl/ global/ auto/).
+		// The bare model is what reaches the gateway; the prefix only steers
+		// account selection.
+		rawModel, _ := reqBody["model"].(string)
+		regionFilter, bareModel := models.ParseRegionPrefix(rawModel)
+		if bareModel != rawModel {
+			reqBody["model"] = bareModel
+		}
+
+		routeReq := ResolveRequest{
+			APIKey:     token,
+			Model:      bareModel,
+			Region:     regionFilter,
+			StickySeed: firstUserContent(reqBody),
+			Exclude:    map[string]bool{},
+		}
 		var rb *ResolvedBridge
 		if resolver != nil {
-			rb = resolver(token)
+			rb = resolver(routeReq)
 		}
 		if rb == nil || rb.Bridge == nil {
 			writeError(w, 401, "invalid_request_error", "Invalid API key or no PAT configured")
@@ -111,22 +168,9 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			}
 		}()
 
-		// Cap request body to bound memory use against oversized payloads.
-		r.Body = http.MaxBytesReader(w, r.Body, chatMaxBodyBytes)
-
-		var reqBody map[string]interface{}
-		// UseNumber keeps client numbers as json.Number so their exact token
-		// (1e18, 9007199254740993, long fractions) survives re-marshaling into
-		// the gateway request verbatim instead of being rounded through float64.
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&reqBody); err != nil {
-			entry.StatusCode, entry.ErrorMsg = 400, truncateRunes("Invalid JSON body: "+err.Error(), 500)
-			writeError(w, 400, "invalid_request_error", "Invalid JSON body: "+err.Error())
-			return
-		}
-
-		// Only authenticated requests with a valid body are counted.
+		// Only authenticated requests with a valid body are counted. The stats
+		// label is the bare model so a prefixed request aggregates with the
+		// unprefixed one.
 		model := statsModelLabel(reqBody, b, r.Context())
 		entry.Model = model
 		entry.Stream, _ = reqBody["stream"].(bool)
@@ -162,27 +206,27 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			}
 		}
 
-		// One failover attempt is made when the upstream rejects the session
-		// credentials before any byte reached the client: the response is still
-		// uncommitted there (headers may have been set but WriteHeader not
-		// called), so swapping to another account's bridge and retrying is
-		// invisible to the client. A StreamReportedError (content already
-		// delivered, failure wrapped by handleStream) or a client disconnect
-		// (context.Canceled) rules the response committed and skips the retry.
+		// A failed account is excluded and the request retried on another one
+		// when the upstream rejects the session credentials before any byte
+		// reached the client (response still uncommitted). A StreamReportedError
+		// (content already delivered) or a client disconnect (context.Canceled)
+		// rules the response committed and skips the retry.
 		for attempt := 0; ; attempt++ {
 			err := b.HandleChat(r.Context(), w, reqBody, usageSink)
 			if err == nil {
+				if rb.OnSuccess != nil {
+					rb.OnSuccess()
+				}
 				break
 			}
 			var authErr *auth.AuthError
 			var repErr *StreamReportedError
-			if attempt == 0 && failover != nil && errors.As(err, &authErr) &&
+			if failover != nil && attempt < maxFailoverAttempts && errors.As(err, &authErr) &&
 				!errors.As(err, &repErr) && !errors.Is(err, context.Canceled) {
-				// Ask the caller for a replacement bridge on another account;
-				// nil means no candidate (or switching disabled) — fall
-				// through to the original 502 mapping.
-				if next := failover(rb.AccountID); next != nil && next.Bridge != nil {
-					log.Printf("[bridge] upstream auth failure on account %s; retrying once on the switched account", rb.AccountID)
+				// Exclude the account that just failed, then ask for another.
+				routeReq.Exclude[rb.AccountID] = true
+				if next := failover(rb.AccountID, routeReq, routeReq.Exclude); next != nil && next.Bridge != nil {
+					log.Printf("[bridge] upstream auth failure on account %s; retrying on another account", rb.AccountID)
 					rb, b = next, next.Bridge
 					entry.KeyID, entry.KeyNote = next.KeyID, next.KeyNote
 					continue
@@ -194,6 +238,39 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		entry.StatusCode = 200
 		record(true)
 	}
+}
+
+// firstUserContent returns the first user message's text, used as the sticky
+// routing seed so a conversation keeps hitting the same account. Empty when no
+// textual user message exists (routing then keys on the API key alone).
+func firstUserContent(reqBody map[string]interface{}) string {
+	msgs, _ := reqBody["messages"].([]interface{})
+	for _, m := range msgs {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := mm["role"].(string); role != "user" {
+			continue
+		}
+		switch c := mm["content"].(type) {
+		case string:
+			return truncateRunes(c, 256)
+		case []interface{}:
+			for _, part := range c {
+				pm, ok := part.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if t, _ := pm["type"].(string); t == "text" {
+					if txt, _ := pm["text"].(string); txt != "" {
+						return truncateRunes(txt, 256)
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // clientGone reports whether err is a client-initiated disconnect (or server
@@ -341,7 +418,7 @@ func MakeModelsHandler(resolver BridgeResolver) http.HandlerFunc {
 		token := extractBearerToken(r)
 		var b *OpenAiBridge
 		if resolver != nil && token != "" {
-			if rb := resolver(token); rb != nil {
+			if rb := resolver(ResolveRequest{APIKey: token, Region: models.RegionDefault}); rb != nil {
 				b = rb.Bridge
 			}
 		}

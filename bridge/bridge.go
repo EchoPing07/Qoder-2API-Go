@@ -79,6 +79,26 @@ type OpenAiBridge struct {
 	// the gateway's per-account admission window yields business code 10605
 	// ("gateway busy") over HTTP 401/403, so we queue locally instead.
 	chatSlots chan struct{}
+	// inFlight counts chat requests currently holding a chatSlots token. The
+	// router reads it to spread load (least-inflight / saturation avoidance).
+	inFlight atomic.Int32
+}
+
+// InFlight returns the number of chat requests currently occupying an upstream
+// slot on this account.
+func (b *OpenAiBridge) InFlight() int {
+	if b == nil {
+		return 0
+	}
+	return int(b.inFlight.Load())
+}
+
+// Capacity returns the per-account upstream concurrency limit.
+func (b *OpenAiBridge) Capacity() int {
+	if b == nil {
+		return 0
+	}
+	return cap(b.chatSlots)
 }
 
 // NewOpenAiBridge creates a new bridge for the given PAT.

@@ -101,17 +101,43 @@ type AccountSnapshot struct {
 	LastError string `json:"last_error,omitempty"`
 }
 
-// AutoSwitch configures automatic switching on low credits: when the active
-// account's remaining credits fall to the absolute Threshold, the switcher
-// moves to the account with the most credits left.
+// AutoSwitch configures multi-account routing. Enabled/Threshold still exclude
+// low-credit accounts from receiving new requests (and drive the legacy
+// switch-to-richest behaviour); the remaining fields tune how requests are
+// spread across the healthy pool.
 type AutoSwitch struct {
 	Enabled   bool    `json:"enabled"`
 	Threshold float64 `json:"threshold"`
+	// Strategy selects the account-picking policy:
+	//   "sticky"        — reuse the same account for a conversation until it
+	//                     serves StickyLimit requests, then rotate (default);
+	//   "round-robin"   — rotate every request;
+	//   "least-inflight" — prefer the account with the fewest in-flight requests.
+	Strategy string `json:"strategy"`
+	// StickyLimit is how many requests one conversation may stay on a single
+	// account before it is rotated to the next one. 0 disables rotation (the
+	// binding is kept until it expires).
+	StickyLimit int `json:"sticky_limit"`
+	// MaxRetryAccounts caps how many accounts one chat request may try when it
+	// hits an upstream auth failure (1..16).
+	MaxRetryAccounts int `json:"max_retry_accounts"`
 }
 
-// DefaultAutoSwitchThreshold is the remaining-credits threshold below which
-// automatic switching considers moving to another account.
-const DefaultAutoSwitchThreshold = 20
+// Routing strategy identifiers.
+const (
+	StrategySticky        = "sticky"
+	StrategyRoundRobin    = "round-robin"
+	StrategyLeastInFlight = "least-inflight"
+)
+
+// Defaults for the routing knobs.
+const (
+	DefaultAutoSwitchThreshold = 20
+	DefaultStickyLimit         = 10
+	DefaultMaxRetryAccounts    = 3
+	MinMaxRetryAccounts        = 1
+	MaxMaxRetryAccounts        = 16
+)
 
 // DefaultHost is the default listen host.
 const DefaultHost = "0.0.0.0"
@@ -278,6 +304,21 @@ func (s *Store) load() error {
 	}
 	if cfg.AutoSwitch.Threshold <= 0 {
 		cfg.AutoSwitch.Threshold = DefaultAutoSwitchThreshold
+		needsSave = true
+	}
+	if cfg.AutoSwitch.Strategy == "" {
+		cfg.AutoSwitch.Strategy = StrategySticky
+		needsSave = true
+	}
+	if cfg.AutoSwitch.MaxRetryAccounts == 0 {
+		cfg.AutoSwitch.MaxRetryAccounts = DefaultMaxRetryAccounts
+		needsSave = true
+	}
+	// StickyLimit is a positive count; a missing/zero value (older files) gets
+	// the default so existing deployments still rotate. There is no "never
+	// rotate" mode: set a large limit instead.
+	if cfg.AutoSwitch.StickyLimit <= 0 {
+		cfg.AutoSwitch.StickyLimit = DefaultStickyLimit
 		needsSave = true
 	}
 	s.config = &cfg
@@ -672,22 +713,60 @@ func (s *Store) SaveSnapshots(snaps map[string]*AccountSnapshot) error {
 func (s *Store) GetAutoSwitch() AutoSwitch {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	as := s.config.AutoSwitch
+	return normalizeAutoSwitch(s.config.AutoSwitch)
+}
+
+// normalizeAutoSwitch fills in defaults for unset routing knobs so callers
+// never have to special-case an empty strategy or zero retry budget.
+func normalizeAutoSwitch(as AutoSwitch) AutoSwitch {
 	if as.Threshold <= 0 {
 		as.Threshold = DefaultAutoSwitchThreshold
+	}
+	switch as.Strategy {
+	case StrategySticky, StrategyRoundRobin, StrategyLeastInFlight:
+	default:
+		as.Strategy = StrategySticky
+	}
+	if as.StickyLimit <= 0 {
+		as.StickyLimit = DefaultStickyLimit
+	}
+	if as.MaxRetryAccounts <= 0 {
+		as.MaxRetryAccounts = DefaultMaxRetryAccounts
 	}
 	return as
 }
 
-// SetAutoSwitch validates and persists the auto-switch settings. Threshold is
-// absolute credits (>= 1) with no upper bound: a pool where every balance
-// sits below the threshold simply stays put by design.
+// SetAutoSwitch validates and persists the enabled flag plus credit threshold,
+// preserving the routing knobs (Strategy/StickyLimit/MaxRetryAccounts).
 func (s *Store) SetAutoSwitch(enabled bool, threshold float64) error {
-	if threshold < 1 {
+	cfg := s.GetAutoSwitch()
+	cfg.Enabled = enabled
+	cfg.Threshold = threshold
+	return s.SetAutoSwitchConfig(cfg)
+}
+
+// SetAutoSwitchConfig validates and persists the full routing configuration.
+// Threshold is absolute credits (>= 1) with no upper bound: a pool where every
+// balance sits below the threshold simply stops serving new requests.
+func (s *Store) SetAutoSwitchConfig(cfg AutoSwitch) error {
+	if cfg.Threshold < 1 {
 		return fmt.Errorf("阈值需不小于 1 积分")
 	}
+	switch cfg.Strategy {
+	case StrategySticky, StrategyRoundRobin, StrategyLeastInFlight:
+	case "":
+		cfg.Strategy = StrategySticky
+	default:
+		return fmt.Errorf("未知的路由策略: %s", cfg.Strategy)
+	}
+	if cfg.StickyLimit < 1 {
+		return fmt.Errorf("粘性次数需不小于 1")
+	}
+	if cfg.MaxRetryAccounts < MinMaxRetryAccounts || cfg.MaxRetryAccounts > MaxMaxRetryAccounts {
+		return fmt.Errorf("最大重试账号数需在 %d..%d 之间", MinMaxRetryAccounts, MaxMaxRetryAccounts)
+	}
 	s.mu.Lock()
-	s.config.AutoSwitch = AutoSwitch{Enabled: enabled, Threshold: threshold}
+	s.config.AutoSwitch = cfg
 	s.mu.Unlock()
 	return s.save()
 }

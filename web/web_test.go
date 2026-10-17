@@ -579,10 +579,12 @@ func TestMovedModelsAndTier(t *testing.T) {
 		}
 	}
 
-	// 自动切换设置卡：开关 + 阈值输入 + 保存动作必须存在
+	// 负载均衡设置卡：开关 + 策略 + 阈值输入 + 保存动作必须存在
 	for _, want := range []string{
-		`<h3>自动切换</h3>`,
+		`<h3>负载均衡 / 自动切换</h3>`,
 		`x-model.number="autoSwitch.threshold"`,
+		`x-model="autoSwitch.strategy"`,
+		`x-model.number="autoSwitch.sticky_limit"`,
 		`@click="saveAutoSwitch()"`,
 	} {
 		if !strings.Contains(token, want) {

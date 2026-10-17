@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"qoder2api/auth"
+	"qoder2api/bridge"
+	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
 )
@@ -354,12 +356,11 @@ func TestPatSwitchDoesNotShowPreviousAccountWhenNewRefreshFails(t *testing.T) {
 	}
 }
 
-// ═══ Automatic account switching ═══
+// ═══ Multi-account routing ═══
 
-// newSwitchTestProvider builds a provider + store with a two-account pool:
-// acc1 active (remaining 10%), acc2 idle (remaining 80%), auto-switch enabled
-// at 20%.
-func newSwitchTestPool(t *testing.T) (*bridgeProvider, *store.Store, string, string) {
+// newRouteTestPool builds a provider + store with a two-account pool:
+// acc1 (remaining 10, active), acc2 (remaining 80), auto-switch enabled at 20.
+func newRouteTestPool(t *testing.T) (*bridgeProvider, *store.Store, string, string) {
 	t.Helper()
 	s, err := store.New(t.TempDir() + "/data.json")
 	if err != nil {
@@ -367,150 +368,200 @@ func newSwitchTestPool(t *testing.T) (*bridgeProvider, *store.Store, string, str
 	}
 	acc1, _ := s.AddAccount("pt-a", "一号")
 	acc2, _ := s.AddAccount("pt-b", "二号")
-	s.SetAccountSnapshot(acc1.ID, &store.AccountSnapshot{Remaining: 10, Total: 100, CheckedAt: time.Now().Unix()})
+	s.SetAccountSnapshot(acc1.ID, &store.AccountSnapshot{Remaining: 50, Total: 100, CheckedAt: time.Now().Unix()})
 	s.SetAccountSnapshot(acc2.ID, &store.AccountSnapshot{Remaining: 80, Total: 100, CheckedAt: time.Now().Unix()})
 	s.SetAutoSwitch(true, 20)
 	p := newBridgeProvider(s)
-	p.switcher = newAutoSwitcher(s)
 	return p, s, acc1.ID, acc2.ID
 }
 
-// TestPickCandidate 候选选择：跳过冷却/自身，优先余额充足者；无充足者回退到最高余额。
-func TestPickCandidate(t *testing.T) {
-	accounts := []store.Account{
-		{ID: "self", PAT: "pt-self", Snapshot: &store.AccountSnapshot{Remaining: 10, Total: 100}},
-		{ID: "hi", PAT: "pt-hi", Snapshot: &store.AccountSnapshot{Remaining: 80, Total: 100}},
-		{ID: "cool", PAT: "pt-cool", Snapshot: &store.AccountSnapshot{Remaining: 95, Total: 100, CooldownUntil: time.Now().Add(time.Hour).Unix()}},
-		{ID: "low", PAT: "pt-low", Snapshot: &store.AccountSnapshot{Remaining: 15, Total: 100}},
-		{ID: "nosnap", PAT: "pt-nosnap"},
+// pickWith is a test helper: route once and return the chosen account ID.
+func pickWith(p *bridgeProvider, model string, filter models.RegionFilter, exclude map[string]bool) string {
+	acc, _, ok := p.router.pick("key-1", model, "seed", filter, exclude)
+	if !ok {
+		return ""
 	}
-	if got := pickCandidate(accounts, "self", 20); got != "hi" {
-		t.Errorf("pick = %q, want hi (highest comfortable)", got)
+	return acc.ID
+}
+
+// TestRouterRoundRobinSpreads 轮询：连续请求在不同账号间交替，不集中在同一账号。
+func TestRouterRoundRobinSpreads(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
 	}
-	// hi 也进冷却 → 回退到未冷却的最高余额（low，虽低于阈值但强于猜测）
-	accounts[1].Snapshot.CooldownUntil = time.Now().Add(time.Hour).Unix()
-	if got := pickCandidate(accounts, "self", 20); got != "low" {
-		t.Errorf("pick = %q, want low (fallback)", got)
+	seen := map[string]int{}
+	for i := 0; i < 10; i++ {
+		id := pickWith(p, "Qwen3.8-Flash", models.RegionDefault, nil)
+		if id == "" {
+			t.Fatal("no route")
+		}
+		seen[id]++
 	}
-	// 全冷却 → 无候选
-	accounts[3].Snapshot.CooldownUntil = time.Now().Add(time.Hour).Unix()
-	if got := pickCandidate(accounts, "self", 20); got != "" {
-		t.Errorf("pick = %q, want empty", got)
+	if seen[acc1] == 0 || seen[acc2] == 0 {
+		t.Errorf("round-robin must use both accounts, got %+v", seen)
+	}
+	if seen[acc1] < 4 || seen[acc2] < 4 {
+		t.Errorf("round-robin distribution too skewed: %+v", seen)
 	}
 }
 
-// TestAutoSwitchOnThreshold 低于阈值的 usage 扣减触发自动切号，并复用 PAT-change
-// 链路（hook 清快照）。
-func TestAutoSwitchOnThreshold(t *testing.T) {
-	p, s, acc1, acc2 := newSwitchTestPool(t)
-	clears := 0
-	p.switcher.setOnSwitch(func() { clears++ })
+// TestRouterStickyReusesThenRotates 粘性：同一会话连续命中同一账号，达到上限后轮换。
+func TestRouterStickyReusesThenRotates(t *testing.T) {
+	p, s, _, _ := newRouteTestPool(t)
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategySticky
+	cfg.StickyLimit = 3
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Same conversation seed for every pick (sticky keys on it).
+	pickSame := func() string {
+		acc, _, ok := p.router.pick("key-1", "m", "conv-1", models.RegionDefault, nil)
+		if !ok {
+			t.Fatal("no route")
+		}
+		return acc.ID
+	}
+	// First pick + successful bind pins the conversation to account A.
+	first := pickSame()
+	_, stickyKey, _ := p.router.pick("key-1", "m", "conv-1", models.RegionDefault, nil)
+	// The pick above already bound? No: bind only happens on success. Bind
+	// explicitly to simulate the first success.
+	stickyKey = stickyKeyFor("key-1", "conv-1")
+	p.router.bind(stickyKey, first)
 
-	// 扣到阈值下方 → 切到二号（先把驻留期拨过去：新建的 switcher 因 60s 驻留
-	// 会挡下首次阈值切换）
-	p.switcher.mu.Lock()
-	p.switcher.since = time.Now().Add(-2 * minResidence)
-	p.switcher.mu.Unlock()
-	p.deductCredits(acc1, 5) // 10-5=5% < 20%
-	if s.GetActiveAccountID() != acc2 {
-		t.Fatalf("active = %q, want %q", s.GetActiveAccountID(), acc2)
-	}
-	if s.GetPAT() != "pt-b" {
-		t.Errorf("PAT mirror = %q, want pt-b (switch is SetPAT)", s.GetPAT())
-	}
-	if clears != 1 {
-		t.Errorf("post-switch hook fired %d times, want 1", clears)
-	}
-	// 滞回外的正常扣减不切号（现在活跃的是二号，余额充足）
-	p.deductCredits(acc2, 5) // 80-5=75% > 20%
-	if s.GetActiveAccountID() != acc2 {
-		t.Error("healthy deduction must not switch")
-	}
-}
-
-// TestAutoSwitchDisabled 开关关闭时阈值突破不切号。
-func TestAutoSwitchDisabled(t *testing.T) {
-	p, s, acc1, _ := newSwitchTestPool(t)
-	s.SetAutoSwitch(false, 20)
-	p.deductCredits(acc1, 5)
-	if s.GetActiveAccountID() != acc1 {
-		t.Error("disabled auto-switch must not move the active account")
-	}
-}
-
-// TestFailoverSwitchesAndCools chat 路径的 AuthError failover：失败号进冷却、
-// 切到候选号、返回重建的 bridge；无候选时返回 nil（回退到原始 502）。
-func TestFailoverSwitchesAndCools(t *testing.T) {
-	p, s, acc1, acc2 := newSwitchTestPool(t)
-
-	next := p.handleChatFailover(acc1)
-	if next == nil {
-		t.Fatal("failover should return a replacement bridge")
-	}
-	if s.GetActiveAccountID() != acc2 {
-		t.Fatalf("active = %q, want %q", s.GetActiveAccountID(), acc2)
-	}
-	// 失败号进冷却（5 分钟）
-	for _, acc := range s.ListAccounts() {
-		if acc.ID == acc1 && (acc.Snapshot == nil || acc.Snapshot.CooldownUntil < time.Now().Unix()) {
-			t.Errorf("failed account not cooling down: %+v", acc.Snapshot)
+	// Reuses stay on A until count exceeds StickyLimit.
+	for i := 0; i < cfg.StickyLimit; i++ {
+		if got := pickSame(); got != first {
+			t.Fatalf("sticky reuse %d = %q, want %q", i, got, first)
 		}
 	}
-	// 返回的 bridge 指向新账号
-	if next.AccountID != acc2 {
-		t.Errorf("replacement AccountID = %q, want %q", next.AccountID, acc2)
-	}
-	// 二号也失败：无候选 → nil，激活不移动
-	next = p.handleChatFailover(acc2)
-	if next != nil {
-		t.Error("no candidate must give up (nil)")
-	}
-	if s.GetActiveAccountID() != acc2 {
-		t.Error("a failed switch attempt must not move the active account")
+	// The next pick rotates to the other account.
+	if got := pickSame(); got == first {
+		t.Errorf("after StickyLimit the router must rotate, still on %q", got)
 	}
 }
 
-// TestFailoverDedupesConcurrent 并发失败去重：第二个调用者发现激活已切换（failedID
-// 不再是激活账号）时不再切号，直接回 nil（该请求在原 bridge 上重试也已被首切覆盖，
-// 由 handler 重新 resolve 完成迁移）。
-func TestFailoverDedupesConcurrent(t *testing.T) {
-	p, s, acc1, _ := newSwitchTestPool(t)
-	// 首切成功
-	p.handleChatFailover(acc1)
-	active := s.GetActiveAccountID()
-	// 同一失败号再来：activeID 已变，直接返回（不再切，也不再冷却别人）
-	next := p.handleChatFailover(acc1)
-	if next != nil {
-		t.Error("stale failure report must return nil")
+// TestRouterDefaultRegionPrefersCN 无前缀默认国内；池里无国内账号时跨区。
+func TestRouterDefaultRegionPrefersCN(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s.GetActiveAccountID() != active {
-		t.Error("dedupe must keep the current active account")
+	cn, _ := s.AddAccountWithRegion("pt-cn", "", "cn")
+	gl, _ := s.AddAccountWithRegion("pt-gl", "", "global")
+	s.SetAutoSwitch(true, 20)
+	p := newBridgeProvider(s)
+
+	for i := 0; i < 6; i++ {
+		if id := pickWith(p, "m", models.RegionDefault, nil); id != cn.ID {
+			t.Fatalf("default filter must prefer CN, got %q", id)
+		}
+	}
+	// cn/ pins CN; gl/ pins global.
+	if id := pickWith(p, "m", models.RegionGlobal, nil); id != gl.ID {
+		t.Errorf("global filter = %q, want %q", id, gl.ID)
+	}
+	if id := pickWith(p, "m", models.RegionCN, nil); id != cn.ID {
+		t.Errorf("cn filter = %q, want %q", id, cn.ID)
+	}
+	// auto balances across both.
+	seen := map[string]bool{}
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	_ = s.SetAutoSwitchConfig(cfg)
+	for i := 0; i < 6; i++ {
+		seen[pickWith(p, "m", models.RegionAuto, nil)] = true
+	}
+	if !seen[cn.ID] || !seen[gl.ID] {
+		t.Errorf("auto must span both regions, got %+v", seen)
 	}
 }
 
-// TestMaybeSwitchRespectsResidence 阈值切换受最小驻留约束（60s），失败切换不受。
-func TestMaybeSwitchRespectsResidence(t *testing.T) {
-	p, s, acc1, acc2 := newSwitchTestPool(t)
-	// 刚切过（since=now），阈值触发被驻留挡下
-	p.deductCredits(acc1, 5)
-	if s.GetActiveAccountID() != acc1 {
-		t.Fatal("precondition: fresh account must resist threshold switch")
+// TestRouterDefaultFallsBackWhenNoCN 只有国际账号时，无前缀请求跨区落到国际账号。
+func TestRouterDefaultFallsBackWhenNoCN(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 失败路径无视驻留
-	if next := p.handleChatFailover(acc1); next == nil {
-		t.Error("failure switch must ignore min residence")
+	gl, _ := s.AddAccountWithRegion("pt-gl", "", "global")
+	s.SetAutoSwitch(true, 20)
+	p := newBridgeProvider(s)
+	if id := pickWith(p, "m", models.RegionDefault, nil); id != gl.ID {
+		t.Errorf("default with no CN account must fall back to global, got %q", id)
 	}
-	if s.GetActiveAccountID() != acc2 {
-		t.Errorf("active = %q, want %q", s.GetActiveAccountID(), acc2)
+}
+
+// TestRouterExcludesLowCreditsAndCooldown 低于阈值或冷却中的账号不接新请求。
+func TestRouterExcludesLowCreditsAndCooldown(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	// acc1 剩余 10 <= 阈值 20 -> 排除；只剩 acc2。
+	s.SetAccountSnapshot(acc1, &store.AccountSnapshot{Remaining: 10, Total: 100, CheckedAt: time.Now().Unix()})
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
 	}
+	for i := 0; i < 4; i++ {
+		if id := pickWith(p, "m", models.RegionDefault, nil); id != acc2 {
+			t.Fatalf("low-credit account must be excluded, got %q", id)
+		}
+	}
+	// acc2 也进冷却 -> 无可用路由。
+	p.router.markFailure(acc2)
+	if id := pickWith(p, "m", models.RegionDefault, nil); id != "" {
+		t.Errorf("all accounts cooling must yield no route, got %q", id)
+	}
+	_ = acc1
+}
+
+// TestRouterExcludeSetSkipsFailedAccount 失败重试时被排除的账号不再选中。
+func TestRouterExcludeSetSkipsFailedAccount(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	exclude := map[string]bool{acc1: true}
+	for i := 0; i < 4; i++ {
+		if id := pickWith(p, "m", models.RegionDefault, exclude); id != acc2 {
+			t.Fatalf("excluded account selected: %q", id)
+		}
+	}
+}
+
+// TestFailoverRoutesToAnotherAccount chat 路径 failover：失败号冷却并排除，
+// 请求改投另一账号，返回其 bridge。
+func TestFailoverRoutesToAnotherAccount(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	req := bridge.ResolveRequest{APIKey: "sk-test", Model: "m", Region: models.RegionDefault}
+	// 用真实 key 才能通过 LookupKey。
+	key, _ := s.AddKey("sk-test", "")
+	_ = key
+	next := p.handleChatFailover(acc1, req, map[string]bool{})
+	if next == nil {
+		t.Fatal("failover should route to another account")
+	}
+	if next.AccountID == acc1 {
+		t.Errorf("failover must not reuse the failed account")
+	}
+	// 失败号进冷却快照。
+	if snap := p.snapshotFor(acc1); snap == nil || snap.CooldownUntil <= time.Now().Unix() {
+		t.Errorf("failed account not cooling: %+v", snap)
+	}
+	_ = acc2
 }
 
 // TestApplyQuotaOrgOnlyAccountNotZeroed 纯组织包账号（Teams）的 userQuota
 // 上游恒为 0/0：快照必须采用组织包而非被清零（PR #6 修复的回归）。
 func TestApplyQuotaOrgOnlyAccountNotZeroed(t *testing.T) {
-	p, _, acc1, _ := newSwitchTestPool(t)
+	p, _, acc1, _ := newRouteTestPool(t)
 	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
-		UserQuota:           &auth.Quota{Total: 0, Remaining: 0},
+		UserQuota:          &auth.Quota{Total: 0, Remaining: 0},
 		OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: true},
 	})
 	snap := p.snapshots[acc1]
@@ -522,9 +573,9 @@ func TestApplyQuotaOrgOnlyAccountNotZeroed(t *testing.T) {
 // TestApplyQuotaUnavailableOrgPackageExcluded 组织包对本成员不可用时
 // 不计入额度；没有其他可用池则快照为零（被动扣减因此 no-op，不猜测）。
 func TestApplyQuotaUnavailableOrgPackageExcluded(t *testing.T) {
-	p, _, acc1, _ := newSwitchTestPool(t)
+	p, _, acc1, _ := newRouteTestPool(t)
 	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
-		UserQuota:           &auth.Quota{Total: 0, Remaining: 0},
+		UserQuota:          &auth.Quota{Total: 0, Remaining: 0},
 		OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: false},
 	})
 	snap := p.snapshots[acc1]
@@ -544,8 +595,8 @@ func TestSumSpendablePools(t *testing.T) {
 		{
 			name: "all pools",
 			st: &auth.AccountStatus{
-				UserQuota:           &auth.Quota{Total: 100, Remaining: 60},
-				AddOnQuota:          &auth.Quota{Total: 50, Remaining: 50},
+				UserQuota:          &auth.Quota{Total: 100, Remaining: 60},
+				AddOnQuota:         &auth.Quota{Total: 50, Remaining: 50},
 				OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: true},
 			},
 			wantTotal:     1150,
@@ -589,12 +640,12 @@ func TestSumSpendablePools(t *testing.T) {
 // TestApplyQuotaHardExhaustedCoolsUntilReset 权威校正把硬耗尽冷却到下次重置点，
 // 恢复后清除冷却。
 func TestApplyQuotaHardExhaustedCoolsUntilReset(t *testing.T) {
-	p, _, acc1, _ := newSwitchTestPool(t)
+	p, _, acc1, _ := newRouteTestPool(t)
 	resetMs := time.Now().Add(48 * time.Hour).UnixMilli()
 	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
-		UserQuota:      &auth.Quota{Total: 100, Remaining: 0},
+		UserQuota:       &auth.Quota{Total: 100, Remaining: 0},
 		IsQuotaExceeded: true,
-		NextResetAtMs:  resetMs,
+		NextResetAtMs:   resetMs,
 	})
 	snap := p.snapshots[acc1]
 	if snap.CooldownUntil != resetMs/1000 {
@@ -602,7 +653,7 @@ func TestApplyQuotaHardExhaustedCoolsUntilReset(t *testing.T) {
 	}
 	// 恢复
 	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
-		UserQuota:      &auth.Quota{Total: 100, Remaining: 50},
+		UserQuota:       &auth.Quota{Total: 100, Remaining: 50},
 		IsQuotaExceeded: false,
 	})
 	if p.snapshots[acc1].CooldownUntil != 0 {
@@ -612,7 +663,7 @@ func TestApplyQuotaHardExhaustedCoolsUntilReset(t *testing.T) {
 
 // TestFlushAccountSnapshots 被动扣减的内存快照按 30s 循环批量落盘。
 func TestFlushAccountSnapshots(t *testing.T) {
-	p, s, acc1, _ := newSwitchTestPool(t)
+	p, s, acc1, _ := newRouteTestPool(t)
 	// 种子内存快照并扣减（不开自动切，免得切走）
 	s.SetAutoSwitch(false, 20)
 	p.snapMu.Lock()
@@ -644,7 +695,6 @@ func TestDeductCreditsWithoutBaseline(t *testing.T) {
 	acc, _ := s.AddAccount("pt-x", "")
 	s.SetAutoSwitch(true, 20)
 	p := newBridgeProvider(s)
-	p.switcher = newAutoSwitcher(s)
 	p.deductCredits(acc.ID, 5) // 无快照：不能崩、不能切
 	if s.GetActiveAccountID() != acc.ID {
 		t.Error("deduction without baseline must not switch")

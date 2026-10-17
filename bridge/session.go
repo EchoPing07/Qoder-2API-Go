@@ -442,6 +442,18 @@ func (b *OpenAiBridge) forceRefresh(ctx context.Context) error {
 	return b.doRenew(ctx, true)
 }
 
+// CachedCatalog returns the catalog only if one has already been fetched (no
+// upstream call). The router uses it to test model support without paying a
+// session round-trip per routing decision.
+func (b *OpenAiBridge) CachedCatalog() *models.ModelCatalog {
+	if b == nil {
+		return nil
+	}
+	b.catalogMu.Lock()
+	defer b.catalogMu.Unlock()
+	return b.catalog
+}
+
 // GetCatalog returns the dynamic model catalog (TTL cached, single-flight).
 func (b *OpenAiBridge) GetCatalog(ctx context.Context) *models.ModelCatalog {
 	now := float64(time.Now().Unix())

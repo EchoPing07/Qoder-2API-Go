@@ -742,3 +742,42 @@ func TestAddAccountWithRegion(t *testing.T) {
 		t.Errorf("GetAccount lost region: %+v ok=%v", acc, ok)
 	}
 }
+
+// TestAutoSwitchRoutingConfig 路由配置字段默认值、持久化与校验。
+func TestAutoSwitchRoutingConfig(t *testing.T) {
+	s := tempStore(t)
+	as := s.GetAutoSwitch()
+	if as.Strategy != StrategySticky || as.StickyLimit != DefaultStickyLimit || as.MaxRetryAccounts != DefaultMaxRetryAccounts {
+		t.Errorf("defaults = %+v", as)
+	}
+	cfg := AutoSwitch{Enabled: true, Threshold: 30, Strategy: StrategyLeastInFlight, StickyLimit: 5, MaxRetryAccounts: 6}
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Reload from disk: the new fields must persist.
+	reloaded, err := New(s.filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reloaded.GetAutoSwitch()
+	if got.Strategy != StrategyLeastInFlight || got.StickyLimit != 5 || got.MaxRetryAccounts != 6 || got.Threshold != 30 {
+		t.Errorf("reloaded = %+v", got)
+	}
+	// Validation.
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: "bogus", StickyLimit: 1, MaxRetryAccounts: 1}); err == nil {
+		t.Error("unknown strategy must be rejected")
+	}
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: StrategySticky, StickyLimit: 1, MaxRetryAccounts: 99}); err == nil {
+		t.Error("out-of-range max retry must be rejected")
+	}
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: StrategySticky, StickyLimit: 0, MaxRetryAccounts: 1}); err == nil {
+		t.Error("zero sticky limit must be rejected")
+	}
+	// SetAutoSwitch (legacy) preserves the routing knobs.
+	if err := s.SetAutoSwitch(true, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.GetAutoSwitch(); got.Strategy != StrategyLeastInFlight || got.StickyLimit != 5 {
+		t.Errorf("SetAutoSwitch must preserve routing knobs: %+v", got)
+	}
+}
