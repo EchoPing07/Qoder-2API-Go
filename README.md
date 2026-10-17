@@ -78,7 +78,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | ------- | -------- | ------ |
 | `QODER_HOST` | `0.0.0.0` | 监听地址 |
 | `QODER_PORT` | `10081` | 监听端口 |
-| `QODER_REGION` | `intl` | 上游区域：`intl` 国际区（center/api3/openapi.qoder.sh，与 QoderGateway 等 Python 实现一致）；`cn` 国内区（gateway.qoder.com.cn）。PAT 不通用，需与账号实际注册区域一致 |
+| `QODER_REGION` | `cn` | 上游区域：`cn` 国内区（gateway.qoder.com.cn）；`intl` 国际区（center/api3/openapi.qoder.sh，与 QoderGateway 等 Python 实现一致）。两区 PAT 不通用，需与账号实际注册区域一致 |
 | `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
 | `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
 | `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |

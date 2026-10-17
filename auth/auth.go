@@ -55,13 +55,13 @@ var INTL = &RegionConfig{
 	OpenAPIBase: "https://openapi.qoder.sh",
 }
 
-// Resolve 按 QODER_REGION 环境变量选择区域，默认国际区（存量账号均为 qoder.sh 国际区）。
+// Resolve 按 QODER_REGION 环境变量选择区域（cn / intl），默认保持 cn 以兼容存量行为。
 func Resolve(pat string) (string, *RegionConfig) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_REGION"))) {
-	case "cn":
-		return pat, CN
-	default:
+	case "intl":
 		return pat, INTL
+	default:
+		return pat, CN
 	}
 }
 
