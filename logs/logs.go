@@ -18,6 +18,8 @@ type LogEntry struct {
 	ID               int64   `json:"id"`
 	KeyID            string  `json:"key_id,omitempty"`
 	KeyNote          string  `json:"key_note,omitempty"`
+	AccountID        string  `json:"account_id,omitempty"`
+	AccountNote      string  `json:"account_note,omitempty"`
 	Model            string  `json:"model,omitempty"`
 	Stream           bool    `json:"stream,omitempty"`
 	PromptTokens     int     `json:"prompt_tokens,omitempty"`

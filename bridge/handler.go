@@ -32,6 +32,8 @@ type ResolvedBridge struct {
 	// gives the failover callback the identity of the account that failed so
 	// concurrent failures can dedupe against the already-switched account.
 	AccountID string
+	// AccountNote is the account's panel note, for request logs.
+	AccountNote string
 }
 
 // FailoverFunc reports an upstream auth failure on the given account and lets
@@ -103,7 +105,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		// One log entry per authenticated request; auth failures are rejected
 		// above and never logged. Fields are filled in below and the entry is
 		// recorded by the deferred flush, the single exit point.
-		entry := &logs.LogEntry{KeyID: rb.KeyID, KeyNote: rb.KeyNote}
+		entry := &logs.LogEntry{KeyID: rb.KeyID, KeyNote: rb.KeyNote, AccountID: rb.AccountID, AccountNote: rb.AccountNote}
 		defer func() {
 			entry.DurationMs = time.Since(start).Milliseconds()
 			if lr != nil {

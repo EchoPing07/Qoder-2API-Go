@@ -102,7 +102,15 @@ func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
 	if b == nil {
 		return nil
 	}
-	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: p.store.GetActiveAccountID()}
+	accountID := p.store.GetActiveAccountID()
+	accountNote := ""
+	for _, acc := range p.store.ListAccounts() {
+		if acc.ID == accountID {
+			accountNote = acc.Note
+			break
+		}
+	}
+	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: accountID, AccountNote: accountNote}
 }
 
 // pickBridge routes the request round-robin across every pool account that is
@@ -118,8 +126,9 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 	}
 	now := time.Now().Unix()
 	type candidate struct {
-		id  string
-		pat string
+		id   string
+		pat  string
+		note string
 	}
 	var cands []candidate
 	for _, acc := range p.store.ListAccounts() {
@@ -139,7 +148,7 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 				continue
 			}
 		}
-		cands = append(cands, candidate{acc.ID, acc.PAT})
+		cands = append(cands, candidate{acc.ID, acc.PAT, acc.Note})
 	}
 	if len(cands) == 0 {
 		return nil
@@ -149,7 +158,7 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 	c := cands[p.rr%uint64(len(cands))]
 	p.mu.Unlock()
 	b := p.bridgeFor(c.id, c.pat)
-	return &bridge.ResolvedBridge{Bridge: b, AccountID: c.id}
+	return &bridge.ResolvedBridge{Bridge: b, AccountID: c.id, AccountNote: c.note}
 }
 
 // bridgeFor returns the cached bridge for a specific pool account, building it
