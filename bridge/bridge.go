@@ -68,6 +68,13 @@ type OpenAiBridge struct {
 	account   *auth.AccountStatus
 	accountTs float64
 
+	// OpenAPI bearer cache, used only for regions that reject the COSY token
+	// on the quota endpoint (global). Guarded by openAPIMu.
+	openAPIMu      sync.Mutex
+	openAPIToken   string
+	openAPIRefresh string
+	openAPIExpMs   int64
+
 	// chatSlots bounds concurrent upstream chat requests per PAT. Exceeding
 	// the gateway's per-account admission window yields business code 10605
 	// ("gateway busy") over HTTP 401/403, so we queue locally instead.

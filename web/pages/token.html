@@ -19,7 +19,7 @@
           </div>
           <div class="table-wrap" x-show="accounts.length">
             <table>
-              <thead><tr><th>令牌</th><th>备注</th><th>剩余额度</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
+              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
               <tbody>
                 <template x-for="acc in accounts" :key="acc.id">
                   <tr>
@@ -29,6 +29,7 @@
                         <span class="badge badge-ok" x-show="acc.active">使用中</span>
                       </div>
                     </td>
+                    <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
                     <td x-text="accountQuota(acc)"></td>
                     <td><span class="badge" :class="accountStatusClass(acc)" x-text="accountStatus(acc)"></span></td>
@@ -88,6 +89,14 @@
         <div class="modal-title">添加账号</div>
         <p class="modal-msg">填入 Qoder 个人访问令牌（PAT）。令牌相同时视为切换到已有账号。</p>
         <div class="form-row"><label class="label">令牌</label><input class="input mono" x-model="accountForm.pat" placeholder="pt-..." autocomplete="off"></div>
+        <div class="form-row">
+          <label class="label">区域</label>
+          <select class="input" x-model="accountForm.region">
+            <option value="cn">国内版（qoder.com.cn）</option>
+            <option value="global">国际版（qoder.sh）</option>
+          </select>
+          <p class="field-hint">令牌所属区域必须匹配，否则会提示「personal token is invalid」。</p>
+        </div>
         <div class="form-row"><label class="label">备注</label><input class="input" x-model="accountForm.note" placeholder="可选描述" autocomplete="off"></div>
         <div class="modal-foot">
           <button type="button" class="btn btn-secondary btn-sm" @click="accountModal=false">取消</button>

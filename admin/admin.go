@@ -30,9 +30,11 @@ const sessionDuration = 24 * time.Hour
 const adminMaxBody = 1 << 16 // 64 KiB
 
 // AccountChecker probes one PAT's real allowance through a throwaway bridge
-// (full session bootstrap) and returns the quota snapshot. Implemented by the
-// caller (main package) — the admin package stays free of bridge wiring.
-type AccountChecker func(ctx context.Context, pat string) (*store.AccountSnapshot, error)
+// (full session bootstrap) and returns the quota snapshot. The region selects
+// the Qoder deployment (""/"cn" = China, "global" = international).
+// Implemented by the caller (main package) — the admin package stays free of
+// bridge wiring.
+type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
 
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
@@ -650,6 +652,7 @@ type accountView struct {
 	ID        string                 `json:"id"`
 	PATMasked string                 `json:"pat_masked"`
 	Note      string                 `json:"note"`
+	Region    string                 `json:"region"`
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
@@ -660,10 +663,15 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 	out := make([]accountView, 0, len(accounts))
 	for i := range accounts {
 		acc := accounts[i]
+		region := acc.Region
+		if region == "" {
+			region = "cn"
+		}
 		out = append(out, accountView{
 			ID:        acc.ID,
 			PATMasked: maskPAT(acc.PAT),
 			Note:      acc.Note,
+			Region:    region,
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
 			Snapshot:  acc.Snapshot,
@@ -682,8 +690,9 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
 	case http.MethodPost:
 		var body struct {
-			PAT  string `json:"pat"`
-			Note string `json:"note"`
+			PAT    string `json:"pat"`
+			Note   string `json:"note"`
+			Region string `json:"region"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -693,7 +702,7 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, map[string]string{"status": "switched"})
 			return
 		}
-		entry, err := a.store.AddAccount(body.PAT, body.Note)
+		entry, err := a.store.AddAccountWithRegion(body.PAT, body.Note, body.Region)
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
@@ -820,7 +829,7 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 503, "检测功能不可用")
 		return
 	}
-	snap, err := a.accountChecker(r.Context(), target.PAT)
+	snap, err := a.accountChecker(r.Context(), target.PAT, target.Region)
 	if err != nil {
 		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
 		writeJSONError(w, 502, "检测失败: "+err.Error())

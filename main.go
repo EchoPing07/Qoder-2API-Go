@@ -33,10 +33,10 @@ var Version = "dev"
 // bridgeProvider manages a single OpenAiBridge for the current PAT.
 // When the PAT changes (via admin UI), the bridge is recreated on next access.
 type bridgeProvider struct {
-	mu     sync.Mutex
-	bridge *bridge.OpenAiBridge
-	pat    string
-	store  *store.Store
+	mu       sync.Mutex
+	bridge   *bridge.OpenAiBridge
+	pat      string
+	store    *store.Store
 	switcher *autoSwitcher // nil in tests that build a provider directly
 	// snapshots are the in-memory quota snapshots maintained by passive
 	// deduction and authoritative correction; flushed to disk periodically.
@@ -101,8 +101,8 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 			p.pat = ""
 		}
 	} else if p.bridge == nil || p.pat != pat {
-		realPAT, region := auth.Resolve(pat)
-		p.bridge = bridge.NewOpenAiBridge(realPAT, region)
+		region := auth.RegionByName(p.store.AccountRegionByPAT(pat))
+		p.bridge = bridge.NewOpenAiBridge(pat, region)
 		p.pat = pat
 		b = p.bridge
 	} else {
@@ -208,9 +208,9 @@ func (s *autoSwitcher) setOnSwitch(fn func()) { s.onSwitch = fn }
 // still beats a dead one. Returns "" when nobody qualifies.
 func pickCandidate(accounts []store.Account, activeID string, threshold float64) string {
 	type cand struct {
-		id         string
-		remaining  float64
-		ready      bool // comfortably above the threshold
+		id        string
+		remaining float64
+		ready     bool // comfortably above the threshold
 	}
 	var pool []cand
 	for _, acc := range accounts {
@@ -675,9 +675,9 @@ func main() {
 	// and returns the authoritative quota snapshot; the admin layer only owns
 	// the endpoint. On-demand only — every check costs a session round-trip.
 	// The result also seeds the auto-switch snapshot for that account.
-	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
-		realPAT, region := auth.Resolve(pat)
-		b := bridge.NewOpenAiBridge(realPAT, region)
+	adminInst.SetAccountChecker(func(ctx context.Context, pat, regionName string) (*store.AccountSnapshot, error) {
+		region := auth.RegionByName(regionName)
+		b := bridge.NewOpenAiBridge(pat, region)
 		acct := b.EnsureAccountStatus(ctx)
 		if acct == nil {
 			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")

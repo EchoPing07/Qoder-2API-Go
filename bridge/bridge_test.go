@@ -314,7 +314,10 @@ func sseFrame(t *testing.T, inner map[string]interface{}) string {
 // client's requested model on every client-facing chunk and on the sync
 // response, so "auto" never leaks to clients.
 func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
-	for _, tc := range []struct{ name string; stream bool }{
+	for _, tc := range []struct {
+		name   string
+		stream bool
+	}{
 		{"stream", true},
 		{"sync", false},
 	} {
@@ -328,8 +331,8 @@ func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			err := b.HandleChat(context.Background(), w, map[string]interface{}{
-				"model":   "Fake-Model",
-				"stream":  tc.stream,
+				"model":    "Fake-Model",
+				"stream":   tc.stream,
 				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "q"}},
 			}, nil)
 			if err != nil {
@@ -363,7 +366,7 @@ func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
 				ChatContext struct {
 					Extra struct {
 						ModelConfig struct {
-								Key string `json:"key"`
+							Key string `json:"key"`
 						} `json:"modelConfig"`
 					} `json:"extra"`
 				} `json:"chat_context"`
@@ -399,7 +402,7 @@ func TestHandleStreamEndToEnd(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "hi"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) { usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, Credits: u.Credits} })
 	if err != nil {
@@ -757,7 +760,7 @@ func TestHandleStreamGLMStyleUsageOnFinalContentFrame(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedPromptTokens(), Credits: u.Credits}
@@ -909,7 +912,7 @@ func TestHandleStreamMiniMaxStyleFinishEvent(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Credits: u.Credits}
@@ -2035,5 +2038,98 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetryAfter)
 			}
 		})
+	}
+}
+
+// newGlobalAccountBridge builds a bridge for a NeedsOpenAPIToken region: the
+// quota endpoint rejects the COSY token, so the bridge must mint an OpenAPI
+// bearer via /api/v1/jobToken/exchange and present THAT on quota/usage.
+func newGlobalAccountBridge(t *testing.T, exchangeHits, refreshHits, quotaHits *atomic.Int32, quotaAuth *atomic.Value) *OpenAiBridge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name":"global","id":"gid","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"cosy-sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"id":"gid","userType":"personal_standard","plan":"PLAN_TIER_FREE","userTag":"Free","nextResetAt":1790265600000}`)
+	})
+	mux.HandleFunc("/api/v1/jobToken/exchange", func(w http.ResponseWriter, r *http.Request) {
+		exchangeHits.Add(1)
+		io.WriteString(w, `{"token":"openapi-tok","refresh_token":"openapi-rt","expires_at":"2099-01-01T00:00:00Z"}`)
+	})
+	mux.HandleFunc("/api/v1/jobToken/refresh", func(w http.ResponseWriter, r *http.Request) {
+		refreshHits.Add(1)
+		io.WriteString(w, `{"token":"openapi-tok-refreshed","refresh_token":"openapi-rt2","expires_at":"2099-01-01T00:00:00Z"}`)
+	})
+	mux.HandleFunc("/api/v2/quota/usage", func(w http.ResponseWriter, r *http.Request) {
+		quotaHits.Add(1)
+		quotaAuth.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, `{"userId":"gid","userType":"personal_standard","userQuota":{"total":0,"used":0,"remaining":0,"unit":"credits"},"addOnQuota":{"total":100,"used":1,"remaining":99,"percentage":0.01,"unit":"credits"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "global", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL, NeedsOpenAPIToken: true}
+	return NewOpenAiBridge("pt-global", region)
+}
+
+// TestGlobalQuotaUsesOpenAPIBearer 国际版额度：用 exchange 换来的 OpenAPI token，
+// 而不是 COSY 的 securityOauthToken；同一 bridge 只交换一次（缓存）。
+func TestGlobalQuotaUsesOpenAPIBearer(t *testing.T) {
+	var exchangeHits, refreshHits, quotaHits atomic.Int32
+	var quotaAuth atomic.Value
+	b := newGlobalAccountBridge(t, &exchangeHits, &refreshHits, &quotaHits, &quotaAuth)
+
+	if st := b.EnsureAccountStatus(context.Background()); st == nil {
+		t.Fatal("EnsureAccountStatus returned nil")
+	}
+	if got := quotaAuth.Load(); got != "Bearer openapi-tok" {
+		t.Errorf("quota Authorization = %v, want the OpenAPI token", got)
+	}
+	if exchangeHits.Load() != 1 {
+		t.Errorf("exchange hits = %d, want 1", exchangeHits.Load())
+	}
+	if st := b.EnsureAccountStatus(context.Background()); st == nil {
+		t.Fatal("second EnsureAccountStatus returned nil")
+	}
+	if exchangeHits.Load() != 1 {
+		t.Errorf("OpenAPI token must be cached across refreshes: exchange hits = %d", exchangeHits.Load())
+	}
+}
+
+// TestGlobalQuotaRefreshesExpiredOpenAPIToken 到期后应走 refresh 端点，而不是重新
+// exchange；refresh 成功则 quota 使用新 token。
+func TestGlobalQuotaRefreshesExpiredOpenAPIToken(t *testing.T) {
+	var exchangeHits, refreshHits, quotaHits atomic.Int32
+	var quotaAuth atomic.Value
+	b := newGlobalAccountBridge(t, &exchangeHits, &refreshHits, &quotaHits, &quotaAuth)
+	b.openAPIToken = "stale"
+	b.openAPIRefresh = "openapi-rt"
+	b.openAPIExpMs = 1 // already expired
+
+	if st := b.EnsureAccountStatus(context.Background()); st == nil {
+		t.Fatal("EnsureAccountStatus returned nil")
+	}
+	if refreshHits.Load() != 1 || exchangeHits.Load() != 0 {
+		t.Errorf("expected refresh (not exchange): refresh=%d exchange=%d", refreshHits.Load(), exchangeHits.Load())
+	}
+	if got := quotaAuth.Load(); got != "Bearer openapi-tok-refreshed" {
+		t.Errorf("quota Authorization = %v", got)
+	}
+}
+
+// TestCNQuotaUsesCOSYToken 国内版回归：额度继续用 COSY 的 securityOauthToken，
+// 不触发 OpenAPI 交换。
+func TestCNQuotaUsesCOSYToken(t *testing.T) {
+	var quotaAuth atomic.Value
+	fx := &accountFixture{quotaFunc: func(w http.ResponseWriter, r *http.Request) {
+		quotaAuth.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, `{"userId":"uid1","userType":"teams","userQuota":{"total":3000,"used":10,"remaining":2990,"unit":"credits"}}`)
+	}}
+	b := newAccountBridge(t, fx)
+	if st := b.EnsureAccountStatus(context.Background()); st == nil {
+		t.Fatal("EnsureAccountStatus returned nil")
+	}
+	if got := quotaAuth.Load(); got != "Bearer sot" {
+		t.Errorf("CN quota Authorization = %v, want the COSY token", got)
 	}
 }

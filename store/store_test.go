@@ -679,8 +679,8 @@ func TestSnapshotCooldownRoundTrip(t *testing.T) {
 	a1, _ := s.AddAccount("pt-c1", "")
 	a2, _ := s.AddAccount("pt-c2", "")
 	if err := s.SaveSnapshots(map[string]*AccountSnapshot{
-		a1.ID: {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
-		a2.ID: {Remaining: 90, Total: 100, CheckedAt: 1700000000},
+		a1.ID:  {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
+		a2.ID:  {Remaining: 90, Total: 100, CheckedAt: 1700000000},
 		"gone": {Remaining: 1}, // 未知 ID 被忽略
 	}); err != nil {
 		t.Fatalf("SaveSnapshots: %v", err)
@@ -700,5 +700,45 @@ func TestSnapshotCooldownRoundTrip(t *testing.T) {
 	// 空批次是 no-op
 	if err := s2.SaveSnapshots(nil); err != nil {
 		t.Errorf("empty batch must be a no-op, got %v", err)
+	}
+}
+
+// TestAddAccountWithRegion 区域持久化：默认空为国内，global 归一化保存；按 PAT
+// 可反查区域；重复 PAT 无论区域都视为重复。
+func TestAddAccountWithRegion(t *testing.T) {
+	s := tempStore(t)
+	cn, err := s.AddAccount("pt-cn", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cn.Region != "" {
+		t.Errorf("default region = %q, want empty (CN)", cn.Region)
+	}
+	if got := s.AccountRegionByPAT("pt-cn"); got != "" {
+		t.Errorf("AccountRegionByPAT(cn) = %q", got)
+	}
+	g, err := s.AddAccountWithRegion("pt-global", "海外", "Global")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Region != "global" {
+		t.Errorf("global region = %q, want global", g.Region)
+	}
+	if got := s.AccountRegionByPAT("pt-global"); got != "global" {
+		t.Errorf("AccountRegionByPAT(global) = %q", got)
+	}
+	if _, err := s.AddAccountWithRegion("pt-global", "", "cn"); !errors.Is(err, ErrDuplicateAccount) {
+		t.Errorf("same PAT in another region must be a duplicate, got %v", err)
+	}
+	// 持久化后重新加载仍保留区域。
+	reloaded, err := New(s.filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.AccountRegionByPAT("pt-global"); got != "global" {
+		t.Errorf("region lost after reload: %q", got)
+	}
+	if acc, ok := reloaded.GetAccount(g.ID); !ok || acc.Region != "global" {
+		t.Errorf("GetAccount lost region: %+v ok=%v", acc, ok)
 	}
 }

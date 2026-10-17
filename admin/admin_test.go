@@ -1013,7 +1013,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 	a, s := newAdmin(t)
 	acc, _ := s.AddAccount("pt-check", "")
 	calls := 0
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		calls++
 		if pat != "pt-check" {
 			t.Errorf("checker pat = %q", pat)
@@ -1032,7 +1032,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 		t.Errorf("snapshot not persisted: %+v", snap)
 	}
 	// checker 失败：502 且 LastError 记入快照
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		return nil, errors.New("会话失败")
 	})
 	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
@@ -1120,5 +1120,59 @@ func TestAutoSwitchEndpoint(t *testing.T) {
 	w = doRequest(t, a.handleAutoSwitch, "DELETE", "/admin/api/accounts/auto", nil)
 	if w.Code != 405 {
 		t.Errorf("DELETE should 405, got %d", w.Code)
+	}
+}
+
+// TestAccountsRegionRoundTrip 添加时携带区域，列表回传区域；默认国内。
+func TestAccountsRegionRoundTrip(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-global-x", "note": "海外", "region": "global"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := s.AccountRegionByPAT("pt-global-x"); got != "global" {
+		t.Errorf("stored region = %q, want global", got)
+	}
+	w = doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-cn-account", "note": "国内"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
+	var list struct {
+		Accounts []struct {
+			PATMasked string `json:"pat_masked"`
+			Region    string `json:"region"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	regions := map[string]string{}
+	for _, acc := range list.Accounts {
+		regions[acc.PATMasked] = acc.Region
+	}
+	if regions["pt-g****al-x"] != "global" {
+		t.Errorf("global account region view = %q", regions["pt-g****al-x"])
+	}
+	if regions["pt-c****ount"] != "cn" {
+		t.Errorf("cn account region view = %q", regions["pt-c****ount"])
+	}
+}
+
+// TestAccountCheckPassesRegion 检测端点必须把账号区域透传给 checker。
+func TestAccountCheckPassesRegion(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccountWithRegion("pt-global-check", "", "global")
+	var gotRegion string
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
+		gotRegion = region
+		return &store.AccountSnapshot{Remaining: 5, Total: 10, CheckedAt: 1700000000}, nil
+	})
+	w := doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotRegion != "global" {
+		t.Errorf("checker region = %q, want global", gotRegion)
 	}
 }

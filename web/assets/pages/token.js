@@ -13,10 +13,10 @@ PAGE('token', {
     if(!pat){ this.toast('令牌不能为空','err'); return; }
     this.busy(async()=>{
       await this.api('/admin/api/accounts',{method:'POST',body:JSON.stringify({
-        pat, note:(this.accountForm.note||'').trim() })});
+        pat, note:(this.accountForm.note||'').trim(), region:(this.accountForm.region||'cn') })});
       this.toast('账号已添加','ok');
       this.accountModal = false;
-      this.accountForm = {pat:'',note:''};
+      this.accountForm = {pat:'',note:'',region:'cn'};
       this.loadAccounts(); this.loadPAT();
     })();
   },
@@ -67,6 +67,10 @@ PAGE('token', {
     const s = acc.snapshot;
     if(!s || !s.checked_at || s.last_error) return '—';
     return this.fmtCredits(s.remaining) + ' / ' + this.fmtCredits(s.total);
+  },
+  /* 区域标签：账号所属的 Qoder 部署（国内 / 国际） */
+  accountRegion(acc){
+    return acc.region === 'global' ? '国际版' : '国内版';
   },
   accountStatus(acc){
     const s = acc.snapshot;

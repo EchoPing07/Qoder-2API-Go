@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,9 +65,13 @@ type Config struct {
 // the first successful check (admin「检测」or, later, the background loops);
 // a stale snapshot is still shown, labelled by CheckedAt.
 type Account struct {
-	ID        string           `json:"id"`
-	PAT       string           `json:"pat"`
-	Note      string           `json:"note"`
+	ID   string `json:"id"`
+	PAT  string `json:"pat"`
+	Note string `json:"note"`
+	// Region selects the Qoder deployment for this PAT: ""/"cn" = China
+	// (qoder.com.cn), "global" = international (qoder.sh). Empty keeps the
+	// historical CN default for accounts created before regions existed.
+	Region    string           `json:"region,omitempty"`
 	CreatedAt int64            `json:"created_at"`
 	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
 }
@@ -484,11 +489,18 @@ func (s *Store) ClearActiveAccount() {
 	_ = s.save()
 }
 
-// AddAccount appends a new account. When no account is active yet (fresh
-// install) it becomes the active one and its PAT is written to the mirrored
-// PAT field; otherwise the caller decides activation explicitly via
-// ActivateAccount, so adding never silently moves a running bridge.
+// AddAccount appends a new account in the default (CN) region. When no account
+// is active yet (fresh install) it becomes the active one and its PAT is
+// written to the mirrored PAT field; otherwise the caller decides activation
+// explicitly via ActivateAccount, so adding never silently moves a running
+// bridge.
 func (s *Store) AddAccount(pat, note string) (*Account, error) {
+	return s.AddAccountWithRegion(pat, note, "")
+}
+
+// AddAccountWithRegion is AddAccount with an explicit region ("cn"/"global").
+// An already-pooled PAT is a duplicate regardless of region.
+func (s *Store) AddAccountWithRegion(pat, note, region string) (*Account, error) {
 	if pat == "" {
 		return nil, fmt.Errorf("令牌不能为空")
 	}
@@ -498,7 +510,7 @@ func (s *Store) AddAccount(pat, note string) (*Account, error) {
 		s.mu.Unlock()
 		return nil, ErrDuplicateAccount
 	}
-	entry := Account{ID: id, PAT: pat, Note: note, CreatedAt: time.Now().Unix()}
+	entry := Account{ID: id, PAT: pat, Note: note, Region: normalizeRegion(region), CreatedAt: time.Now().Unix()}
 	s.config.Accounts = append(s.config.Accounts, entry)
 	if s.config.ActiveAccountID == "" {
 		s.config.ActiveAccountID = id
@@ -509,6 +521,39 @@ func (s *Store) AddAccount(pat, note string) (*Account, error) {
 		return nil, err
 	}
 	return &entry, nil
+}
+
+// normalizeRegion canonicalizes a stored region to "" (CN default) or "global".
+func normalizeRegion(region string) string {
+	switch strings.ToLower(strings.TrimSpace(region)) {
+	case "global", "intl", "international":
+		return "global"
+	default:
+		return ""
+	}
+}
+
+// GetAccount returns the pool entry with the given id (zero value when absent).
+func (s *Store) GetAccount(id string) (Account, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, acc := range s.config.Accounts {
+		if acc.ID == id {
+			return acc, true
+		}
+	}
+	return Account{}, false
+}
+
+// AccountRegionByPAT returns the stored region for a PAT ("" when the PAT is
+// unknown or has no explicit region, i.e. the CN default).
+func (s *Store) AccountRegionByPAT(pat string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if i := findAccountByPAT(s.config.Accounts, pat); i >= 0 {
+		return s.config.Accounts[i].Region
+	}
+	return ""
 }
 
 // DeleteAccount removes an account. Deleting the active one is refused: the

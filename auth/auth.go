@@ -38,6 +38,11 @@ type RegionConfig struct {
 	AuthBase    string
 	ChatBase    string
 	OpenAPIBase string
+	// NeedsOpenAPIToken marks regions whose quota API does not accept the
+	// COSY session token. Global (qoder.sh) requires a separate OpenAPI bearer
+	// obtained via /api/v1/jobToken/exchange; CN accepts the COSY
+	// securityOauthToken directly.
+	NeedsOpenAPIToken bool
 }
 
 var CN = &RegionConfig{
@@ -47,6 +52,39 @@ var CN = &RegionConfig{
 	OpenAPIBase: "https://openapi.qoder.com.cn",
 }
 
+// Global is the international Qoder region (qoder.sh). Chat/status go through
+// api1.qoder.sh; quota/billing through openapi.qoder.sh and require a separate
+// OpenAPI bearer token.
+var Global = &RegionConfig{
+	Name:              "global",
+	AuthBase:          "https://api1.qoder.sh",
+	ChatBase:          "https://api1.qoder.sh",
+	OpenAPIBase:       "https://openapi.qoder.sh",
+	NeedsOpenAPIToken: true,
+}
+
+// RegionByName maps a stored account region ("cn"/"global", empty = cn) to its
+// configuration. Unknown values fall back to CN.
+func RegionByName(name string) *RegionConfig {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "global", "intl", "international":
+		return Global
+	default:
+		return CN
+	}
+}
+
+// NormalizeRegion canonicalizes an account region for storage/display.
+func NormalizeRegion(name string) string {
+	if RegionByName(name).Name == "global" {
+		return "global"
+	}
+	return "cn"
+}
+
+// Resolve returns the region for a PAT. Region is not encoded in the token, so
+// callers that know the account's region should use RegionByName instead; this
+// keeps the historical CN default for legacy single-PAT call sites.
 func Resolve(pat string) (string, *RegionConfig) {
 	return pat, CN
 }
@@ -70,6 +108,10 @@ func OpenAPIURL(region *RegionConfig, path string) string {
 func FetchModelCatalog(ctx context.Context, sess *SessionContext, region *RegionConfig) (map[string]interface{}, error) {
 	return CallGet(ctx, sess, ModelListURL(region))
 }
+
+// openAPIUserAgentVersion is the client version the global OpenAPI endpoints
+// expect in the User-Agent header. It mirrors the pinned CLI (1.1.32).
+const openAPIUserAgentVersion = "1.1.32"
 
 // --- Custom Encoding (Qoder Base64 variant) ---
 
@@ -874,6 +916,115 @@ func FetchQuotaUsage(ctx context.Context, bearer string, region *RegionConfig) (
 		return nil, fmt.Errorf("quota usage response shape unexpected")
 	}
 	return &usage, nil
+}
+
+// --- OpenAPI bearer (regions whose quota API rejects the COSY token) ---
+
+// OpenAPIToken is the bearer pair minted by the OpenAPI jobToken exchange. The
+// global region's quota/usage endpoint rejects the COSY securityOauthToken, so
+// it needs this separately-issued token (and its refresh token) instead.
+type OpenAPIToken struct {
+	Token        string
+	RefreshToken string
+	// ExpiresAtMs is the token expiry in epoch millis (0 when unreported).
+	ExpiresAtMs int64
+}
+
+// openAPITokenResponse is the wire shape of /api/v1/jobToken/exchange and
+// /api/v1/jobToken/refresh. expires_at is an RFC3339 string on the observed
+// global endpoint, while expires_in (milliseconds) is the fallback.
+type openAPITokenResponse struct {
+	Token              string      `json:"token"`
+	AccessToken        string      `json:"access_token"`
+	DeviceToken        string      `json:"device_token"`
+	RefreshToken       string      `json:"refresh_token"`
+	ExpiresAt          interface{} `json:"expires_at"`
+	ExpiresIn          int64       `json:"expires_in"`
+	RefreshTokenExpire interface{} `json:"refresh_token_expires_at"`
+}
+
+func (r openAPITokenResponse) token() string {
+	if r.Token != "" {
+		return r.Token
+	}
+	if r.AccessToken != "" {
+		return r.AccessToken
+	}
+	return r.DeviceToken
+}
+
+// expiryMs resolves the absolute expiry from expires_at (RFC3339 string or
+// epoch millis) with expires_in (milliseconds) as a fallback.
+func (r openAPITokenResponse) expiryMs() int64 {
+	switch v := r.ExpiresAt.(type) {
+	case string:
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t.UnixMilli()
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	}
+	if r.ExpiresIn > 0 {
+		return time.Now().Add(time.Duration(r.ExpiresIn) * time.Millisecond).UnixMilli()
+	}
+	return 0
+}
+
+func openAPITokenRequest(ctx context.Context, urlStr string, payload interface{}, region *RegionConfig) (*OpenAPIToken, error) {
+	plain, err := marshalNoEscape(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(plain))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "qoder/"+openAPIUserAgentVersion)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openapi token endpoint HTTP %d: %s", resp.StatusCode, truncateErrorBody(body))
+	}
+	var parsed openAPITokenResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode openapi token: %w", err)
+	}
+	tok := parsed.token()
+	if tok == "" {
+		return nil, fmt.Errorf("openapi token response carried no token")
+	}
+	return &OpenAPIToken{Token: tok, RefreshToken: parsed.RefreshToken, ExpiresAtMs: parsed.expiryMs()}, nil
+}
+
+// ExchangeOpenAPIToken mints an OpenAPI bearer from a personal access token.
+// Used by regions flagged NeedsOpenAPIToken.
+func ExchangeOpenAPIToken(ctx context.Context, personalToken string, region *RegionConfig) (*OpenAPIToken, error) {
+	if region == nil {
+		region = CN
+	}
+	urlStr := OpenAPIURL(region, "/api/v1/jobToken/exchange")
+	return openAPITokenRequest(ctx, urlStr, map[string]string{"personal_token": personalToken}, region)
+}
+
+// RefreshOpenAPIToken rotates an OpenAPI bearer using its refresh token.
+func RefreshOpenAPIToken(ctx context.Context, refreshToken string, region *RegionConfig) (*OpenAPIToken, error) {
+	if region == nil {
+		region = CN
+	}
+	urlStr := OpenAPIURL(region, "/api/v1/jobToken/refresh")
+	return openAPITokenRequest(ctx, urlStr, map[string]string{"refresh_token": refreshToken}, region)
 }
 
 // ParseAccountStatus converts a raw /user/status response into AccountStatus.

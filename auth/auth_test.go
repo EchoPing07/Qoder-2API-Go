@@ -727,3 +727,98 @@ func TestFetchUserStatusRequestBodyContract(t *testing.T) {
 		t.Errorf("authInfo = %#v, want {}", authInfo)
 	}
 }
+
+// TestRegionByNameAndNormalize 区域解析：空/cn 归国内，global 归国际，未知回退国内。
+func TestRegionByNameAndNormalize(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantNorm string
+	}{
+		{"", "cn", "cn"},
+		{"cn", "cn", "cn"},
+		{"CN", "cn", "cn"},
+		{"global", "global", "global"},
+		{"Global", "global", "global"},
+		{"intl", "global", "global"},
+		{"weird", "cn", "cn"},
+	}
+	for _, tc := range cases {
+		if got := RegionByName(tc.in).Name; got != tc.wantName {
+			t.Errorf("RegionByName(%q).Name = %q, want %q", tc.in, got, tc.wantName)
+		}
+		if got := NormalizeRegion(tc.in); got != tc.wantNorm {
+			t.Errorf("NormalizeRegion(%q) = %q, want %q", tc.in, got, tc.wantNorm)
+		}
+	}
+	if !Global.NeedsOpenAPIToken {
+		t.Error("Global region must require an OpenAPI token for quota")
+	}
+	if CN.NeedsOpenAPIToken {
+		t.Error("CN region must use the COSY token directly")
+	}
+}
+
+// TestExchangeOpenAPIToken 国际版 PAT → OpenAPI bearer：验证路径、请求体与 RFC3339
+// 到期时间解析。
+func TestExchangeOpenAPIToken(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"token":"jt-abc","refresh_token":"jrt-xyz","expires_at":"2030-01-02T03:04:05Z","expires_in":86400000}`)
+	}))
+	defer srv.Close()
+
+	tok, err := ExchangeOpenAPIToken(context.Background(), "pt-global", &RegionConfig{OpenAPIBase: srv.URL, NeedsOpenAPIToken: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/api/v1/jobToken/exchange" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if !strings.Contains(gotBody, `"personal_token":"pt-global"`) {
+		t.Errorf("body = %q", gotBody)
+	}
+	if tok.Token != "jt-abc" || tok.RefreshToken != "jrt-xyz" {
+		t.Errorf("unexpected token: %+v", tok)
+	}
+	want := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC).UnixMilli()
+	if tok.ExpiresAtMs != want {
+		t.Errorf("expiry = %d, want %d", tok.ExpiresAtMs, want)
+	}
+}
+
+// TestRefreshOpenAPITokenAndFallback ExpiresAt 为数字且无 expires_in 时的兜底。
+func TestRefreshOpenAPITokenNumericExpiry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/jobToken/refresh" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		io.WriteString(w, `{"access_token":"jt-refreshed","refresh_token":"jrt-new","expires_at":1893456000000}`)
+	}))
+	defer srv.Close()
+
+	tok, err := RefreshOpenAPIToken(context.Background(), "jrt-old", &RegionConfig{OpenAPIBase: srv.URL, NeedsOpenAPIToken: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Token != "jt-refreshed" || tok.ExpiresAtMs != 1893456000000 {
+		t.Errorf("unexpected token: %+v", tok)
+	}
+}
+
+// TestExchangeOpenAPITokenError 非 200 必须报错且携带状态码。
+func TestExchangeOpenAPITokenError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"errorMessage":"personal token is invalid"}`)
+	}))
+	defer srv.Close()
+
+	if _, err := ExchangeOpenAPIToken(context.Background(), "pt-bad", &RegionConfig{OpenAPIBase: srv.URL, NeedsOpenAPIToken: true}); err == nil {
+		t.Fatal("expected an error for 401")
+	}
+}
