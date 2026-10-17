@@ -36,8 +36,14 @@ type bridgeProvider struct {
 	mu     sync.Mutex
 	bridge *bridge.OpenAiBridge
 	pat    string
-	store  *store.Store
-	switcher *autoSwitcher // nil in tests that build a provider directly
+	// 多账号分流：为池内每个账号缓存独立 bridge（含各自的并发槽），
+	// 使全部账号并行承接流量而不是都压在「使用中」账号上。
+	bridges     map[string]*bridge.OpenAiBridge
+	bridgePAT   map[string]string // accountID -> 建桥时的 PAT（变更时重建）
+	bridgeSlots map[string]int    // accountID -> 建桥时的并发槽（面板值变更时重建）
+	rr          uint64            // 轮询计数（atomic 语义，仅持 mu 时访问）
+	store       *store.Store
+	switcher    *autoSwitcher // nil in tests that build a provider directly
 	// snapshots are the in-memory quota snapshots maintained by passive
 	// deduction and authoritative correction; flushed to disk periodically.
 	snapMu    sync.Mutex
@@ -49,7 +55,12 @@ type bridgeProvider struct {
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
-	return &bridgeProvider{store: st, snapshots: map[string]*store.AccountSnapshot{}}
+	return &bridgeProvider{
+		store:     st,
+		snapshots: map[string]*store.AccountSnapshot{},
+		bridges:   map[string]*bridge.OpenAiBridge{},
+		bridgePAT: map[string]string{},
+	}
 }
 
 // AccountIDByPAT resolves a PAT to its pool entry ID ("" when absent).
@@ -78,11 +89,117 @@ func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
 	if !ok {
 		return nil
 	}
+	// 负载均衡开启时在全部合格账号间轮询分流；无合格账号（全部冷却/低于阈值）
+	// 或功能关闭时，回退「使用中」账号的桥。
+	if p.store.GetLoadBalance().Enabled {
+		if rb := p.pickBridge(); rb != nil {
+			rb.KeyID, rb.KeyNote = key.ID, key.Note
+			return rb
+		}
+	}
 	b := p.currentBridge()
 	if b == nil {
 		return nil
 	}
 	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: p.store.GetActiveAccountID()}
+}
+
+// pickBridge routes the request round-robin across every pool account that is
+// eligible under the load-balancing threshold: has a PAT, is not cooling down,
+// is not hard-exhausted, and — once a quota snapshot exists — still has
+// remaining credits above the threshold. Accounts without a snapshot yet are
+// eligible: unknown quota beats never serving a freshly added account.
+// Returns nil when load balancing is off or nobody qualifies.
+func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
+	lb := p.store.GetLoadBalance()
+	if !lb.Enabled {
+		return nil
+	}
+	now := time.Now().Unix()
+	type candidate struct {
+		id  string
+		pat string
+	}
+	var cands []candidate
+	for _, acc := range p.store.ListAccounts() {
+		if acc.PAT == "" || acc.Disabled {
+			continue
+		}
+		if acc.Snapshot != nil {
+			// 最近一次「检测」失败的账号不参与分流（如 PAT 失效），
+			// 重新检测通过后自动恢复资格。
+			if acc.Snapshot.LastError != "" {
+				continue
+			}
+			if acc.Snapshot.CooldownUntil > now || acc.Snapshot.IsExceeded {
+				continue
+			}
+			if acc.Snapshot.Remaining <= lb.Threshold {
+				continue
+			}
+		}
+		cands = append(cands, candidate{acc.ID, acc.PAT})
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	p.rr++
+	c := cands[p.rr%uint64(len(cands))]
+	p.mu.Unlock()
+	b := p.bridgeFor(c.id, c.pat)
+	return &bridge.ResolvedBridge{Bridge: b, AccountID: c.id}
+}
+
+// bridgeFor returns the cached bridge for a specific pool account, building it
+// on first use — or rebuilding when the account's PAT or the panel-configured
+// concurrency window changed.
+func (p *bridgeProvider) bridgeFor(id, pat string) *bridge.OpenAiBridge {
+	n := p.maxConcurrency()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.bridges == nil {
+		p.bridges = map[string]*bridge.OpenAiBridge{}
+		p.bridgePAT = map[string]string{}
+		p.bridgeSlots = map[string]int{}
+	}
+	b := p.bridges[id]
+	if b == nil || p.bridgePAT[id] != pat || p.bridgeSlots[id] != n {
+		realPAT, region := auth.Resolve(pat)
+		b = bridge.NewOpenAiBridgeWithConcurrency(realPAT, region, n)
+		p.bridges[id] = b
+		p.bridgePAT[id] = pat
+		p.bridgeSlots[id] = n
+	}
+	return b
+}
+
+// maxConcurrency is the effective per-account upstream concurrency window:
+// the panel value wins, otherwise the QODER_MAX_CONCURRENCY env override,
+// otherwise 1.
+func (p *bridgeProvider) maxConcurrency() int {
+	if v := p.store.GetMaxConcurrency(); v > 0 {
+		return v
+	}
+	return bridge.MaxConcurrencyFromEnv()
+}
+
+// cooldownAccount marks an account unusable until failureCooldown so the
+// rotation (and the auto-switcher) skip it.
+func (p *bridgeProvider) cooldownAccount(accountID string) {
+	for _, acc := range p.store.ListAccounts() {
+		if acc.ID != accountID {
+			continue
+		}
+		snap := &store.AccountSnapshot{CooldownUntil: time.Now().Add(failureCooldown).Unix()}
+		if acc.Snapshot != nil {
+			cp := *acc.Snapshot
+			snap = &cp
+			snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
+		}
+		_ = p.store.SetAccountSnapshot(accountID, snap)
+		break
+	}
 }
 
 // currentBridge returns the bridge for the current PAT, creating or recreating
@@ -208,13 +325,13 @@ func (s *autoSwitcher) setOnSwitch(fn func()) { s.onSwitch = fn }
 // still beats a dead one. Returns "" when nobody qualifies.
 func pickCandidate(accounts []store.Account, activeID string, threshold float64) string {
 	type cand struct {
-		id         string
-		remaining  float64
-		ready      bool // comfortably above the threshold
+		id        string
+		remaining float64
+		ready     bool // comfortably above the threshold
 	}
 	var pool []cand
 	for _, acc := range accounts {
-		if acc.ID == activeID || acc.Snapshot == nil {
+		if acc.ID == activeID || acc.Snapshot == nil || acc.Disabled {
 			continue
 		}
 		if acc.Snapshot.CooldownUntil > time.Now().Unix() {
@@ -311,6 +428,11 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 // of failedAccountID, cool it down, switch to a candidate, and hand back the
 // replacement bridge — or nil to give up and surface the original error.
 func (p *bridgeProvider) handleChatFailover(failedAccountID string) *bridge.ResolvedBridge {
+	// 分流路径：失败的不是「使用中」账号时，冷却它让轮询自然跳过，直接换一个。
+	if failedAccountID != "" && failedAccountID != p.store.GetActiveAccountID() && p.store.GetLoadBalance().Enabled {
+		p.cooldownAccount(failedAccountID)
+		return p.pickBridge()
+	}
 	activeID := p.store.GetActiveAccountID()
 	p.switcher.maybeSwitch("failure", failedAccountID)
 	if p.store.GetActiveAccountID() == activeID {
@@ -661,6 +783,28 @@ func main() {
 			case <-accountStop:
 				return
 			}
+		}
+	}()
+
+	// 冷启动预热：负载均衡开启时逐个建立池内账号的会话并拉取额度快照，
+	// 避免首批并发请求同时引导多个会话触发上游风控；也让「检测」之外
+	// 的所有账号在分流启用时就有额度数据（自动切换候选同样受益）。
+	go func() {
+		if !st.GetLoadBalance().Enabled {
+			return
+		}
+		time.Sleep(2 * time.Second)
+		for _, acc := range st.ListAccounts() {
+			if acc.PAT == "" {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			b := provider.bridgeFor(acc.ID, acc.PAT)
+			if acct := b.EnsureAccountStatus(ctx); acct != nil {
+				provider.applyQuotaToSnapshot(acc.ID, acct)
+			}
+			cancel()
+			time.Sleep(1500 * time.Millisecond)
 		}
 	}()
 

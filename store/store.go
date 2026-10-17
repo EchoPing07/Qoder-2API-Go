@@ -55,9 +55,13 @@ type Config struct {
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 	// Multi-account pool. A legacy config carrying a bare PAT migrates into a
 	// one-entry pool on load (see load).
-	Accounts        []Account  `json:"accounts,omitempty"`
-	ActiveAccountID string     `json:"active_account_id,omitempty"`
-	AutoSwitch      AutoSwitch `json:"auto_switch"`
+	Accounts        []Account   `json:"accounts,omitempty"`
+	ActiveAccountID string      `json:"active_account_id,omitempty"`
+	AutoSwitch      AutoSwitch  `json:"auto_switch"`
+	LoadBalance     LoadBalance `json:"load_balance"`
+	// MaxConcurrency 是面板可调的单账号上游并发上限；0 表示未设置
+	//（回退 QODER_MAX_CONCURRENCY 环境变量，再回退 1）。
+	MaxConcurrency int `json:"max_concurrency,omitempty"`
 }
 
 // Account is one Qoder PAT in the multi-account pool. Snapshot is nil until
@@ -69,6 +73,9 @@ type Account struct {
 	Note      string           `json:"note"`
 	CreatedAt int64            `json:"created_at"`
 	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
+	// Disabled 为 true 时该账号不参与负载均衡，也不是自动切换的候选
+	//（旧配置缺省该字段视为启用）。
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // AccountSnapshot is the per-account quota snapshot from the authoritative
@@ -107,6 +114,20 @@ type AutoSwitch struct {
 // DefaultAutoSwitchThreshold is the remaining-credits threshold below which
 // automatic switching considers moving to another account.
 const DefaultAutoSwitchThreshold = 20
+
+// LoadBalance configures multi-account load balancing: when enabled, chat
+// requests are routed round-robin across every pool account whose remaining
+// credits exceed the threshold (instead of funnelling through the active
+// account). Accounts without a quota snapshot yet are eligible; accounts in
+// cooldown or hard-exhausted are always skipped.
+type LoadBalance struct {
+	Enabled   bool    `json:"enabled"`
+	Threshold float64 `json:"threshold"`
+}
+
+// DefaultLoadBalanceThreshold is the remaining-credits floor for an account
+// to take part in load-balanced routing.
+const DefaultLoadBalanceThreshold = 5
 
 // DefaultHost is the default listen host.
 const DefaultHost = "0.0.0.0"
@@ -183,6 +204,7 @@ func New(filePath string) (*Store, error) {
 			APIKeys:            []APIKey{},
 			Accounts:           []Account{},
 			AutoSwitch:         AutoSwitch{Threshold: DefaultAutoSwitchThreshold},
+			LoadBalance:        LoadBalance{Threshold: DefaultLoadBalanceThreshold},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -644,6 +666,71 @@ func (s *Store) SetAutoSwitch(enabled bool, threshold float64) error {
 	s.mu.Lock()
 	s.config.AutoSwitch = AutoSwitch{Enabled: enabled, Threshold: threshold}
 	s.mu.Unlock()
+	return s.save()
+}
+
+// GetLoadBalance returns the load-balancing settings, normalising a missing
+// or non-positive threshold to the default.
+func (s *Store) GetLoadBalance() LoadBalance {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	lb := s.config.LoadBalance
+	if lb.Threshold <= 0 {
+		lb.Threshold = DefaultLoadBalanceThreshold
+	}
+	return lb
+}
+
+// SetLoadBalance validates and persists the load-balancing settings. The
+// threshold is the per-account remaining-credits floor (>= 0) for taking part
+// in the rotation; 0 keeps the account eligible until it is exhausted.
+func (s *Store) SetLoadBalance(enabled bool, threshold float64) error {
+	if threshold < 0 {
+		return fmt.Errorf("阈值不能为负数")
+	}
+	s.mu.Lock()
+	s.config.LoadBalance = LoadBalance{Enabled: enabled, Threshold: threshold}
+	s.mu.Unlock()
+	return s.save()
+}
+
+// GetMaxConcurrency returns the panel-configured per-account upstream
+// concurrency window; 0 means unset (caller falls back to the env override).
+func (s *Store) GetMaxConcurrency() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.MaxConcurrency
+}
+
+// SetMaxConcurrency validates and persists the per-account concurrency window
+// (1-32, mirroring the env override's bounds). Takes effect as each account's
+// bridge is (re)built lazily on the next request.
+func (s *Store) SetMaxConcurrency(n int) error {
+	if n < 1 || n > 32 {
+		return fmt.Errorf("并发上限需在 1-32 之间")
+	}
+	s.mu.Lock()
+	s.config.MaxConcurrency = n
+	s.mu.Unlock()
+	return s.save()
+}
+
+// SetAccountEnabled toggles a pool account's participation in load balancing
+// and as an auto-switch candidate.
+func (s *Store) SetAccountEnabled(id string, disabled bool) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Disabled = disabled
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
 	return s.save()
 }
 

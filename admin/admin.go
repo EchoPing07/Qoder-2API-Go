@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"qoder2api/auth"
+	"qoder2api/bridge"
 	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
@@ -86,6 +87,8 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
 	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
+	mux.HandleFunc("/admin/api/accounts/enabled", a.requireAuth(a.handleAccountEnabled))
+	mux.HandleFunc("/admin/api/loadbalance", a.requireAuth(a.handleLoadBalance))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
@@ -652,6 +655,7 @@ type accountView struct {
 	Note      string                 `json:"note"`
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
+	Disabled  bool                   `json:"disabled"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
 }
 
@@ -666,6 +670,7 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 			Note:      acc.Note,
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
+			Disabled:  acc.Disabled,
 			Snapshot:  acc.Snapshot,
 		})
 	}
@@ -852,6 +857,66 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 		if err := a.store.SetAutoSwitch(body.Enabled, body.Threshold); err != nil {
 			writeJSONError(w, 400, err.Error())
 			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// handleAccountEnabled serves POST /admin/api/accounts/enabled: toggles a pool
+// account's participation in load balancing and as an auto-switch candidate.
+func (a *Admin) handleAccountEnabled(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID       string `json:"id"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.SetAccountEnabled(body.ID, body.Disabled); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleLoadBalance serves GET/POST /admin/api/loadbalance: the multi-account
+// load-balancing toggle, its remaining-credits eligibility threshold, and the
+// per-account upstream concurrency window (panel-adjustable).
+func (a *Admin) handleLoadBalance(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		lb := a.store.GetLoadBalance()
+		mc := a.store.GetMaxConcurrency()
+		if mc <= 0 {
+			mc = bridge.MaxConcurrencyFromEnv()
+		}
+		writeJSON(w, 200, map[string]interface{}{"enabled": lb.Enabled, "threshold": lb.Threshold, "max_concurrency": mc})
+	case http.MethodPost:
+		var body struct {
+			Enabled        bool    `json:"enabled"`
+			Threshold      float64 `json:"threshold"`
+			MaxConcurrency int     `json:"max_concurrency"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		if err := a.store.SetLoadBalance(body.Enabled, body.Threshold); err != nil {
+			writeJSONError(w, 400, err.Error())
+			return
+		}
+		if body.MaxConcurrency > 0 {
+			if err := a.store.SetMaxConcurrency(body.MaxConcurrency); err != nil {
+				writeJSONError(w, 400, err.Error())
+				return
+			}
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	default:

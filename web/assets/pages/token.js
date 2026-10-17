@@ -61,6 +61,37 @@ PAGE('token', {
     finally{ this.checkingId = ''; }
   },
 
+  /* 逐个检测全部账号（串行，避免同时引导多个会话触发上游风控） */
+  async checkAllAccounts(){
+    if(this.bulkChecking) return;
+    this.bulkChecking = true;
+    let ok = 0, fail = 0;
+    try{
+      for(const acc of (this.accounts||[])){
+        try{
+          await this.api('/admin/api/accounts/check',{method:'POST',body:JSON.stringify({id:acc.id})});
+          ok++;
+        }catch(e){ fail++; }
+        this.loadAccounts();
+      }
+      this.toast(`全部检测完成：成功 ${ok}，失败 ${fail}`, fail ? 'err' : 'ok');
+    } finally { this.bulkChecking = false; this.loadAccounts(); }
+  },
+
+  /* ── 启用/停用：停用的账号不参与负载均衡，也不是自动切换候选 ── */
+  toggleAccountEnabled(acc){
+    const disabling = !acc.disabled;
+    const doIt = ()=>this.busy(async()=>{
+      await this.api('/admin/api/accounts/enabled',{method:'POST',body:JSON.stringify({
+        id: acc.id, disabled: disabling })});
+      this.toast(disabling ? '账号已停用' : '账号已启用','ok');
+      this.loadAccounts();
+    })();
+    if(disabling && acc.active){
+      this.askConfirm('停用主账号','该账号当前是主账号。停用后负载均衡会跳过它；若负载均衡未开启，API 仍会使用该账号，建议先切换到其他账号。', doIt, {okText:'仍要停用', danger:false});
+    } else doIt();
+  },
+
   /* ── 表格展示 ── */
   /* 剩余额度：快照存在才展示（checked_at 为零说明从未检测过） */
   accountQuota(acc){
@@ -69,12 +100,13 @@ PAGE('token', {
     return this.fmtCredits(s.remaining) + ' / ' + this.fmtCredits(s.total);
   },
   accountStatus(acc){
+    if(acc.disabled) return '已停用';
     const s = acc.snapshot;
     if(!s || !s.checked_at) return '未检测';
     if(s.last_error) return '检测失败';
     if(s.is_exceeded) return '已耗尽';
-    if(acc.active) return '使用中';
-    return '正常';
+    if(acc.active) return this.loadBalance.enabled ? '主账号' : '使用中';
+    return this.loadBalance.enabled ? '分流中' : '正常';
   },
   accountStatusClass(acc){
     const s = acc.snapshot;
@@ -110,7 +142,27 @@ PAGE('token', {
     })();
   },
 
+  /* ── 负载均衡 ── */
+  async loadLoadBalance(){
+    try{
+      const r = await this.api('/admin/api/loadbalance');
+      this.loadBalance = {enabled: !!r.enabled, threshold: (r.threshold ?? 5), max_concurrency: r.max_concurrency || 0};
+    }catch(e){ this.toast(e.message,'err'); }
+  },
+  async saveLoadBalance(){
+    const lb = this.loadBalance;
+    const t = Number(lb.threshold);
+    if(!Number.isFinite(t) || t < 0){ this.toast('阈值不能为负数','err'); return; }
+    const mc = Number(lb.max_concurrency);
+    if(!Number.isFinite(mc) || mc < 1 || mc > 32){ this.toast('单账号并发上限需在 1-32 之间','err'); return; }
+    this.busy(async()=>{
+      await this.api('/admin/api/loadbalance',{method:'POST',body:JSON.stringify({
+        enabled: !!lb.enabled, threshold: t, max_concurrency: mc })});
+      this.toast('负载均衡设置已保存','ok');
+    })();
+  },
+
   /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
    * 不参与统计页的定时刷新） ── */
-  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadPAT(); this.loadStats(); },
+  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadLoadBalance(); this.loadPAT(); this.loadStats(); },
 });

@@ -568,9 +568,12 @@ func TestMovedModelsAndTier(t *testing.T) {
 		`<h1>账号</h1>`,
 		`<h3>账号池</h3>`,
 		`x-text="acc.pat_masked"`,
-		`x-show="acc.active"`,
+		`x-show="acc.active && !acc.disabled && !loadBalance.enabled"`,
+		`x-show="acc.active && !acc.disabled && loadBalance.enabled"`,
 		`@click="switchAccount(acc)"`,
 		`@click="checkAccount(acc)"`,
+		`@click="checkAllAccounts()"`,
+		`@click="toggleAccountEnabled(acc)"`,
 		`@click="deleteAccount(acc)"`,
 		`@submit.prevent="createAccount()"`,
 	} {

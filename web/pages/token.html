@@ -15,6 +15,10 @@
             <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
             <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
+            <button class="btn btn-ghost btn-sm" @click="checkAllAccounts()" :disabled="bulkChecking">
+              <span class="spin" x-show="bulkChecking"></span>
+              <span x-show="!bulkChecking">刷新全部</span>
+            </button>
             <span class="muted-xs">API 桥接使用激活中的账号；切换后桥接会话在下次请求时自动重建</span>
           </div>
           <div class="table-wrap" x-show="accounts.length">
@@ -26,7 +30,10 @@
                     <td>
                       <div class="row" style="gap:6px;flex-wrap:nowrap">
                         <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
-                        <span class="badge badge-ok" x-show="acc.active">使用中</span>
+                        <span class="badge badge-ok" x-show="acc.active && !acc.disabled && !loadBalance.enabled">使用中</span>
+                        <span class="badge badge-ok" x-show="acc.active && !acc.disabled && loadBalance.enabled">主账号</span>
+                        <span class="badge badge-muted" x-show="!acc.active && !acc.disabled && loadBalance.enabled">分流中</span>
+                        <span class="badge badge-muted" x-show="acc.disabled">已停用</span>
                       </div>
                     </td>
                     <td x-text="acc.note || '—'"></td>
@@ -36,6 +43,7 @@
                     <td>
                       <div class="row" style="gap:2px;flex-wrap:nowrap;justify-content:flex-end">
                         <button class="btn btn-ghost btn-sm" x-show="!acc.active" @click="switchAccount(acc)">切换</button>
+                        <button class="btn btn-ghost btn-sm" @click="toggleAccountEnabled(acc)" x-text="acc.disabled ? '启用' : '停用'"></button>
                         <button class="btn btn-ghost btn-sm" @click="checkAccount(acc)" :disabled="checkingId===acc.id">
                           <span class="spin" x-show="checkingId===acc.id"></span>
                           <span x-show="checkingId!==acc.id">检测</span>
@@ -52,6 +60,35 @@
           <div class="empty" x-show="!accounts.length">
             <span class="ic ic-lg" x-html="ic('token')"></span>
             暂无账号，点击右上角添加第一个账号
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>负载均衡</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs">开启后每个请求轮流分发给池内合格的账号，而不是只走「使用中」账号</span>
+          </div>
+          <div class="switch-row">
+            <span class="sw-label">启用负载均衡</span>
+            <button type="button" class="switch" :class="loadBalance.enabled ? 'on' : ''" @click="loadBalance.enabled = !loadBalance.enabled" aria-label="启用负载均衡"></button>
+          </div>
+          <div class="form-row">
+            <label class="label">阈值（剩余积分，低于此值不参与分流）</label>
+            <input class="input" type="number" min="0" step="1" x-model.number="loadBalance.threshold">
+            <p class="field-hint">只有剩余积分高于阈值的账号参与轮流分发；冷却中、已耗尽或最近一次「检测」失败的账号自动跳过（重新检测通过即恢复）。无快照的新账号直接参与。</p>
+          </div>
+          <div class="form-row">
+            <label class="label">单账号并发上限（同时进行的生成数）</label>
+            <input class="input" type="number" min="1" max="32" step="1" x-model.number="loadBalance.max_concurrency">
+            <p class="field-hint">每个账号同时发往上游的生成数上限，修改保存后下一个请求生效；上限过高会触发上游并发限制（业务码 10605），出现时请调低。</p>
+          </div>
+          <div class="action-row">
+            <div class="spacer"></div>
+            <button class="btn btn-sm" @click="saveLoadBalance()" :disabled="loading">
+              <span class="spin" x-show="loading"></span>
+              <span x-show="!loading">保存</span>
+            </button>
           </div>
         </div>
 
