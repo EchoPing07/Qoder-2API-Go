@@ -620,11 +620,11 @@ func TestAccountSnapshotAndNote(t *testing.T) {
 	}
 }
 
-// TestAutoSwitchDefaults 默认阈值 20、未开启；SetAutoSwitch 校验范围并持久化。
+// TestAutoSwitchDefaults 默认阈值 20 积分、未开启；SetAutoSwitch 校验下限并持久化。
 func TestAutoSwitchDefaults(t *testing.T) {
 	s := tempStore(t)
 	as := s.GetAutoSwitch()
-	if as.Enabled || as.ThresholdPercent != DefaultAutoSwitchPercent {
+	if as.Enabled || as.Threshold != DefaultAutoSwitchThreshold {
 		t.Errorf("default auto switch = %+v", as)
 	}
 	if err := s.SetAutoSwitch(true, 15); err != nil {
@@ -633,11 +633,12 @@ func TestAutoSwitchDefaults(t *testing.T) {
 	if err := s.SetAutoSwitch(true, 0); err == nil {
 		t.Error("threshold 0 must fail")
 	}
-	if err := s.SetAutoSwitch(true, 100); err == nil {
-		t.Error("threshold 100 must fail")
+	// 绝对积分无上限：大阈值合法（所有账号都低于它时留守，由状态机处理）
+	if err := s.SetAutoSwitch(true, 100000); err != nil {
+		t.Errorf("large threshold must be accepted: %v", err)
 	}
 	s2, _ := New(s.filePath)
-	if as := s2.GetAutoSwitch(); !as.Enabled || as.ThresholdPercent != 15 {
+	if as := s2.GetAutoSwitch(); !as.Enabled || as.Threshold != 100000 {
 		t.Errorf("persisted auto switch = %+v", as)
 	}
 }
@@ -666,4 +667,38 @@ func TestHandEditedPatImported(t *testing.T) {
 		t.Errorf("hand-edited PAT lost: %v", pats)
 	}
 	_ = acc
+}
+
+// TestSnapshotCooldownRoundTrip 冷却字段与批量落盘的持久化。
+func TestSnapshotCooldownRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a1, _ := s.AddAccount("pt-c1", "")
+	a2, _ := s.AddAccount("pt-c2", "")
+	if err := s.SaveSnapshots(map[string]*AccountSnapshot{
+		a1.ID: {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
+		a2.ID: {Remaining: 90, Total: 100, CheckedAt: 1700000000},
+		"gone": {Remaining: 1}, // 未知 ID 被忽略
+	}); err != nil {
+		t.Fatalf("SaveSnapshots: %v", err)
+	}
+	accs := s.ListAccounts()
+	if accs[0].Snapshot == nil || accs[0].Snapshot.CooldownUntil != 1900000000 {
+		t.Errorf("a1 snapshot = %+v", accs[0].Snapshot)
+	}
+	if accs[1].Snapshot == nil || accs[1].Snapshot.Remaining != 90 {
+		t.Errorf("a2 snapshot = %+v", accs[1].Snapshot)
+	}
+	s2, _ := New(dir + "/data.json")
+	accs = s2.ListAccounts()
+	if accs[0].Snapshot == nil || accs[0].Snapshot.CooldownUntil != 1900000000 {
+		t.Error("cooldown must persist")
+	}
+	// 空批次是 no-op
+	if err := s2.SaveSnapshots(nil); err != nil {
+		t.Errorf("empty batch must be a no-op, got %v", err)
+	}
 }

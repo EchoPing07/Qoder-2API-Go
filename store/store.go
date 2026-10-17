@@ -54,9 +54,7 @@ type Config struct {
 	ChatTimeoutSeconds int `json:"chat_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 	// Multi-account pool. A legacy config carrying a bare PAT migrates into a
-	// one-entry pool on load (see load). AutoSwitch is persisted from the start
-	// (unused until automatic switching ships) so that rollout needs no second
-	// data migration.
+	// one-entry pool on load (see load).
 	Accounts        []Account  `json:"accounts,omitempty"`
 	ActiveAccountID string     `json:"active_account_id,omitempty"`
 	AutoSwitch      AutoSwitch `json:"auto_switch"`
@@ -90,21 +88,25 @@ type AccountSnapshot struct {
 	NextResetAtMs int64 `json:"next_reset_at_ms,omitempty"`
 	// CheckedAt is when the snapshot was captured (epoch seconds).
 	CheckedAt int64 `json:"checked_at,omitempty"`
+	// CooldownUntil is the automatic-switching exclusion instant (epoch
+	// seconds): hard exhaustion cools down to the next reset, a generic
+	// failure (upstream 401/403 on a chat) for a short fixed window.
+	CooldownUntil int64 `json:"cooldown_until,omitempty"`
 	// LastError is the most recent check failure; empty after a good check.
 	LastError string `json:"last_error,omitempty"`
 }
 
-// AutoSwitch configures automatic switching on low credits (wired up in a
-// follow-up change; the fields are persisted from the start so the pool
-// schema is stable from day one).
+// AutoSwitch configures automatic switching on low credits: when the active
+// account's remaining credits fall to the absolute Threshold, the switcher
+// moves to the account with the most credits left.
 type AutoSwitch struct {
-	Enabled          bool    `json:"enabled"`
-	ThresholdPercent float64 `json:"threshold_percent"`
+	Enabled   bool    `json:"enabled"`
+	Threshold float64 `json:"threshold"`
 }
 
-// DefaultAutoSwitchPercent is the remaining-percentage threshold below which
+// DefaultAutoSwitchThreshold is the remaining-credits threshold below which
 // automatic switching considers moving to another account.
-const DefaultAutoSwitchPercent = 20
+const DefaultAutoSwitchThreshold = 20
 
 // DefaultHost is the default listen host.
 const DefaultHost = "0.0.0.0"
@@ -180,7 +182,7 @@ func New(filePath string) (*Store, error) {
 			LogMaxEntries:      DefaultLogMaxEntries,
 			APIKeys:            []APIKey{},
 			Accounts:           []Account{},
-			AutoSwitch:         AutoSwitch{ThresholdPercent: DefaultAutoSwitchPercent},
+			AutoSwitch:         AutoSwitch{Threshold: DefaultAutoSwitchThreshold},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -269,8 +271,8 @@ func (s *Store) load() error {
 			needsSave = true
 		}
 	}
-	if cfg.AutoSwitch.ThresholdPercent <= 0 {
-		cfg.AutoSwitch.ThresholdPercent = DefaultAutoSwitchPercent
+	if cfg.AutoSwitch.Threshold <= 0 {
+		cfg.AutoSwitch.Threshold = DefaultAutoSwitchThreshold
 		needsSave = true
 	}
 	s.config = &cfg
@@ -596,6 +598,29 @@ func (s *Store) SetAccountSnapshot(id string, snap *AccountSnapshot) error {
 	return s.save()
 }
 
+// SaveSnapshots merges a batch of snapshots into the pool and persists once.
+// Unknown IDs are ignored (the account may have been deleted while the
+// snapshot was in flight). Used by the periodic flush of passively deducted
+// snapshots, where a save per usage frame would be far too hot.
+func (s *Store) SaveSnapshots(snaps map[string]*AccountSnapshot) error {
+	if len(snaps) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	applied := 0
+	for i := range s.config.Accounts {
+		if snap, ok := snaps[s.config.Accounts[i].ID]; ok {
+			s.config.Accounts[i].Snapshot = snap
+			applied++
+		}
+	}
+	s.mu.Unlock()
+	if applied == 0 {
+		return nil
+	}
+	return s.save()
+}
+
 // --- AutoSwitch (persisted from day one; consumed by automatic switching) ---
 
 // GetAutoSwitch returns a normalized copy of the auto-switch settings.
@@ -603,19 +628,21 @@ func (s *Store) GetAutoSwitch() AutoSwitch {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	as := s.config.AutoSwitch
-	if as.ThresholdPercent <= 0 {
-		as.ThresholdPercent = DefaultAutoSwitchPercent
+	if as.Threshold <= 0 {
+		as.Threshold = DefaultAutoSwitchThreshold
 	}
 	return as
 }
 
-// SetAutoSwitch validates and persists the auto-switch settings.
-func (s *Store) SetAutoSwitch(enabled bool, thresholdPercent float64) error {
-	if thresholdPercent < 1 || thresholdPercent > 99 {
-		return fmt.Errorf("阈值需在 1-99 之间")
+// SetAutoSwitch validates and persists the auto-switch settings. Threshold is
+// absolute credits (>= 1) with no upper bound: a pool where every balance
+// sits below the threshold simply stays put by design.
+func (s *Store) SetAutoSwitch(enabled bool, threshold float64) error {
+	if threshold < 1 {
+		return fmt.Errorf("阈值需不小于 1 积分")
 	}
 	s.mu.Lock()
-	s.config.AutoSwitch = AutoSwitch{Enabled: enabled, ThresholdPercent: thresholdPercent}
+	s.config.AutoSwitch = AutoSwitch{Enabled: enabled, Threshold: threshold}
 	s.mu.Unlock()
 	return s.save()
 }

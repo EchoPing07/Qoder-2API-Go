@@ -92,7 +92,25 @@ PAGE('token', {
     }catch(e){ this.toast(e.message,'err'); }
   },
 
+  /* ── 自动切换设置 ── */
+  async loadAutoSwitch(){
+    try{
+      const r = await this.api('/admin/api/accounts/auto');
+      this.autoSwitch = {enabled: !!r.enabled, threshold: r.threshold || 20};
+    }catch(e){ this.toast(e.message,'err'); }
+  },
+  async saveAutoSwitch(){
+    const as = this.autoSwitch;
+    const t = Number(as.threshold);
+    if(!Number.isFinite(t) || t < 1){ this.toast('阈值需不小于 1 积分','err'); return; }
+    this.busy(async()=>{
+      await this.api('/admin/api/accounts/auto',{method:'POST',body:JSON.stringify({
+        enabled: !!as.enabled, threshold: t })});
+      this.toast('自动切换设置已保存','ok');
+    })();
+  },
+
   /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
    * 不参与统计页的定时刷新） ── */
-  load(){ this.loadAccounts(); this.loadPAT(); this.loadStats(); },
+  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadPAT(); this.loadStats(); },
 });

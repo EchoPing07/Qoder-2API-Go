@@ -54,6 +54,30 @@
             暂无账号，点击右上角添加第一个账号
           </div>
         </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>自动切换</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs">激活账号额度低于阈值时自动切到余额充足的账号</span>
+          </div>
+          <div class="switch-row">
+            <span class="sw-label">启用自动切换</span>
+            <button type="button" class="switch" :class="autoSwitch.enabled ? 'on' : ''" @click="autoSwitch.enabled = !autoSwitch.enabled" aria-label="启用自动切换"></button>
+          </div>
+          <div class="form-row">
+            <label class="label">阈值（剩余积分，低于此值自动切换）</label>
+            <input class="input" type="number" min="1" step="1" x-model.number="autoSwitch.threshold">
+            <p class="field-hint">当前账号剩余积分 ≤ 阈值时切到余额最多的账号（预留 5 积分滞回防振荡）；所有账号都低于阈值时留守当前账号并继续服务。硬耗尽的账号冷却到下次重置点。</p>
+          </div>
+          <div class="action-row">
+            <div class="spacer"></div>
+            <button class="btn btn-sm" @click="saveAutoSwitch()" :disabled="loading">
+              <span class="spin" x-show="loading"></span>
+              <span x-show="!loading">保存</span>
+            </button>
+          </div>
+        </div>
       </section>
 
 <!-- ═══ 添加账号弹窗 ═══ -->

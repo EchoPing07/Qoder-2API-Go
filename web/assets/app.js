@@ -64,6 +64,7 @@ function appShell(){
     pat:{masked:'',input:''},
     accounts:[], accountModal:false, accountForm:{pat:'',note:''},
     noteModal:false, noteForm:{id:'',note:''}, checkingId:'',
+    autoSwitch:{enabled:false, threshold:20},
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},

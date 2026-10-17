@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"qoder2api/auth"
 	"qoder2api/stats"
 	"qoder2api/store"
 )
@@ -350,5 +351,224 @@ func TestPatSwitchDoesNotShowPreviousAccountWhenNewRefreshFails(t *testing.T) {
 	}
 	if got := rec.Report().Account; got != nil {
 		t.Errorf("a late write resurrected the previous PAT's account: %+v", got)
+	}
+}
+
+// ═══ Automatic account switching ═══
+
+// newSwitchTestProvider builds a provider + store with a two-account pool:
+// acc1 active (remaining 10%), acc2 idle (remaining 80%), auto-switch enabled
+// at 20%.
+func newSwitchTestPool(t *testing.T) (*bridgeProvider, *store.Store, string, string) {
+	t.Helper()
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	acc1, _ := s.AddAccount("pt-a", "一号")
+	acc2, _ := s.AddAccount("pt-b", "二号")
+	s.SetAccountSnapshot(acc1.ID, &store.AccountSnapshot{Remaining: 10, Total: 100, CheckedAt: time.Now().Unix()})
+	s.SetAccountSnapshot(acc2.ID, &store.AccountSnapshot{Remaining: 80, Total: 100, CheckedAt: time.Now().Unix()})
+	s.SetAutoSwitch(true, 20)
+	p := newBridgeProvider(s)
+	p.switcher = newAutoSwitcher(s)
+	return p, s, acc1.ID, acc2.ID
+}
+
+// TestPickCandidate 候选选择：跳过冷却/自身，优先余额充足者；无充足者回退到最高余额。
+func TestPickCandidate(t *testing.T) {
+	accounts := []store.Account{
+		{ID: "self", PAT: "pt-self", Snapshot: &store.AccountSnapshot{Remaining: 10, Total: 100}},
+		{ID: "hi", PAT: "pt-hi", Snapshot: &store.AccountSnapshot{Remaining: 80, Total: 100}},
+		{ID: "cool", PAT: "pt-cool", Snapshot: &store.AccountSnapshot{Remaining: 95, Total: 100, CooldownUntil: time.Now().Add(time.Hour).Unix()}},
+		{ID: "low", PAT: "pt-low", Snapshot: &store.AccountSnapshot{Remaining: 15, Total: 100}},
+		{ID: "nosnap", PAT: "pt-nosnap"},
+	}
+	if got := pickCandidate(accounts, "self", 20); got != "hi" {
+		t.Errorf("pick = %q, want hi (highest comfortable)", got)
+	}
+	// hi 也进冷却 → 回退到未冷却的最高余额（low，虽低于阈值但强于猜测）
+	accounts[1].Snapshot.CooldownUntil = time.Now().Add(time.Hour).Unix()
+	if got := pickCandidate(accounts, "self", 20); got != "low" {
+		t.Errorf("pick = %q, want low (fallback)", got)
+	}
+	// 全冷却 → 无候选
+	accounts[3].Snapshot.CooldownUntil = time.Now().Add(time.Hour).Unix()
+	if got := pickCandidate(accounts, "self", 20); got != "" {
+		t.Errorf("pick = %q, want empty", got)
+	}
+}
+
+// TestAutoSwitchOnThreshold 低于阈值的 usage 扣减触发自动切号，并复用 PAT-change
+// 链路（hook 清快照）。
+func TestAutoSwitchOnThreshold(t *testing.T) {
+	p, s, acc1, acc2 := newSwitchTestPool(t)
+	clears := 0
+	p.switcher.setOnSwitch(func() { clears++ })
+
+	// 扣到阈值下方 → 切到二号（先把驻留期拨过去：新建的 switcher 因 60s 驻留
+	// 会挡下首次阈值切换）
+	p.switcher.mu.Lock()
+	p.switcher.since = time.Now().Add(-2 * minResidence)
+	p.switcher.mu.Unlock()
+	p.deductCredits(acc1, 5) // 10-5=5% < 20%
+	if s.GetActiveAccountID() != acc2 {
+		t.Fatalf("active = %q, want %q", s.GetActiveAccountID(), acc2)
+	}
+	if s.GetPAT() != "pt-b" {
+		t.Errorf("PAT mirror = %q, want pt-b (switch is SetPAT)", s.GetPAT())
+	}
+	if clears != 1 {
+		t.Errorf("post-switch hook fired %d times, want 1", clears)
+	}
+	// 滞回外的正常扣减不切号（现在活跃的是二号，余额充足）
+	p.deductCredits(acc2, 5) // 80-5=75% > 20%
+	if s.GetActiveAccountID() != acc2 {
+		t.Error("healthy deduction must not switch")
+	}
+}
+
+// TestAutoSwitchDisabled 开关关闭时阈值突破不切号。
+func TestAutoSwitchDisabled(t *testing.T) {
+	p, s, acc1, _ := newSwitchTestPool(t)
+	s.SetAutoSwitch(false, 20)
+	p.deductCredits(acc1, 5)
+	if s.GetActiveAccountID() != acc1 {
+		t.Error("disabled auto-switch must not move the active account")
+	}
+}
+
+// TestFailoverSwitchesAndCools chat 路径的 AuthError failover：失败号进冷却、
+// 切到候选号、返回重建的 bridge；无候选时返回 nil（回退到原始 502）。
+func TestFailoverSwitchesAndCools(t *testing.T) {
+	p, s, acc1, acc2 := newSwitchTestPool(t)
+
+	next := p.handleChatFailover(acc1)
+	if next == nil {
+		t.Fatal("failover should return a replacement bridge")
+	}
+	if s.GetActiveAccountID() != acc2 {
+		t.Fatalf("active = %q, want %q", s.GetActiveAccountID(), acc2)
+	}
+	// 失败号进冷却（5 分钟）
+	for _, acc := range s.ListAccounts() {
+		if acc.ID == acc1 && (acc.Snapshot == nil || acc.Snapshot.CooldownUntil < time.Now().Unix()) {
+			t.Errorf("failed account not cooling down: %+v", acc.Snapshot)
+		}
+	}
+	// 返回的 bridge 指向新账号
+	if next.AccountID != acc2 {
+		t.Errorf("replacement AccountID = %q, want %q", next.AccountID, acc2)
+	}
+	// 二号也失败：无候选 → nil，激活不移动
+	next = p.handleChatFailover(acc2)
+	if next != nil {
+		t.Error("no candidate must give up (nil)")
+	}
+	if s.GetActiveAccountID() != acc2 {
+		t.Error("a failed switch attempt must not move the active account")
+	}
+}
+
+// TestFailoverDedupesConcurrent 并发失败去重：第二个调用者发现激活已切换（failedID
+// 不再是激活账号）时不再切号，直接回 nil（该请求在原 bridge 上重试也已被首切覆盖，
+// 由 handler 重新 resolve 完成迁移）。
+func TestFailoverDedupesConcurrent(t *testing.T) {
+	p, s, acc1, _ := newSwitchTestPool(t)
+	// 首切成功
+	p.handleChatFailover(acc1)
+	active := s.GetActiveAccountID()
+	// 同一失败号再来：activeID 已变，直接返回（不再切，也不再冷却别人）
+	next := p.handleChatFailover(acc1)
+	if next != nil {
+		t.Error("stale failure report must return nil")
+	}
+	if s.GetActiveAccountID() != active {
+		t.Error("dedupe must keep the current active account")
+	}
+}
+
+// TestMaybeSwitchRespectsResidence 阈值切换受最小驻留约束（60s），失败切换不受。
+func TestMaybeSwitchRespectsResidence(t *testing.T) {
+	p, s, acc1, acc2 := newSwitchTestPool(t)
+	// 刚切过（since=now），阈值触发被驻留挡下
+	p.deductCredits(acc1, 5)
+	if s.GetActiveAccountID() != acc1 {
+		t.Fatal("precondition: fresh account must resist threshold switch")
+	}
+	// 失败路径无视驻留
+	if next := p.handleChatFailover(acc1); next == nil {
+		t.Error("failure switch must ignore min residence")
+	}
+	if s.GetActiveAccountID() != acc2 {
+		t.Errorf("active = %q, want %q", s.GetActiveAccountID(), acc2)
+	}
+}
+
+// TestApplyQuotaHardExhaustedCoolsUntilReset 权威校正把硬耗尽冷却到下次重置点，
+// 恢复后清除冷却。
+func TestApplyQuotaHardExhaustedCoolsUntilReset(t *testing.T) {
+	p, _, acc1, _ := newSwitchTestPool(t)
+	resetMs := time.Now().Add(48 * time.Hour).UnixMilli()
+	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
+		UserQuota:      &auth.Quota{Total: 100, Remaining: 0},
+		IsQuotaExceeded: true,
+		NextResetAtMs:  resetMs,
+	})
+	snap := p.snapshots[acc1]
+	if snap.CooldownUntil != resetMs/1000 {
+		t.Errorf("cooldown = %d, want reset %d", snap.CooldownUntil, resetMs/1000)
+	}
+	// 恢复
+	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
+		UserQuota:      &auth.Quota{Total: 100, Remaining: 50},
+		IsQuotaExceeded: false,
+	})
+	if p.snapshots[acc1].CooldownUntil != 0 {
+		t.Error("recovered account must clear the cooldown")
+	}
+}
+
+// TestFlushAccountSnapshots 被动扣减的内存快照按 30s 循环批量落盘。
+func TestFlushAccountSnapshots(t *testing.T) {
+	p, s, acc1, _ := newSwitchTestPool(t)
+	// 种子内存快照并扣减（不开自动切，免得切走）
+	s.SetAutoSwitch(false, 20)
+	p.snapMu.Lock()
+	p.snapshots[acc1] = &store.AccountSnapshot{Remaining: 50, Total: 100, CheckedAt: 1}
+	p.snapMu.Unlock()
+	p.deductCredits(acc1, 10)
+	p.flushAccountSnapshots()
+	var got *store.AccountSnapshot
+	for _, acc := range s.ListAccounts() {
+		if acc.ID == acc1 {
+			got = acc.Snapshot
+		}
+	}
+	if got == nil || got.Remaining != 40 {
+		t.Errorf("flushed snapshot = %+v, want remaining 40", got)
+	}
+	// 无快照时是 no-op（不写盘）
+	if err := p.store.SaveSnapshots(nil); err != nil {
+		t.Errorf("empty flush = %v", err)
+	}
+}
+
+// TestDeductCreditsWithoutBaseline 无权威基线（无快照）时被动扣减是 no-op，不猜测。
+func TestDeductCreditsWithoutBaseline(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, _ := s.AddAccount("pt-x", "")
+	s.SetAutoSwitch(true, 20)
+	p := newBridgeProvider(s)
+	p.switcher = newAutoSwitcher(s)
+	p.deductCredits(acc.ID, 5) // 无快照：不能崩、不能切
+	if s.GetActiveAccountID() != acc.ID {
+		t.Error("deduction without baseline must not switch")
+	}
+	if p.snapshots[acc.ID] != nil {
+		t.Error("deduction without baseline must not fabricate a snapshot")
 	}
 }

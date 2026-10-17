@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -26,7 +27,23 @@ type ResolvedBridge struct {
 	Bridge  *OpenAiBridge
 	KeyID   string // authenticated key's ID ("" when unknown)
 	KeyNote string // authenticated key's note
+	// AccountID identifies the Qoder account serving this request. Empty when
+	// the caller does not track accounts (single-PAT deployments, tests). It
+	// gives the failover callback the identity of the account that failed so
+	// concurrent failures can dedupe against the already-switched account.
+	AccountID string
 }
+
+// FailoverFunc reports an upstream auth failure on the given account and lets
+// the caller switch to another one. It returns the replacement bridge (nil =
+// give up, surface the original error). Implemented by the caller (main
+// package); nil keeps the legacy behaviour (no failover).
+type FailoverFunc func(failedAccountID string) *ResolvedBridge
+
+// UsageHook receives every usage frame together with the account that served
+// the request (empty when unknown), enabling passive credit deduction for
+// automatic switching. May be nil; it never affects the response.
+type UsageHook func(accountID string, u *transform.Usage)
 
 // BridgeResolver resolves an API key to the current bridge plus its key
 // metadata, or nil if the key is invalid or no PAT is configured. Implemented
@@ -60,7 +77,12 @@ func writeError(w http.ResponseWriter, statusCode int, errType, message string) 
 // MakeChatHandler creates the /v1/chat/completions handler. The resolver
 // validates the API key and returns the single bridge instance. rec records
 // request statistics and lr audit-log entries (metadata only); both may be nil.
-func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Recorder) http.HandlerFunc {
+// failover may be nil: an upstream auth failure then surfaces as a plain
+// 502 upstream_error. With it, an AuthError seen before any byte reached the
+// client is reported to the callback, which may return a replacement bridge
+// (already resolved for another account); the request is then retried once on
+// it — invisible to the client.
+func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Recorder, failover FailoverFunc, usageHook UsageHook) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		token := extractBearerToken(r)
@@ -114,7 +136,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			}
 		}
 		var usageSink UsageSink
-		if rec != nil || lr != nil {
+		if rec != nil || lr != nil || usageHook != nil {
 			usageSink = func(u *transform.Usage) {
 				if rec != nil {
 					rec.RecordUsage(model, &stats.Usage{
@@ -131,109 +153,148 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 					entry.CompletionTokens = u.CompletionTokens
 					entry.TotalTokens = u.TotalTokens
 					entry.Credits = u.Credits
+					// Passive deduction for automatic switching; must not be
+					// able to break the response path.
+					if usageHook != nil {
+						usageHook(rb.AccountID, u)
+					}
 				}
 			}
 		}
 
-		err := b.HandleChat(r.Context(), w, reqBody, usageSink)
-		if err != nil {
-			// A client-initiated disconnect (or server shutdown) is not a
-			// request failure and must not skew the success rate.
-			clientGone := errors.Is(err, context.Canceled)
-			var repErr *StreamReportedError
-			if errors.As(err, &repErr) {
-				// Content was already delivered: the response is committed as
-				// 200 with an in-band error chunk.
-				entry.StatusCode, entry.ErrorMsg = 200, truncateRunes(repErr.Error(), 500)
-				if !clientGone {
-					record(false)
-				}
-				return
-			}
-			var paramErr *RequestParamError
-			if errors.As(err, &paramErr) {
-				entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(paramErr.Error(), 500)
-				writeError(w, 400, "invalid_request_error", paramErr.Error())
-				record(false)
-				return
-			}
-			var upErr *auth.UpstreamError
-			if errors.As(err, &upErr) {
-				// A gateway rejection of the request itself (bad parameter values,
-				// unknown tiers, oversized caps...) passes through with its status
-				// and body instead of being masked as a bridge fault.
-				entry.StatusCode = clientStatusForUpstream(upErr.StatusCode)
-				entry.ErrorMsg = truncateRunes("upstream: "+upErr.Body, 500)
-				writeUpstreamRejection(w, upErr.StatusCode, upErr.Body, upErr.RetryAfter)
-				record(false)
-				return
-			}
-			var isErr *auth.InStreamError
-			if errors.As(err, &isErr) {
-				// The gateway accepted the request (HTTP 200) but failed inside the
-				// SSE stream before any content was delivered: map by the status
-				// embedded in the failure frame, same policy as UpstreamError. A
-				// frame without a usable status is still a provider fault → 502.
-				entry.StatusCode = clientStatusForUpstream(isErr.Status)
-				entry.ErrorMsg = truncateRunes("upstream: "+isErr.Detail, 500)
-				writeUpstreamRejection(w, isErr.Status, isErr.Detail, 0)
-				record(false)
-				return
+		// One failover attempt is made when the upstream rejects the session
+		// credentials before any byte reached the client: the response is still
+		// uncommitted there (headers may have been set but WriteHeader not
+		// called), so swapping to another account's bridge and retrying is
+		// invisible to the client. A StreamReportedError (content already
+		// delivered, failure wrapped by handleStream) or a client disconnect
+		// (context.Canceled) rules the response committed and skips the retry.
+		for attempt := 0; ; attempt++ {
+			err := b.HandleChat(r.Context(), w, reqBody, usageSink)
+			if err == nil {
+				break
 			}
 			var authErr *auth.AuthError
-			if errors.As(err, &authErr) {
-				// The gateway rejected OUR session/PAT credentials, not the
-				// client's API key (that was validated by the resolver long before
-				// this point). Passing the upstream 401 through would make every
-				// client believe its own key is invalid, so this is reported as a
-				// bad-gateway fault with the (redacted) upstream detail.
-				entry.StatusCode, entry.ErrorMsg = 502, truncateRunes("upstream auth: "+authErr.Error(), 500)
-				writeError(w, 502, "upstream_error", "upstream auth: "+authErr.Error())
-				record(false)
-				return
-			}
-			var valErr *models.UnsupportedModelError
-			if errors.As(err, &valErr) {
-				entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(valErr.Error(), 500)
-				writeError(w, 400, "invalid_request_error", valErr.Error())
-				record(false)
-				return
-			}
-			var busyErr *auth.BusyError
-			if errors.As(err, &busyErr) {
-				// Gateway admission-control rejection, not a server fault:
-				// surface it as 429 with Retry-After so clients back off.
-				if busyErr.RetryAfter > 0 {
-					retrySecs := int((busyErr.RetryAfter + time.Second - 1) / time.Second)
-					w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+			var repErr *StreamReportedError
+			if attempt == 0 && failover != nil && errors.As(err, &authErr) &&
+				!errors.As(err, &repErr) && !errors.Is(err, context.Canceled) {
+				// Ask the caller for a replacement bridge on another account;
+				// nil means no candidate (or switching disabled) — fall
+				// through to the original 502 mapping.
+				if next := failover(rb.AccountID); next != nil && next.Bridge != nil {
+					log.Printf("[bridge] upstream auth failure on account %s; retrying once on the switched account", rb.AccountID)
+					rb, b = next, next.Bridge
+					entry.KeyID, entry.KeyNote = next.KeyID, next.KeyNote
+					continue
 				}
-				entry.StatusCode, entry.ErrorMsg = 429, truncateRunes("upstream busy: "+busyErr.Message, 500)
-				writeError(w, 429, "rate_limit_error", "upstream busy: "+busyErr.Message)
-				record(false)
-				return
 			}
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "Unsupported model") || strings.Contains(errMsg, "not supported") {
-				entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(errMsg, 500)
-				writeError(w, 400, "invalid_request_error", errMsg)
-				record(false)
-				return
-			}
-			if clientGone {
-				// Client aborted before anything was delivered: 499 (nginx's
-				// "client closed request") rather than a misleading 500.
-				entry.StatusCode, entry.ErrorMsg = 499, "client canceled"
-			} else {
-				entry.StatusCode, entry.ErrorMsg = 500, truncateRunes(errMsg, 500)
-			}
-			writeError(w, 500, "qoder_error", errMsg)
-			if !clientGone {
-				record(false)
-			}
+			handleChatError(w, entry, record, err, clientGone(err))
 			return
 		}
 		entry.StatusCode = 200
 		record(true)
+	}
+}
+
+// clientGone reports whether err is a client-initiated disconnect (or server
+// shutdown): not a request failure, must not skew the success rate.
+func clientGone(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+// handleChatError maps a failed HandleChat call onto the client response and
+// the request-log entry. Shared by the failover loop and the original path so
+// both speak one error mapping.
+func handleChatError(w http.ResponseWriter, entry *logs.LogEntry, record func(bool), err error, clientGone bool) {
+	var repErr *StreamReportedError
+	if errors.As(err, &repErr) {
+		// Content was already delivered: the response is committed as
+		// 200 with an in-band error chunk.
+		entry.StatusCode, entry.ErrorMsg = 200, truncateRunes(repErr.Error(), 500)
+		if !clientGone {
+			record(false)
+		}
+		return
+	}
+	var paramErr *RequestParamError
+	if errors.As(err, &paramErr) {
+		entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(paramErr.Error(), 500)
+		writeError(w, 400, "invalid_request_error", paramErr.Error())
+		record(false)
+		return
+	}
+	var upErr *auth.UpstreamError
+	if errors.As(err, &upErr) {
+		// A gateway rejection of the request itself (bad parameter values,
+		// unknown tiers, oversized caps...) passes through with its status
+		// and body instead of being masked as a bridge fault.
+		entry.StatusCode = clientStatusForUpstream(upErr.StatusCode)
+		entry.ErrorMsg = truncateRunes("upstream: "+upErr.Body, 500)
+		writeUpstreamRejection(w, upErr.StatusCode, upErr.Body, upErr.RetryAfter)
+		record(false)
+		return
+	}
+	var isErr *auth.InStreamError
+	if errors.As(err, &isErr) {
+		// The gateway accepted the request (HTTP 200) but failed inside the
+		// SSE stream before any content was delivered: map by the status
+		// embedded in the failure frame, same policy as UpstreamError. A
+		// frame without a usable status is still a provider fault → 502.
+		entry.StatusCode = clientStatusForUpstream(isErr.Status)
+		entry.ErrorMsg = truncateRunes("upstream: "+isErr.Detail, 500)
+		writeUpstreamRejection(w, isErr.Status, isErr.Detail, 0)
+		record(false)
+		return
+	}
+	var authErr *auth.AuthError
+	if errors.As(err, &authErr) {
+		// The gateway rejected OUR session/PAT credentials, not the
+		// client's API key (that was validated by the resolver long before
+		// this point). Passing the upstream 401 through would make every
+		// client believe its own key is invalid, so this is reported as a
+		// bad-gateway fault with the (redacted) upstream detail.
+		entry.StatusCode, entry.ErrorMsg = 502, truncateRunes("upstream auth: "+authErr.Error(), 500)
+		writeError(w, 502, "upstream_error", "upstream auth: "+authErr.Error())
+		record(false)
+		return
+	}
+	var valErr *models.UnsupportedModelError
+	if errors.As(err, &valErr) {
+		entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(valErr.Error(), 500)
+		writeError(w, 400, "invalid_request_error", valErr.Error())
+		record(false)
+		return
+	}
+	var busyErr *auth.BusyError
+	if errors.As(err, &busyErr) {
+		// Gateway admission-control rejection, not a server fault:
+		// surface it as 429 with Retry-After so clients back off.
+		if busyErr.RetryAfter > 0 {
+			retrySecs := int((busyErr.RetryAfter + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		}
+		entry.StatusCode, entry.ErrorMsg = 429, truncateRunes("upstream busy: "+busyErr.Message, 500)
+		writeError(w, 429, "rate_limit_error", "upstream busy: "+busyErr.Message)
+		record(false)
+		return
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "Unsupported model") || strings.Contains(errMsg, "not supported") {
+		entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(errMsg, 500)
+		writeError(w, 400, "invalid_request_error", errMsg)
+		record(false)
+		return
+	}
+	if clientGone {
+		// Client aborted before anything was delivered: 499 (nginx's
+		// "client closed request") rather than a misleading 500.
+		entry.StatusCode, entry.ErrorMsg = 499, "client canceled"
+	} else {
+		entry.StatusCode, entry.ErrorMsg = 500, truncateRunes(errMsg, 500)
+	}
+	writeError(w, 500, "qoder_error", errMsg)
+	if !clientGone {
+		record(false)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"qoder2api/models"
 	"qoder2api/stats"
 	"qoder2api/store"
+	"qoder2api/transform"
 	"qoder2api/web"
 
 	"sync"
@@ -36,6 +37,11 @@ type bridgeProvider struct {
 	bridge *bridge.OpenAiBridge
 	pat    string
 	store  *store.Store
+	switcher *autoSwitcher // nil in tests that build a provider directly
+	// snapshots are the in-memory quota snapshots maintained by passive
+	// deduction and authoritative correction; flushed to disk periodically.
+	snapMu    sync.Mutex
+	snapshots map[string]*store.AccountSnapshot
 	// onPatChange is fired after a different non-empty PAT was replaced or the
 	// PAT was cleared. It runs without the provider lock held: the callback
 	// takes the recorder lock, and nesting the two risks a lock-order stall.
@@ -43,7 +49,17 @@ type bridgeProvider struct {
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
-	return &bridgeProvider{store: st}
+	return &bridgeProvider{store: st, snapshots: map[string]*store.AccountSnapshot{}}
+}
+
+// AccountIDByPAT resolves a PAT to its pool entry ID ("" when absent).
+func AccountIDByPAT(s *store.Store, pat string) string {
+	for _, acc := range s.ListAccounts() {
+		if acc.PAT == pat {
+			return acc.ID
+		}
+	}
+	return ""
 }
 
 // setOnPatChange installs the callback fired when the configured PAT changes.
@@ -66,7 +82,7 @@ func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
 	if b == nil {
 		return nil
 	}
-	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note}
+	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: p.store.GetActiveAccountID()}
 }
 
 // currentBridge returns the bridge for the current PAT, creating or recreating
@@ -133,6 +149,269 @@ func clearAccountOnPatChange(rec *stats.Recorder) {
 	patWriteMu.Lock()
 	defer patWriteMu.Unlock()
 	rec.ClearAccount()
+}
+
+// ═══ Automatic account switching ═══
+//
+// Three signals feed the pool snapshots, in decreasing trust order, and none
+// of them adds a polling loop:
+//
+//  1. authoritative correction — the existing 60s account loop already fetches
+//     the active account's quota; its result is written back into the snapshot
+//     and hard-exhaustion sets a cooldown until the next reset;
+//  2. failure fallback — a chat request dying on an upstream 401/403 before any
+//     byte reached the client puts the failed account into a short cooldown and
+//     moves to the next candidate; the request retries once on the new bridge;
+//  3. passive deduction — the usage frame of every billed request carries
+//     credits, which are subtracted from the current account's remaining
+//     snapshot; a threshold breach schedules a switch.
+//
+// Switching itself is still SetPAT(): the bridge rebuilds lazily, the stats
+// snapshot is cleared by the existing PAT-change hook, and patWriteMu keeps
+// account-loop writes from landing across a switch.
+
+const (
+	// failureCooldown is the exclusion window applied after a chat-path auth
+	// failure: long enough to stop hammering a dead token, short enough that
+	// a fixed credential recovers without admin action.
+	failureCooldown = 5 * time.Minute
+	// minResidence is the minimum time an account stays active before
+	// automatic switching may move away from it again (anti-oscillation).
+	minResidence = 60 * time.Second
+	// switchHysteresis requires a candidate to beat the threshold by this much
+	// margin (credits) so an account hovering at the threshold cannot
+	// flip-flop.
+	switchHysteresis = 5.0
+)
+
+// autoSwitcher owns the switching state machine. It mutates the pool through
+// the store (ActivateAccount) and never holds locks across upstream calls.
+type autoSwitcher struct {
+	mu       sync.Mutex
+	store    *store.Store
+	since    time.Time // when the current account became active
+	lastAsk  time.Time // last "no candidate" log instant (throttle for the stay-put warning)
+	onSwitch func()    // fired after a successful automatic switch (stats snapshot clear)
+}
+
+func newAutoSwitcher(st *store.Store) *autoSwitcher {
+	return &autoSwitcher{store: st, since: time.Now()}
+}
+
+// setOnSwitch installs the post-switch hook (must happen before serving).
+func (s *autoSwitcher) setOnSwitch(fn func()) { s.onSwitch = fn }
+
+// pickCandidate returns the pool entry to switch to: skipping cooling-down
+// accounts, preferring the one with the most remaining credits that sits
+// comfortably above the threshold (+ hysteresis), falling back to the highest
+// remaining when every candidate sits below it — a partially charged account
+// still beats a dead one. Returns "" when nobody qualifies.
+func pickCandidate(accounts []store.Account, activeID string, threshold float64) string {
+	type cand struct {
+		id         string
+		remaining  float64
+		ready      bool // comfortably above the threshold
+	}
+	var pool []cand
+	for _, acc := range accounts {
+		if acc.ID == activeID || acc.Snapshot == nil {
+			continue
+		}
+		if acc.Snapshot.CooldownUntil > time.Now().Unix() {
+			continue
+		}
+		remaining := acc.Snapshot.Remaining
+		pool = append(pool, cand{acc.ID, remaining, remaining > threshold+switchHysteresis && !acc.Snapshot.IsExceeded})
+	}
+	// Prefer ready candidates (most credits first), then any candidate
+	// (still most credits first). Accounts without a snapshot never qualify:
+	// no data beats guessing.
+	for _, wantReady := range []bool{true, false} {
+		best := ""
+		bestRemaining := -1.0
+		for _, c := range pool {
+			if c.ready != wantReady || c.remaining <= bestRemaining {
+				continue
+			}
+			best, bestRemaining = c.id, c.remaining
+		}
+		if best != "" {
+			return best
+		}
+	}
+	return ""
+}
+
+// maybeSwitch evaluates the auto-switch conditions for reason ("threshold" or
+// "failure") and switches when a candidate exists. Serializes against itself;
+// concurrent failures dedupe because the second caller re-reads the store and
+// finds itself already on the account the first one switched to.
+func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg := s.store.GetAutoSwitch()
+	if !cfg.Enabled {
+		return
+	}
+	activeID := s.store.GetActiveAccountID()
+	if failedID != "" && failedID != activeID {
+		// Someone already switched away from the failed account.
+		return
+	}
+	if reason == "failure" && failedID != "" {
+		// Cool the failed account down first so the candidate pick below skips
+		// it (failures are rare; one save is fine).
+		for _, acc := range s.store.ListAccounts() {
+			if acc.ID != failedID {
+				continue
+			}
+			snap := &store.AccountSnapshot{CooldownUntil: time.Now().Add(failureCooldown).Unix()}
+			if acc.Snapshot != nil {
+				cp := *acc.Snapshot
+				snap = &cp
+				snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
+			}
+			_ = s.store.SetAccountSnapshot(failedID, snap)
+			break
+		}
+	}
+	if reason == "threshold" && time.Since(s.since) < minResidence {
+		return // anti-oscillation: honor the current account's residence
+	}
+	id := pickCandidate(s.store.ListAccounts(), activeID, cfg.Threshold)
+	if id == "" {
+		// Keep serving and say so once per account loop.
+		if time.Since(s.lastAsk) > accountRefreshCadence {
+			s.lastAsk = time.Now()
+			log.Printf("[bridge] WARN auto-switch: no eligible candidate above %.0f credits; staying on the current account", cfg.Threshold)
+		}
+		return
+	}
+	if err := s.store.ActivateAccount(id); err != nil {
+		log.Printf("[bridge] WARN auto-switch failed: %v", err)
+		return
+	}
+	s.since = time.Now()
+	note := id
+	for _, acc := range s.store.ListAccounts() {
+		if acc.ID == id {
+			note = acc.Note
+			if note == "" {
+				note = acc.PAT[:4] + "****"
+			}
+		}
+	}
+	log.Printf("[bridge] auto-switch (%s): moved to account %s", reason, note)
+	if s.onSwitch != nil {
+		s.onSwitch()
+	}
+}
+
+// handleChatFailover implements bridge.FailoverFunc: report the auth failure
+// of failedAccountID, cool it down, switch to a candidate, and hand back the
+// replacement bridge — or nil to give up and surface the original error.
+func (p *bridgeProvider) handleChatFailover(failedAccountID string) *bridge.ResolvedBridge {
+	activeID := p.store.GetActiveAccountID()
+	p.switcher.maybeSwitch("failure", failedAccountID)
+	if p.store.GetActiveAccountID() == activeID {
+		return nil // no switch happened: no point retrying on the same bridge
+	}
+	// The PAT mirror moved, so currentBridge rebuilds lazily on the new PAT.
+	b := p.currentBridge()
+	if b == nil {
+		return nil
+	}
+	return &bridge.ResolvedBridge{Bridge: b, AccountID: p.store.GetActiveAccountID()}
+}
+
+// deductCredits passively applies one usage frame to the current account's
+// snapshot and evaluates the threshold. Memory-only: the snapshot is flushed
+// to disk by the 30s stats loop (flushAccountSnapshots).
+func (p *bridgeProvider) deductCredits(accountID string, credits float64) {
+	if accountID == "" || credits <= 0 {
+		return
+	}
+	p.snapMu.Lock()
+	snap := p.snapshots[accountID]
+	if snap == nil {
+		// Seed from the persisted snapshot so passive deduction continues
+		// where the last check left off.
+		for _, acc := range p.store.ListAccounts() {
+			if acc.ID == accountID {
+				if acc.Snapshot != nil {
+					cp := *acc.Snapshot
+					snap = &cp
+				}
+				break
+			}
+		}
+	}
+	if snap == nil || snap.Total <= 0 {
+		p.snapMu.Unlock()
+		return // no authoritative baseline: passive deduction would guess
+	}
+	snap.Remaining -= credits
+	if snap.Remaining < 0 {
+		snap.Remaining = 0
+	}
+	p.snapshots[accountID] = snap
+	remaining := snap.Remaining
+	p.snapMu.Unlock()
+
+	if cfg := p.store.GetAutoSwitch(); cfg.Enabled && remaining <= cfg.Threshold {
+		p.switcher.maybeSwitch("threshold", accountID)
+	}
+}
+
+// flushAccountSnapshots persists the passively deducted snapshots. Runs on the
+// existing 30s stats flush loop; a single save covers every touched account.
+func (p *bridgeProvider) flushAccountSnapshots() {
+	p.snapMu.Lock()
+	if len(p.snapshots) == 0 {
+		p.snapMu.Unlock()
+		return
+	}
+	batch := make(map[string]*store.AccountSnapshot, len(p.snapshots))
+	for id, snap := range p.snapshots {
+		cp := *snap
+		batch[id] = &cp
+	}
+	p.snapMu.Unlock()
+	if err := p.store.SaveSnapshots(batch); err != nil {
+		log.Printf("[stats] WARN account snapshot flush failed: %v", err)
+	}
+}
+
+// applyQuotaToSnapshot merges an authoritative OpenAPI result into the pool
+// snapshot of the given account: it repairs drift from passive deduction and
+// records hard exhaustion (cooldown until the next reset).
+func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.AccountStatus) {
+	if accountID == "" || st == nil || st.UserQuota == nil {
+		return
+	}
+	p.snapMu.Lock()
+	snap := p.snapshots[accountID]
+	if snap == nil {
+		snap = &store.AccountSnapshot{}
+	}
+	snap.Remaining = st.UserQuota.Remaining
+	snap.Total = st.UserQuota.Total
+	snap.Plan = st.UserTag
+	snap.IsExceeded = st.IsQuotaExceeded
+	snap.NextResetAtMs = st.NextResetAtMs
+	snap.CheckedAt = time.Now().Unix()
+	snap.LastError = ""
+	if st.IsQuotaExceeded {
+		if st.NextResetAtMs > time.Now().UnixMilli() {
+			snap.CooldownUntil = st.NextResetAtMs / 1000
+		} else {
+			snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
+		}
+	} else {
+		snap.CooldownUntil = 0
+	}
+	p.snapshots[accountID] = snap
+	p.snapMu.Unlock()
 }
 
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
@@ -223,11 +502,17 @@ func main() {
 	}
 
 	provider := newBridgeProvider(st)
-
 	// Request statistics recorder with periodic persistence (30s cadence).
 	// The loop also drains a stop channel so graceful shutdown can trigger a
 	// final flush, avoiding loss of the last <=30s of stats.
 	rec := stats.NewRecorder(st)
+	// Automatic switching state machine: ownership of the pool switch, fed by
+	// the quota loop (authoritative), the failover path (failure) and the
+	// usage sink (threshold). The post-switch hook reuses the PAT-change
+	// clear so the panel drops the previous account's snapshot.
+	switcher := newAutoSwitcher(st)
+	provider.switcher = switcher
+	switcher.setOnSwitch(func() { clearAccountOnPatChange(rec) })
 	// Request-log recorder: same persistence model as stats (in-memory on the
 	// request path, flushed out of band). Entries are metadata only.
 	logRec := logs.NewRecorder(st, logRetention, logMaxEntries)
@@ -253,6 +538,9 @@ func main() {
 			if err := logRec.Flush(); err != nil {
 				log.Printf("[logs] WARN %sflush failed: %v", finalStr(final), err)
 			}
+			// Passively deducted account snapshots ride the same cadence (a
+			// single batched save; a no-op when nothing was touched).
+			provider.flushAccountSnapshots()
 		}
 		for {
 			select {
@@ -330,6 +618,10 @@ func main() {
 		// snapshot fetched for the previous PAT can no longer land after that
 		// clear. The fetch above stays outside the lock (it can take 30s).
 		applyAccountWrite(rec, provider, pat, st.NextResetAtMs, account)
+		// Authoritative correction (signal 1): merge the OpenAPI result into the
+		// account snapshot and arm the hard-exhaustion cooldown. Runs after the
+		// recorder write so a switch racing this write evaluates fresh data.
+		provider.applyQuotaToSnapshot(provider.store.GetActiveAccountID(), st)
 	}
 	go func() {
 		defer close(accountDone)
@@ -358,34 +650,43 @@ func main() {
 	// Account「检测」runs a throwaway bridge through a full session bootstrap
 	// and returns the authoritative quota snapshot; the admin layer only owns
 	// the endpoint. On-demand only — every check costs a session round-trip.
+	// The result also seeds the auto-switch snapshot for that account.
 	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
 		realPAT, region := auth.Resolve(pat)
 		b := bridge.NewOpenAiBridge(realPAT, region)
-		st := b.EnsureAccountStatus(ctx)
-		if st == nil {
+		acct := b.EnsureAccountStatus(ctx)
+		if acct == nil {
 			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")
 		}
 		snap := &store.AccountSnapshot{
-			Plan:          st.UserTag,
-			IsExceeded:    st.IsQuotaExceeded,
-			NextResetAtMs: st.NextResetAtMs,
+			Plan:          acct.UserTag,
+			IsExceeded:    acct.IsQuotaExceeded,
+			NextResetAtMs: acct.NextResetAtMs,
 			CheckedAt:     time.Now().Unix(),
 		}
 		// Sum the spendable pools with the same policy as the panel's quota
 		// list (zero-total pools are absent; the org pool counts only when it
 		// is available to this member) so numbers stay comparable across
 		// accounts and consistent with the stats page.
-		if st.UserQuota != nil && st.UserQuota.Total > 0 {
-			snap.Total += st.UserQuota.Total
-			snap.Remaining += st.UserQuota.Remaining
+		if acct.UserQuota != nil && acct.UserQuota.Total > 0 {
+			snap.Total += acct.UserQuota.Total
+			snap.Remaining += acct.UserQuota.Remaining
 		}
-		if st.AddOnQuota != nil && st.AddOnQuota.Total > 0 {
-			snap.Total += st.AddOnQuota.Total
-			snap.Remaining += st.AddOnQuota.Remaining
+		if acct.AddOnQuota != nil && acct.AddOnQuota.Total > 0 {
+			snap.Total += acct.AddOnQuota.Total
+			snap.Remaining += acct.AddOnQuota.Remaining
 		}
-		if st.OrgResourcePackage != nil && st.OrgResourcePackage.Cap > 0 && st.OrgResourcePackage.Available {
-			snap.Total += st.OrgResourcePackage.Cap
-			snap.Remaining += st.OrgResourcePackage.Remaining
+		if acct.OrgResourcePackage != nil && acct.OrgResourcePackage.Cap > 0 && acct.OrgResourcePackage.Available {
+			snap.Total += acct.OrgResourcePackage.Cap
+			snap.Remaining += acct.OrgResourcePackage.Remaining
+		}
+		// Seed the pool snapshot so passive deduction and candidate picking
+		// have an authoritative baseline even before the loop reaches it.
+		if id := AccountIDByPAT(st, pat); id != "" {
+			cp := *snap
+			provider.snapMu.Lock()
+			provider.snapshots[id] = &cp
+			provider.snapMu.Unlock()
 		}
 		return snap, nil
 	})
@@ -398,7 +699,20 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec, logRec))
+	// failover hands a chat-path auth failure to the auto-switcher and, when
+	// the active account moved, returns the rebuilt bridge for a single retry.
+	failover := func(failedAccountID string) *bridge.ResolvedBridge {
+		return provider.handleChatFailover(failedAccountID)
+	}
+	// usageHook feeds the usage sink with the account context: billed credits
+	// passively deduct the current account's snapshot (signal 3) and a
+	// threshold breach schedules an automatic switch.
+	usageHook := func(accountID string, u *transform.Usage) {
+		if u != nil && u.Billable {
+			provider.deductCredits(accountID, u.Credits)
+		}
+	}
+	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec, logRec, failover, usageHook))
 	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
 	mux.HandleFunc("/health", healthHandler(st))
 

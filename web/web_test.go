@@ -560,6 +560,7 @@ func TestMovedModelsAndTier(t *testing.T) {
 	if !strings.Contains(token, `href="https://qoder.cn/account/integrations"`) {
 		t.Error("令牌页缺少跳转 Qoder 集成页创建令牌的链接")
 	}
+	tokenJS := read(assetFS, "assets/pages/token.js")
 
 	// 令牌页已升级为账号页：账号池表格（掩码回显 + 激活徽标 + 切换/检测/备注/删除）
 	// 与添加弹窗必须存在，路由 key 仍为 token。
@@ -578,9 +579,22 @@ func TestMovedModelsAndTier(t *testing.T) {
 		}
 	}
 
+	// 自动切换设置卡：开关 + 阈值输入 + 保存动作必须存在
+	for _, want := range []string{
+		`<h3>自动切换</h3>`,
+		`x-model.number="autoSwitch.threshold"`,
+		`@click="saveAutoSwitch()"`,
+	} {
+		if !strings.Contains(token, want) {
+			t.Errorf("账号页缺少自动切换元素 %s", want)
+		}
+	}
+	if !strings.Contains(tokenJS, "loadAutoSwitch") {
+		t.Error("账号页必须加载自动切换设置")
+	}
+
 	// 令牌页要渲染等级徽标与账号池，其 load() 必须拉取 stats 快照（徽标数据源）
 	// 与账号列表。
-	tokenJS := read(assetFS, "assets/pages/token.js")
 	if !strings.Contains(tokenJS, "this.loadStats()") {
 		t.Error("令牌页 load() 必须加载 stats 快照（等级徽标的数据源）")
 	}
@@ -589,7 +603,7 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 	// 账号 API 调用路径须走 /admin/api/accounts*（与 admin 路由的契约由
 	// TestFrontendAPIPathsMatchAdminRoutes 守住，这里只守语义入口）。
-	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/switch'", "'/admin/api/accounts/check'"} {
+	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/switch'", "'/admin/api/accounts/check'", "'/admin/api/accounts/auto'"} {
 		if !strings.Contains(tokenJS, want) {
 			t.Errorf("账号页缺少 API 调用 %s", want)
 		}
@@ -837,7 +851,7 @@ Object.keys(PAGES).forEach(function (k) {
   const orig = PAGES[k].load;
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
-['loadStats', 'loadKeys', 'loadPAT', 'loadAccounts', 'loadModels', 'loadConfig'].forEach(function (m) {
+['loadStats', 'loadKeys', 'loadPAT', 'loadAccounts', 'loadAutoSwitch', 'loadModels', 'loadConfig'].forEach(function (m) {
   if (typeof inst[m] === 'function') inst[m] = function () { loads.push(m); };
 });
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）

@@ -24,7 +24,7 @@ import (
 )
 
 func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
-	handler := MakeChatHandler(nil, nil, nil)
+	handler := MakeChatHandler(nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -41,7 +41,7 @@ func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
 
 func TestChatRouteRejectsInvalidApiKey(t *testing.T) {
 	resolver := func(apiKey string) *ResolvedBridge { return nil }
-	handler := MakeChatHandler(resolver, nil, nil)
+	handler := MakeChatHandler(resolver, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -93,7 +93,7 @@ func TestModelsRouteReturnsAllModels(t *testing.T) {
 // Unauthorized requests (missing/invalid key) must not be counted.
 func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	handler := MakeChatHandler(nil, rec, nil)
+	handler := MakeChatHandler(nil, rec, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen3.7-Max","messages":[]}`))
@@ -112,7 +112,7 @@ func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 func TestChatRouteDoesNotRecordInvalidJSON(t *testing.T) {
 	rec := stats.NewRecorder(nil)
 	resolver := func(apiKey string) *ResolvedBridge { return &ResolvedBridge{Bridge: &OpenAiBridge{}} }
-	handler := MakeChatHandler(resolver, rec, nil)
+	handler := MakeChatHandler(resolver, rec, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model": `))
@@ -690,7 +690,7 @@ func TestChatRouteRejectsMalformedParamTypes(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":"8000"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -713,7 +713,7 @@ func TestChatRouteRejectsMultiChoice(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"n":3}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -855,7 +855,7 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	// The failure frames carry no content, so nothing is committed to the
 	// client and the rejection must surface as a real HTTP status carrying the
 	// embedded 429 — not a 200 SSE stream whose success every SDK would read.
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1205,7 +1205,7 @@ func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
 	gw := &busyGateway{busyFirstN: 99}
 	b := newBusyBridge(t, gw)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -1874,7 +1874,7 @@ func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1910,7 +1910,7 @@ func TestHandleChatAttributesCreditsToRequestedModel(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
+	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil, nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -2017,7 +2017,7 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: tc.retryAfter}
 			b := newRejectingBridge(t, gw)
-			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil, nil, nil)
 
 			req := httptest.NewRequest("POST", "/v1/chat/completions",
 				strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))

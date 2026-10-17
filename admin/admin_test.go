@@ -1081,3 +1081,44 @@ func TestPATPostStillMirrorsPool(t *testing.T) {
 			s.GetActiveAccountID(), len(s.ListAccounts()))
 	}
 }
+
+// TestAutoSwitchEndpoint 自动切换设置的读写与校验。
+func TestAutoSwitchEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	// 默认值
+	w := doRequest(t, a.handleAutoSwitch, "GET", "/admin/api/accounts/auto", nil)
+	var resp struct {
+		Enabled   bool    `json:"enabled"`
+		Threshold float64 `json:"threshold"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Enabled || resp.Threshold != store.DefaultAutoSwitchThreshold {
+		t.Errorf("default = %+v", resp)
+	}
+	// 保存
+	w = doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto",
+		map[string]interface{}{"enabled": true, "threshold": 30})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// 回读
+	w = doRequest(t, a.handleAutoSwitch, "GET", "/admin/api/accounts/auto", nil)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.Enabled || resp.Threshold != 30 {
+		t.Errorf("after save = %+v", resp)
+	}
+	if as := s.GetAutoSwitch(); !as.Enabled || as.Threshold != 30 {
+		t.Errorf("store = %+v", as)
+	}
+	// 非法阈值
+	w = doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto",
+		map[string]interface{}{"enabled": true, "threshold": 0})
+	if w.Code != 400 {
+		t.Errorf("threshold 0 should 400, got %d", w.Code)
+	}
+	// 方法不允许
+	w = doRequest(t, a.handleAutoSwitch, "DELETE", "/admin/api/accounts/auto", nil)
+	if w.Code != 405 {
+		t.Errorf("DELETE should 405, got %d", w.Code)
+	}
+}

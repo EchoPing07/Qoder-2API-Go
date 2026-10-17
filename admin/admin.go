@@ -85,6 +85,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/switch", a.requireAuth(a.handleAccountSwitch))
 	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
+	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
@@ -830,6 +831,32 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"snapshot": snap})
+}
+
+// handleAutoSwitch serves GET/POST /admin/api/accounts/auto: the automatic
+// switching switch plus its absolute remaining-credits threshold.
+func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		as := a.store.GetAutoSwitch()
+		writeJSON(w, 200, map[string]interface{}{"enabled": as.Enabled, "threshold": as.Threshold})
+	case http.MethodPost:
+		var body struct {
+			Enabled   bool    `json:"enabled"`
+			Threshold float64 `json:"threshold"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		if err := a.store.SetAutoSwitch(body.Enabled, body.Threshold); err != nil {
+			writeJSONError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
 }
 
 // --- Models endpoint ---
