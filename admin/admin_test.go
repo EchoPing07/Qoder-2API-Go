@@ -134,9 +134,9 @@ func TestMaskPAT(t *testing.T) {
 		{"pt-very-long-token-here", "pt-v****here"},
 	}
 	for _, tt := range tests {
-		got := maskPAT(tt.input)
+		got := MaskPAT(tt.input)
 		if got != tt.expected {
-			t.Errorf("maskPAT(%q) = %q, want %q", tt.input, got, tt.expected)
+			t.Errorf("MaskPAT(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
 	}
 }

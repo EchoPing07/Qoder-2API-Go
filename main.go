@@ -106,7 +106,7 @@ func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
 	accountNote := ""
 	for _, acc := range p.store.ListAccounts() {
 		if acc.ID == accountID {
-			accountNote = acc.Note
+			accountNote = accountDisplayName(acc)
 			break
 		}
 	}
@@ -148,7 +148,7 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 				continue
 			}
 		}
-		cands = append(cands, candidate{acc.ID, acc.PAT, acc.Note})
+		cands = append(cands, candidate{acc.ID, acc.PAT, accountDisplayName(acc)})
 	}
 	if len(cands) == 0 {
 		return nil
@@ -159,6 +159,15 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 	p.mu.Unlock()
 	b := p.bridgeFor(c.id, c.pat)
 	return &bridge.ResolvedBridge{Bridge: b, AccountID: c.id, AccountNote: c.note}
+}
+
+// accountDisplayName 是账号在日志等展示场景的名字：优先备注，
+// 没有备注时回退掩码 PAT（与账号池页面的展示一致）。
+func accountDisplayName(acc store.Account) string {
+	if acc.Note != "" {
+		return acc.Note
+	}
+	return admin.MaskPAT(acc.PAT)
 }
 
 // bridgeFor returns the cached bridge for a specific pool account, building it

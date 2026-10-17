@@ -610,7 +610,7 @@ func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		// Only the masked form is exposed; the plaintext PAT never leaves
 		// the server. The UI edits it as a whole new value, never in place.
-		masked := maskPAT(a.store.GetPAT())
+		masked := MaskPAT(a.store.GetPAT())
 		writeJSON(w, 200, map[string]string{"pat_masked": masked})
 	case http.MethodPost:
 		var body struct {
@@ -666,7 +666,7 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 		acc := accounts[i]
 		out = append(out, accountView{
 			ID:        acc.ID,
-			PATMasked: maskPAT(acc.PAT),
+			PATMasked: MaskPAT(acc.PAT),
 			Note:      acc.Note,
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
@@ -1002,8 +1002,8 @@ func atoiDefault(s string, def int) int {
 	return n
 }
 
-// maskPAT returns a masked version of the PAT for display.
-func maskPAT(pat string) string {
+// MaskPAT returns a masked version of the PAT for display.
+func MaskPAT(pat string) string {
 	if len(pat) <= 8 {
 		if pat == "" {
 			return ""
