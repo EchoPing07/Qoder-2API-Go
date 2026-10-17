@@ -386,7 +386,7 @@ func (p *bridgeProvider) flushAccountSnapshots() {
 // snapshot of the given account: it repairs drift from passive deduction and
 // records hard exhaustion (cooldown until the next reset).
 func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.AccountStatus) {
-	if accountID == "" || st == nil || st.UserQuota == nil {
+	if accountID == "" || st == nil {
 		return
 	}
 	p.snapMu.Lock()
@@ -394,8 +394,27 @@ func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.Account
 	if snap == nil {
 		snap = &store.AccountSnapshot{}
 	}
-	snap.Remaining = st.UserQuota.Remaining
-	snap.Total = st.UserQuota.Total
+	// 与面板「检测」同口径：对可用的额度池（个人 + 加量包 + 组织共享包）求和。
+	// 纯组织包账号（Teams）的 user_quota 上游恒为 0/0，直接采用会把快照清零。
+	var total, remaining float64
+	if st.UserQuota != nil && st.UserQuota.Total > 0 {
+		total += st.UserQuota.Total
+		remaining += st.UserQuota.Remaining
+	}
+	if st.AddOnQuota != nil && st.AddOnQuota.Total > 0 {
+		total += st.AddOnQuota.Total
+		remaining += st.AddOnQuota.Remaining
+	}
+	if st.OrgResourcePackage != nil && st.OrgResourcePackage.Cap > 0 && st.OrgResourcePackage.Available {
+		total += st.OrgResourcePackage.Cap
+		remaining += st.OrgResourcePackage.Remaining
+	}
+	if total == 0 && st.UserQuota != nil {
+		total = st.UserQuota.Total
+		remaining = st.UserQuota.Remaining
+	}
+	snap.Remaining = remaining
+	snap.Total = total
 	snap.Plan = st.UserTag
 	snap.IsExceeded = st.IsQuotaExceeded
 	snap.NextResetAtMs = st.NextResetAtMs
