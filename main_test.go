@@ -505,6 +505,87 @@ func TestMaybeSwitchRespectsResidence(t *testing.T) {
 	}
 }
 
+// TestApplyQuotaOrgOnlyAccountNotZeroed 纯组织包账号（Teams）的 userQuota
+// 上游恒为 0/0：快照必须采用组织包而非被清零（PR #6 修复的回归）。
+func TestApplyQuotaOrgOnlyAccountNotZeroed(t *testing.T) {
+	p, _, acc1, _ := newSwitchTestPool(t)
+	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
+		UserQuota:           &auth.Quota{Total: 0, Remaining: 0},
+		OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: true},
+	})
+	snap := p.snapshots[acc1]
+	if snap.Total != 1000 || snap.Remaining != 800 {
+		t.Errorf("org-only snapshot = total %.0f / remaining %.0f, want 1000 / 800", snap.Total, snap.Remaining)
+	}
+}
+
+// TestApplyQuotaUnavailableOrgPackageExcluded 组织包对本成员不可用时
+// 不计入额度；没有其他可用池则快照为零（被动扣减因此 no-op，不猜测）。
+func TestApplyQuotaUnavailableOrgPackageExcluded(t *testing.T) {
+	p, _, acc1, _ := newSwitchTestPool(t)
+	p.applyQuotaToSnapshot(acc1, &auth.AccountStatus{
+		UserQuota:           &auth.Quota{Total: 0, Remaining: 0},
+		OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: false},
+	})
+	snap := p.snapshots[acc1]
+	if snap.Total != 0 || snap.Remaining != 0 {
+		t.Errorf("unavailable org package must not count: total %.0f / remaining %.0f", snap.Total, snap.Remaining)
+	}
+}
+
+// TestSumSpendablePools 多池求和与负余额 clamp 的口径。
+func TestSumSpendablePools(t *testing.T) {
+	cases := []struct {
+		name          string
+		st            *auth.AccountStatus
+		wantTotal     float64
+		wantRemaining float64
+	}{
+		{
+			name: "all pools",
+			st: &auth.AccountStatus{
+				UserQuota:           &auth.Quota{Total: 100, Remaining: 60},
+				AddOnQuota:          &auth.Quota{Total: 50, Remaining: 50},
+				OrgResourcePackage: &auth.OrgResourcePackage{Cap: 1000, Remaining: 800, Available: true},
+			},
+			wantTotal:     1150,
+			wantRemaining: 910,
+		},
+		{
+			name: "zero-total pools are absent",
+			st: &auth.AccountStatus{
+				UserQuota:  &auth.Quota{Total: 0, Remaining: 0},
+				AddOnQuota: &auth.Quota{Total: 0, Remaining: 10}, // 零总额池不计入，其余额也不计
+			},
+			wantTotal:     0,
+			wantRemaining: 0,
+		},
+		{
+			name: "over-drawn pool clamped at zero",
+			st: &auth.AccountStatus{
+				UserQuota: &auth.Quota{Total: 100, Remaining: -20},
+			},
+			wantTotal:     100,
+			wantRemaining: 0,
+		},
+		{
+			name:          "nil status pools",
+			st:            &auth.AccountStatus{},
+			wantTotal:     0,
+			wantRemaining: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			total, remaining := sumSpendablePools(tc.st)
+			if total != tc.wantTotal || remaining != tc.wantRemaining {
+				t.Errorf("sumSpendablePools = total %.0f / remaining %.0f, want %.0f / %.0f",
+					total, remaining, tc.wantTotal, tc.wantRemaining)
+			}
+		})
+	}
+}
+
 // TestApplyQuotaHardExhaustedCoolsUntilReset 权威校正把硬耗尽冷却到下次重置点，
 // 恢复后清除冷却。
 func TestApplyQuotaHardExhaustedCoolsUntilReset(t *testing.T) {

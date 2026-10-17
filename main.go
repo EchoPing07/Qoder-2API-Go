@@ -382,11 +382,36 @@ func (p *bridgeProvider) flushAccountSnapshots() {
 	}
 }
 
+// sumSpendablePools sums the spendable quota pools (personal + add-on +
+// available org package) with the same policy as the panel's quota list:
+// zero-total pools are absent; the org pool counts only when it is available
+// to this member. Org-only accounts (Teams) report a 0/0 userQuota upstream,
+// so adopting it verbatim would zero the snapshot. The totals are clamped at
+// zero: an over-drawn pool (remaining < 0) must never poison the snapshot.
+// NOTE: the cooldown/reset model assumes a single billing cycle; if add-on or
+// org pools ever reset on a different cadence than the subscription, that
+// assumption needs revisiting.
+func sumSpendablePools(st *auth.AccountStatus) (total, remaining float64) {
+	if st.UserQuota != nil && st.UserQuota.Total > 0 {
+		total += st.UserQuota.Total
+		remaining += st.UserQuota.Remaining
+	}
+	if st.AddOnQuota != nil && st.AddOnQuota.Total > 0 {
+		total += st.AddOnQuota.Total
+		remaining += st.AddOnQuota.Remaining
+	}
+	if st.OrgResourcePackage != nil && st.OrgResourcePackage.Cap > 0 && st.OrgResourcePackage.Available {
+		total += st.OrgResourcePackage.Cap
+		remaining += st.OrgResourcePackage.Remaining
+	}
+	return total, max(remaining, 0)
+}
+
 // applyQuotaToSnapshot merges an authoritative OpenAPI result into the pool
 // snapshot of the given account: it repairs drift from passive deduction and
 // records hard exhaustion (cooldown until the next reset).
 func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.AccountStatus) {
-	if accountID == "" || st == nil || st.UserQuota == nil {
+	if accountID == "" || st == nil {
 		return
 	}
 	p.snapMu.Lock()
@@ -394,8 +419,7 @@ func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.Account
 	if snap == nil {
 		snap = &store.AccountSnapshot{}
 	}
-	snap.Remaining = st.UserQuota.Remaining
-	snap.Total = st.UserQuota.Total
+	snap.Total, snap.Remaining = sumSpendablePools(st)
 	snap.Plan = st.UserTag
 	snap.IsExceeded = st.IsQuotaExceeded
 	snap.NextResetAtMs = st.NextResetAtMs
@@ -664,22 +688,10 @@ func main() {
 			NextResetAtMs: acct.NextResetAtMs,
 			CheckedAt:     time.Now().Unix(),
 		}
-		// Sum the spendable pools with the same policy as the panel's quota
-		// list (zero-total pools are absent; the org pool counts only when it
-		// is available to this member) so numbers stay comparable across
-		// accounts and consistent with the stats page.
-		if acct.UserQuota != nil && acct.UserQuota.Total > 0 {
-			snap.Total += acct.UserQuota.Total
-			snap.Remaining += acct.UserQuota.Remaining
-		}
-		if acct.AddOnQuota != nil && acct.AddOnQuota.Total > 0 {
-			snap.Total += acct.AddOnQuota.Total
-			snap.Remaining += acct.AddOnQuota.Remaining
-		}
-		if acct.OrgResourcePackage != nil && acct.OrgResourcePackage.Cap > 0 && acct.OrgResourcePackage.Available {
-			snap.Total += acct.OrgResourcePackage.Cap
-			snap.Remaining += acct.OrgResourcePackage.Remaining
-		}
+		// Same spendable-pool summation as applyQuotaToSnapshot (see
+		// sumSpendablePools): numbers must stay comparable across accounts and
+		// consistent with the stats page.
+		snap.Total, snap.Remaining = sumSpendablePools(acct)
 		// Seed the pool snapshot so passive deduction and candidate picking
 		// have an authoritative baseline even before the loop reaches it.
 		if id := AccountIDByPAT(st, pat); id != "" {
