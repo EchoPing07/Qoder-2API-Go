@@ -29,15 +29,21 @@ const sessionDuration = 24 * time.Hour
 // adminMaxBody caps JSON request bodies handled by the admin API.
 const adminMaxBody = 1 << 16 // 64 KiB
 
+// AccountChecker probes one PAT's real allowance through a throwaway bridge
+// (full session bootstrap) and returns the quota snapshot. Implemented by the
+// caller (main package) — the admin package stays free of bridge wiring.
+type AccountChecker func(ctx context.Context, pat string) (*store.AccountSnapshot, error)
+
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
-	store        *store.Store
-	modelFetcher ModelFetcher
-	stats        *stats.Recorder
-	logRec       *logs.Recorder
-	sessions     map[string]time.Time
-	sessionMu    sync.Mutex
-	limiter      *loginLimiter
+	store          *store.Store
+	modelFetcher   ModelFetcher
+	stats          *stats.Recorder
+	logRec         *logs.Recorder
+	accountChecker AccountChecker
+	sessions       map[string]time.Time
+	sessionMu      sync.Mutex
+	limiter        *loginLimiter
 }
 
 // ModelFetcher returns the current model catalog (dynamic or fallback).
@@ -55,6 +61,12 @@ func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder
 	}
 }
 
+// SetAccountChecker installs the account quota probe used by
+// /admin/api/accounts/check. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountChecker(fn AccountChecker) {
+	a.accountChecker = fn
+}
+
 // RegisterRoutes registers all admin API routes on the given mux.
 //
 // The WebUI itself is served by the web package (pages under /admin, assets
@@ -69,6 +81,10 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	// Protected API endpoints (require auth)
 	mux.HandleFunc("/admin/api/keys", a.requireAuth(a.handleKeys))
 	mux.HandleFunc("/admin/api/pat", a.requireAuth(a.handlePAT))
+	mux.HandleFunc("/admin/api/accounts", a.requireAuth(a.handleAccounts))
+	mux.HandleFunc("/admin/api/accounts/switch", a.requireAuth(a.handleAccountSwitch))
+	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
+	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
@@ -600,14 +616,220 @@ func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}
+		// Store first, then align the account pool with whatever the admin PAT
+		// form submitted (the mirror write stays low-level): a PAT already in
+		// the pool is activated, a new one is added+activated, and clearing the
+		// PAT always deactivates (an empty mirror must not coexist with an
+		// active pool entry — re-activation is one click on the account page).
+		oldPAT := a.store.GetPAT()
 		if err := a.store.SetPAT(body.PAT); err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
+		}
+		switch {
+		case body.PAT == "":
+			if a.store.GetActiveAccountID() != "" {
+				a.store.ClearActiveAccount()
+			}
+		case body.PAT != oldPAT:
+			a.ensureAccount(body.PAT)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	default:
 		writeJSONError(w, 405, "方法不允许")
 	}
+}
+
+// --- Account endpoints ---
+
+// accountView is the JSON shape of one pool entry. The plaintext PAT never
+// leaves the server: the response carries the same masked form as the legacy
+// PAT endpoint plus the id used by switch/delete.
+type accountView struct {
+	ID        string                 `json:"id"`
+	PATMasked string                 `json:"pat_masked"`
+	Note      string                 `json:"note"`
+	CreatedAt int64                  `json:"created_at"`
+	Active    bool                   `json:"active"`
+	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
+}
+
+// accountViews maps the pool to its wire form, marking the active entry.
+func accountViews(accounts []store.Account, activeID string) []accountView {
+	out := make([]accountView, 0, len(accounts))
+	for i := range accounts {
+		acc := accounts[i]
+		out = append(out, accountView{
+			ID:        acc.ID,
+			PATMasked: maskPAT(acc.PAT),
+			Note:      acc.Note,
+			CreatedAt: acc.CreatedAt,
+			Active:    acc.ID == activeID,
+			Snapshot:  acc.Snapshot,
+		})
+	}
+	return out
+}
+
+// handleAccounts serves GET/POST/DELETE /admin/api/accounts: the multi-account
+// pool CRUD. POST is idempotent on PAT — re-submitting an existing token just
+// activates it, so the old single-PAT panel flow keeps working against this
+// endpoint too.
+func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
+	case http.MethodPost:
+		var body struct {
+			PAT  string `json:"pat"`
+			Note string `json:"note"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		if a.activateExisting(body.PAT) {
+			writeJSON(w, 200, map[string]string{"status": "switched"})
+			return
+		}
+		entry, err := a.store.AddAccount(body.PAT, body.Note)
+		if err != nil {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, 201, entry)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSONError(w, 400, "缺少 id 参数")
+			return
+		}
+		if err := a.store.DeleteAccount(id); err != nil {
+			if errors.Is(err, store.ErrActiveAccount) {
+				writeJSONError(w, 400, err.Error())
+			} else {
+				writeJSONError(w, 404, err.Error())
+			}
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// activateExisting switches the active account to an already-pooled PAT.
+// Returns false when pat is not in the pool (caller then adds it).
+func (a *Admin) activateExisting(pat string) bool {
+	if pat == "" {
+		return false
+	}
+	for _, acc := range a.store.ListAccounts() {
+		if acc.PAT == pat {
+			_ = a.store.ActivateAccount(acc.ID)
+			return true
+		}
+	}
+	return false
+}
+
+// ensureAccount aligns the pool after a legacy PAT write: an already-pooled
+// PAT becomes active, a new one is added and activated. Used by the legacy
+// /admin/api/pat endpoint so the pool can never silently diverge from the
+// mirrored PAT field.
+func (a *Admin) ensureAccount(pat string) {
+	if a.activateExisting(pat) {
+		return
+	}
+	_, _ = a.store.AddAccount(pat, "")
+}
+
+// handleAccountSwitch serves POST /admin/api/accounts/switch {id}: explicit
+// account switch from the panel.
+func (a *Admin) handleAccountSwitch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.ActivateAccount(body.ID); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountNote serves POST /admin/api/accounts/note {id, note}: renames
+// an account's note (separate endpoint so the account CRUD bodies stay small).
+func (a *Admin) handleAccountNote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID   string `json:"id"`
+		Note string `json:"note"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.UpdateAccountNote(body.ID, body.Note); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountCheck serves POST /admin/api/accounts/check {id?}: probes one
+// account (default: the active one) through a throwaway bridge and stores the
+// returned quota snapshot. This is the only account-side upstream call —
+// deliberately on-demand, since every check costs a full session bootstrap.
+func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	_ = readJSON(w, r, &body) // body optional: default to the active account
+	id := body.ID
+	if id == "" {
+		id = a.store.GetActiveAccountID()
+	}
+	var target *store.Account
+	for _, acc := range a.store.ListAccounts() {
+		if acc.ID == id {
+			target = &acc
+			break
+		}
+	}
+	if target == nil {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	if a.accountChecker == nil {
+		writeJSONError(w, 503, "检测功能不可用")
+		return
+	}
+	snap, err := a.accountChecker(r.Context(), target.PAT)
+	if err != nil {
+		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
+		writeJSONError(w, 502, "检测失败: "+err.Error())
+		return
+	}
+	if err := a.store.SetAccountSnapshot(target.ID, snap); err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"snapshot": snap})
 }
 
 // --- Models endpoint ---

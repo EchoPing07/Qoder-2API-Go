@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -873,5 +874,210 @@ func TestConfigLogLimitsEnvPinned(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "QODER_LOG_RETENTION_DAYS") {
 		t.Errorf("error should name the pinning env var: %s", w.Body.String())
+	}
+}
+
+// -- Accounts --
+
+// TestAccountsCRUDFlow 添加（首个自动激活）→ 列表（掩码回显）→ 切换 → 删除守卫的完整链路。
+func TestAccountsCRUDFlow(t *testing.T) {
+	a, s := newAdmin(t)
+	// 首个账号：创建即激活
+	w := doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-one-12345678", "note": "一号"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.GetPAT() != "pt-one-12345678" {
+		t.Errorf("first account must activate, pat=%q", s.GetPAT())
+	}
+	// 第二个账号：不改变激活
+	w = doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-two-12345678", "note": "二号"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	if s.GetPAT() != "pt-one-12345678" {
+		t.Errorf("adding must not move activation, pat=%q", s.GetPAT())
+	}
+	// 列表：掩码 + active 标记，明文永不回传
+	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
+	var list struct {
+		Accounts []struct {
+			ID        string `json:"id"`
+			PATMasked string `json:"pat_masked"`
+			Note      string `json:"note"`
+			Active    bool   `json:"active"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(list.Accounts))
+	}
+	if strings.Contains(w.Body.String(), "pt-one-12345678") || strings.Contains(w.Body.String(), "pt-two-12345678") {
+		t.Error("response must not leak plaintext PATs")
+	}
+	var inactiveID string
+	for _, acc := range list.Accounts {
+		if acc.Active && acc.PATMasked != "pt-o****5678" {
+			t.Errorf("active masked = %q", acc.PATMasked)
+		}
+		if !acc.Active {
+			inactiveID = acc.ID
+		}
+	}
+	// 切换
+	w = doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": inactiveID})
+	if w.Code != 200 {
+		t.Fatalf("switch failed: %d %s", w.Code, w.Body.String())
+	}
+	if s.GetPAT() != "pt-two-12345678" {
+		t.Errorf("after switch pat=%q, want pt-two-12345678", s.GetPAT())
+	}
+	// 删除激活中的账号 → 400
+	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
+	if w.Code != 400 {
+		t.Errorf("deleting active should 400, got %d", w.Code)
+	}
+	// 切回去再删
+	otherID := list.Accounts[0].ID
+	if otherID == inactiveID {
+		otherID = list.Accounts[1].ID
+	}
+	doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": otherID})
+	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
+	if w.Code != 200 {
+		t.Errorf("delete failed: %d", w.Code)
+	}
+	if len(s.ListAccounts()) != 1 {
+		t.Errorf("expected 1 account after delete")
+	}
+}
+
+// TestAccountsPostDuplicateActivates 相同 PAT 重复提交视为切换（幂等），返回 200 而非 409。
+func TestAccountsPostDuplicateActivates(t *testing.T) {
+	a, s := newAdmin(t)
+	doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-x", "note": "a"})
+	doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-y", "note": "b"})
+	w := doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-x", "note": "again"})
+	if w.Code != 200 {
+		t.Fatalf("duplicate PAT should switch (200), got %d", w.Code)
+	}
+	if s.GetPAT() != "pt-x" {
+		t.Errorf("pat=%q, want pt-x", s.GetPAT())
+	}
+	if len(s.ListAccounts()) != 2 {
+		t.Errorf("duplicate must not add, got %d accounts", len(s.ListAccounts()))
+	}
+}
+
+// TestAccountsPostDuplicateConflict 不同的管理语义下，重复 PAT 走切换而非报错；
+// 这里确认返回体不含明文。
+func TestAccountsPostDuplicateNoPlaintextLeak(t *testing.T) {
+	a, _ := newAdmin(t)
+	doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-secret-value"})
+	w := doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-secret-value"})
+	if strings.Contains(w.Body.String(), "pt-secret-value") {
+		t.Error("response must not leak the plaintext PAT")
+	}
+}
+
+// TestAccountSwitchUnknown 未知 id 切换 → 404。
+func TestAccountSwitchUnknown(t *testing.T) {
+	a, _ := newAdmin(t)
+	w := doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": "nope"})
+	if w.Code != 404 {
+		t.Errorf("expected 404, got %d", w.Code)
+	}
+}
+
+// TestAccountNoteEndpoint 备注更新端点。
+func TestAccountNoteEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-note", "")
+	w := doRequest(t, a.handleAccountNote, "POST", "/admin/api/accounts/note", map[string]string{"id": acc.ID, "note": "测试备注"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.ListAccounts()[0].Note != "测试备注" {
+		t.Errorf("note = %q", s.ListAccounts()[0].Note)
+	}
+	w = doRequest(t, a.handleAccountNote, "POST", "/admin/api/accounts/note", map[string]string{"id": "nope", "note": "x"})
+	if w.Code != 404 {
+		t.Errorf("unknown id should 404, got %d", w.Code)
+	}
+}
+
+// TestAccountCheckEndpoint 检测端点：成功时快照落库回传；失败时错误进快照（LastError）。
+func TestAccountCheckEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-check", "")
+	calls := 0
+	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+		calls++
+		if pat != "pt-check" {
+			t.Errorf("checker pat = %q", pat)
+		}
+		return &store.AccountSnapshot{Remaining: 10, Total: 100, CheckedAt: 1700000000}, nil
+	})
+	w := doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("checker calls = %d", calls)
+	}
+	snap := s.ListAccounts()[0].Snapshot
+	if snap == nil || snap.Remaining != 10 {
+		t.Errorf("snapshot not persisted: %+v", snap)
+	}
+	// checker 失败：502 且 LastError 记入快照
+	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+		return nil, errors.New("会话失败")
+	})
+	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
+	if w.Code != 502 {
+		t.Errorf("expected 502, got %d", w.Code)
+	}
+	snap = s.ListAccounts()[0].Snapshot
+	if snap == nil || snap.LastError != "会话失败" {
+		t.Errorf("LastError not recorded: %+v", snap)
+	}
+	// 未知账号 → 404
+	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": "nope"})
+	if w.Code != 404 {
+		t.Errorf("unknown id should 404, got %d", w.Code)
+	}
+	// 未装 checker → 503
+	a2, s2 := newAdmin(t)
+	acc2, _ := s2.AddAccount("pt-x", "")
+	w = doRequest(t, a2.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc2.ID})
+	if w.Code != 503 {
+		t.Errorf("nil checker should 503, got %d", w.Code)
+	}
+}
+
+// TestPATPostStillMirrorsPool 旧 PAT 端点的兼容语义：新 PAT 写入后自动进池并激活；
+// 清空 PAT 时若池还有账号则仅取消激活（不动池），镜像随 SetPAT 落空。
+func TestPATPostStillMirrorsPool(t *testing.T) {
+	a, s := newAdmin(t)
+	// 新 PAT（池为空）→ 添加并激活
+	w := doRequest(t, a.handlePAT, "POST", "/admin/api/pat", map[string]string{"pat": "pt-via-pat"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() == "" {
+		t.Fatalf("PAT write must sync the pool: %+v", s.ListAccounts())
+	}
+	// 换成池外新 PAT → 追加账号并激活
+	doRequest(t, a.handlePAT, "POST", "/admin/api/pat", map[string]string{"pat": "pt-via-pat-2"})
+	if len(s.ListAccounts()) != 2 || s.GetPAT() != "pt-via-pat-2" {
+		t.Fatalf("second PAT write must add+activate: %+v pat=%q", s.ListAccounts(), s.GetPAT())
+	}
+	// 清空 PAT → 取消激活，池保留
+	doRequest(t, a.handlePAT, "POST", "/admin/api/pat", map[string]string{"pat": ""})
+	if s.GetActiveAccountID() != "" || len(s.ListAccounts()) != 2 {
+		t.Errorf("clearing PAT must deactivate but keep the pool: active=%q n=%d",
+			s.GetActiveAccountID(), len(s.ListAccounts()))
 	}
 }

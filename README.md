@@ -13,7 +13,7 @@
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
-- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、PAT 配置、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、多账号池（多 PAT 添加 / 一键切换 / 额度检测）、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
 - **请求日志** —— 记录每次调用的元信息（时间、模型、密钥、流式与否、token 用量、扣费额度、耗时、状态码与错误摘要，不保存对话内容），面板「日志」页支持按模型 / 密钥 / 状态筛选与分页，保留天数与条数上限可配置、自动清理最旧条目
 - **订阅周期感知** —— 从网关 `/algo/api/v3/user/status` 读取真实订阅信息（套餐、组织、`nextResetAt` 重置时间、`isQuotaExceeded` 超额标记），使面板额度按计费周期统计而非终身累计
 - **单文件部署** —— 编译为单一二进制文件，零外部依赖
@@ -132,7 +132,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 
 ### 1. 配置 PAT
 
-启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「令牌」标签页中填入你的 Qoder PAT。
+启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号一键切换；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。
 
 > ⚠️ **默认密码仅用于首次登录，请立即在「设置」标签页中修改**。登录失败会按客户端 IP 触发指数退避限流，部署到公网时务必启用 HTTPS 反代。
 
@@ -244,7 +244,11 @@ curl http://localhost:10081/v1/models \
 | `/admin` | GET | Web 管理面板 |
 | `/admin/api/login` | POST | 管理面板登录 |
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
-| `/admin/api/pat` | GET/POST | PAT 令牌管理 |
+| `/admin/api/pat` | GET/POST | PAT 令牌管理（写入自动同步账号池） |
+| `/admin/api/accounts` | GET/POST/DELETE | 账号池管理（相同 PAT 重复提交视为切换；删除激活中的账号返回 `400`） |
+| `/admin/api/accounts/switch` | POST | 手动切换激活账号 |
+| `/admin/api/accounts/note` | POST | 修改账号备注 |
+| `/admin/api/accounts/check` | POST | 检测账号真实额度（临时会话查询一次并落快照） |
 | `/admin/api/models` | GET | 获取模型列表 |
 | `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 实际扣费额度与均值 / 计费周期与套餐信息） |
 | `/admin/api/config` | GET/POST | 服务器配置 |

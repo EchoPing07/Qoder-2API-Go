@@ -561,10 +561,38 @@ func TestMovedModelsAndTier(t *testing.T) {
 		t.Error("令牌页缺少跳转 Qoder 集成页创建令牌的链接")
 	}
 
-	// 令牌页要渲染等级徽标，其 load() 必须拉取 stats 快照（徽标数据源）
+	// 令牌页已升级为账号页：账号池表格（掩码回显 + 激活徽标 + 切换/检测/备注/删除）
+	// 与添加弹窗必须存在，路由 key 仍为 token。
+	for _, want := range []string{
+		`<h1>账号</h1>`,
+		`<h3>账号池</h3>`,
+		`x-text="acc.pat_masked"`,
+		`x-show="acc.active"`,
+		`@click="switchAccount(acc)"`,
+		`@click="checkAccount(acc)"`,
+		`@click="deleteAccount(acc)"`,
+		`@submit.prevent="createAccount()"`,
+	} {
+		if !strings.Contains(token, want) {
+			t.Errorf("账号页缺少 %s", want)
+		}
+	}
+
+	// 令牌页要渲染等级徽标与账号池，其 load() 必须拉取 stats 快照（徽标数据源）
+	// 与账号列表。
 	tokenJS := read(assetFS, "assets/pages/token.js")
 	if !strings.Contains(tokenJS, "this.loadStats()") {
 		t.Error("令牌页 load() 必须加载 stats 快照（等级徽标的数据源）")
+	}
+	if !strings.Contains(tokenJS, "this.loadAccounts()") {
+		t.Error("令牌页 load() 必须加载账号池列表")
+	}
+	// 账号 API 调用路径须走 /admin/api/accounts*（与 admin 路由的契约由
+	// TestFrontendAPIPathsMatchAdminRoutes 守住，这里只守语义入口）。
+	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/switch'", "'/admin/api/accounts/check'"} {
+		if !strings.Contains(tokenJS, want) {
+			t.Errorf("账号页缺少 API 调用 %s", want)
+		}
 	}
 	// 模型列表迁入统计页后，其加载动作随之迁到 stats 页面层
 	statsJS := read(assetFS, "assets/pages/stats.js")
@@ -809,7 +837,7 @@ Object.keys(PAGES).forEach(function (k) {
   const orig = PAGES[k].load;
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
-['loadStats', 'loadKeys', 'loadPAT', 'loadModels', 'loadConfig'].forEach(function (m) {
+['loadStats', 'loadKeys', 'loadPAT', 'loadAccounts', 'loadModels', 'loadConfig'].forEach(function (m) {
   if (typeof inst[m] === 'function') inst[m] = function () { loads.push(m); };
 });
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）

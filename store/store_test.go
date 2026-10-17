@@ -471,3 +471,199 @@ func TestLookupKey(t *testing.T) {
 		t.Error("LookupKey must report false for a missing key")
 	}
 }
+
+// -- Multi-Account Pool --
+
+// TestLegacyPATMigration 旧版 data.json（裸 PAT、无账号池）加载时迁成单条「默认账号」，
+// 激活指针指向它；再次保存后结构落盘，后续加载不再重复迁移。
+func TestLegacyPATMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/data.json"
+	// 先写一个旧版结构：有 PAT、无 accounts 字段
+	legacy := `{"host":"0.0.0.0","port":10081,"pat":"pt-legacy-token","password":"pw","api_keys":[]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	accounts := s.ListAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("expected 1 migrated account, got %d", len(accounts))
+	}
+	if accounts[0].PAT != "pt-legacy-token" {
+		t.Errorf("migrated PAT = %q", accounts[0].PAT)
+	}
+	if accounts[0].Note != "默认账号" {
+		t.Errorf("migrated note = %q", accounts[0].Note)
+	}
+	if s.GetActiveAccountID() != accounts[0].ID {
+		t.Error("migrated account should be active")
+	}
+	if s.GetPAT() != "pt-legacy-token" {
+		t.Error("PAT mirror must survive migration")
+	}
+	// 重新加载：不重复迁移（仍是一条）
+	s2, err := New(path)
+	if err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	if got := len(s2.ListAccounts()); got != 1 {
+		t.Errorf("reload duplicated migration: %d accounts", got)
+	}
+}
+
+// TestAddAccountActivatesFirst 空池添加的第一个账号自动激活并镜像 PAT；
+// 已有激活账号时，新账号不改变激活状态。
+func TestAddAccountActivatesFirst(t *testing.T) {
+	s := tempStore(t)
+	first, err := s.AddAccount("pt-first", "一号")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if s.GetActiveAccountID() != first.ID || s.GetPAT() != "pt-first" {
+		t.Error("first account must activate and mirror PAT")
+	}
+	second, err := s.AddAccount("pt-second", "二号")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if s.GetActiveAccountID() != first.ID || s.GetPAT() != "pt-first" {
+		t.Error("adding must not move the active account")
+	}
+	if second.Snapshot != nil {
+		t.Error("new account must start without a snapshot")
+	}
+}
+
+func TestAddAccountDuplicate(t *testing.T) {
+	s := tempStore(t)
+	if _, err := s.AddAccount("pt-dup", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddAccount("pt-dup", ""); !errors.Is(err, ErrDuplicateAccount) {
+		t.Errorf("expected ErrDuplicateAccount, got %v", err)
+	}
+	if _, err := s.AddAccount("", ""); err == nil {
+		t.Error("empty PAT must be rejected")
+	}
+}
+
+// TestActivateAccountSwitch 切换同时更新激活指针与 PAT 镜像，且持久化生效。
+func TestActivateAccountSwitch(t *testing.T) {
+	s := tempStore(t)
+	first, _ := s.AddAccount("pt-a", "")
+	second, _ := s.AddAccount("pt-b", "")
+	if err := s.ActivateAccount(second.ID); err != nil {
+		t.Fatalf("ActivateAccount: %v", err)
+	}
+	if s.GetActiveAccountID() != second.ID || s.GetPAT() != "pt-b" {
+		t.Errorf("active=%q pat=%q", s.GetActiveAccountID(), s.GetPAT())
+	}
+	if err := s.ActivateAccount(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s.GetPAT() != "pt-a" {
+		t.Errorf("PAT mirror = %q, want pt-a", s.GetPAT())
+	}
+	if err := s.ActivateAccount("nonexistent"); err == nil {
+		t.Error("unknown id must fail")
+	}
+}
+
+// TestDeleteAccountGuard 删除激活中的账号被拒绝（ErrActiveAccount）；删除其他账号后
+// 激活状态不受影响。
+func TestDeleteAccountGuard(t *testing.T) {
+	s := tempStore(t)
+	first, _ := s.AddAccount("pt-a", "")
+	second, _ := s.AddAccount("pt-b", "")
+	if err := s.DeleteAccount(first.ID); !errors.Is(err, ErrActiveAccount) {
+		t.Errorf("deleting active must fail with ErrActiveAccount, got %v", err)
+	}
+	if err := s.DeleteAccount(second.ID); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() != first.ID {
+		t.Error("active account must survive the other's deletion")
+	}
+	if err := s.DeleteAccount("nonexistent"); err == nil {
+		t.Error("unknown id must fail")
+	}
+}
+
+// TestAccountSnapshotAndNote 快照写入与备注更新都按 ID 定位并持久化。
+func TestAccountSnapshotAndNote(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, _ := s.AddAccount("pt-snap", "")
+	snap := &AccountSnapshot{Remaining: 42.5, Total: 100, Plan: "Teams", CheckedAt: 1700000000}
+	if err := s.SetAccountSnapshot(acc.ID, snap); err != nil {
+		t.Fatalf("SetAccountSnapshot: %v", err)
+	}
+	if err := s.UpdateAccountNote(acc.ID, "主号"); err != nil {
+		t.Fatalf("UpdateAccountNote: %v", err)
+	}
+	if err := s.SetAccountSnapshot("nonexistent", snap); err == nil {
+		t.Error("unknown id must fail")
+	}
+	s2, err := New(dir + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s2.ListAccounts()[0]
+	if got.Note != "主号" || got.Snapshot == nil || got.Snapshot.Remaining != 42.5 {
+		t.Errorf("round-trip mismatch: %+v", got)
+	}
+}
+
+// TestAutoSwitchDefaults 默认阈值 20、未开启；SetAutoSwitch 校验范围并持久化。
+func TestAutoSwitchDefaults(t *testing.T) {
+	s := tempStore(t)
+	as := s.GetAutoSwitch()
+	if as.Enabled || as.ThresholdPercent != DefaultAutoSwitchPercent {
+		t.Errorf("default auto switch = %+v", as)
+	}
+	if err := s.SetAutoSwitch(true, 15); err != nil {
+		t.Fatalf("SetAutoSwitch: %v", err)
+	}
+	if err := s.SetAutoSwitch(true, 0); err == nil {
+		t.Error("threshold 0 must fail")
+	}
+	if err := s.SetAutoSwitch(true, 100); err == nil {
+		t.Error("threshold 100 must fail")
+	}
+	s2, _ := New(s.filePath)
+	if as := s2.GetAutoSwitch(); !as.Enabled || as.ThresholdPercent != 15 {
+		t.Errorf("persisted auto switch = %+v", as)
+	}
+}
+
+// TestHandEditedPatImported 手改 data.json 把 PAT 换成池外值时按导入处理（不丢弃令牌）。
+func TestHandEditedPatImported(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/data.json"
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, _ := s.AddAccount("pt-old", "")
+	if err := s.SetPAT("pt-hand-edited"); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pats := map[string]bool{}
+	for _, a := range s2.ListAccounts() {
+		pats[a.PAT] = true
+	}
+	if !pats["pt-hand-edited"] || !pats["pt-old"] {
+		t.Errorf("hand-edited PAT lost: %v", pats)
+	}
+	_ = acc
+}

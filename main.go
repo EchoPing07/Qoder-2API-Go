@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -354,6 +355,40 @@ func main() {
 
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec, logRec)
+	// Account「检测」runs a throwaway bridge through a full session bootstrap
+	// and returns the authoritative quota snapshot; the admin layer only owns
+	// the endpoint. On-demand only — every check costs a session round-trip.
+	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+		realPAT, region := auth.Resolve(pat)
+		b := bridge.NewOpenAiBridge(realPAT, region)
+		st := b.EnsureAccountStatus(ctx)
+		if st == nil {
+			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")
+		}
+		snap := &store.AccountSnapshot{
+			Plan:          st.UserTag,
+			IsExceeded:    st.IsQuotaExceeded,
+			NextResetAtMs: st.NextResetAtMs,
+			CheckedAt:     time.Now().Unix(),
+		}
+		// Sum the spendable pools with the same policy as the panel's quota
+		// list (zero-total pools are absent; the org pool counts only when it
+		// is available to this member) so numbers stay comparable across
+		// accounts and consistent with the stats page.
+		if st.UserQuota != nil && st.UserQuota.Total > 0 {
+			snap.Total += st.UserQuota.Total
+			snap.Remaining += st.UserQuota.Remaining
+		}
+		if st.AddOnQuota != nil && st.AddOnQuota.Total > 0 {
+			snap.Total += st.AddOnQuota.Total
+			snap.Remaining += st.AddOnQuota.Remaining
+		}
+		if st.OrgResourcePackage != nil && st.OrgResourcePackage.Cap > 0 && st.OrgResourcePackage.Available {
+			snap.Total += st.OrgResourcePackage.Cap
+			snap.Remaining += st.OrgResourcePackage.Remaining
+		}
+		return snap, nil
+	})
 
 	// WebUI: pre-render all pages at startup (multi-page Alpine.js frontend,
 	// no build step, no external dependencies).

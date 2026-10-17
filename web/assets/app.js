@@ -62,6 +62,8 @@ function appShell(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
     pat:{masked:'',input:''},
+    accounts:[], accountModal:false, accountForm:{pat:'',note:''},
+    noteModal:false, noteForm:{id:'',note:''}, checkingId:'',
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},

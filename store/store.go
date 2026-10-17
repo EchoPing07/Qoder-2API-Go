@@ -30,8 +30,11 @@ type APIKey struct {
 
 // Config is the on-disk JSON structure.
 type Config struct {
-	Host     string      `json:"host"`
-	Port     int         `json:"port"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	// PAT is the ACTIVE account's token, mirrored from Accounts[ActiveAccountID]
+	// so the bridge (which binds to PAT) and every legacy reader keep working
+	// unchanged when the active account switches.
 	PAT      string      `json:"pat"`
 	Password string      `json:"password"`
 	APIKeys  []APIKey    `json:"api_keys"`
@@ -50,7 +53,58 @@ type Config struct {
 	// bounds how long an established SSE stream may stay silent.
 	ChatTimeoutSeconds int `json:"chat_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+	// Multi-account pool. A legacy config carrying a bare PAT migrates into a
+	// one-entry pool on load (see load). AutoSwitch is persisted from the start
+	// (unused until automatic switching ships) so that rollout needs no second
+	// data migration.
+	Accounts        []Account  `json:"accounts,omitempty"`
+	ActiveAccountID string     `json:"active_account_id,omitempty"`
+	AutoSwitch      AutoSwitch `json:"auto_switch"`
 }
+
+// Account is one Qoder PAT in the multi-account pool. Snapshot is nil until
+// the first successful check (admin「检测」or, later, the background loops);
+// a stale snapshot is still shown, labelled by CheckedAt.
+type Account struct {
+	ID        string           `json:"id"`
+	PAT       string           `json:"pat"`
+	Note      string           `json:"note"`
+	CreatedAt int64            `json:"created_at"`
+	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
+}
+
+// AccountSnapshot is the per-account quota snapshot from the authoritative
+// OpenAPI data. Remaining/Total sum the spendable pools with the same policy
+// as the panel's quota list: pools with a zero total are absent, and the
+// organization pool counts only when it is available to this member — so the
+// numbers stay comparable across accounts and consistent with the stats page.
+type AccountSnapshot struct {
+	Remaining float64 `json:"remaining,omitempty"`
+	Total     float64 `json:"total,omitempty"`
+	// Plan is the human-facing plan label ("Teams", ...) from user/status.
+	Plan string `json:"plan,omitempty"`
+	// IsExceeded is the OpenAPI out-of-quota verdict.
+	IsExceeded bool `json:"is_exceeded,omitempty"`
+	// NextResetAtMs is the subscription refresh instant (epoch millis); the
+	// hard-exhaustion cooldown runs until it (automatic switching).
+	NextResetAtMs int64 `json:"next_reset_at_ms,omitempty"`
+	// CheckedAt is when the snapshot was captured (epoch seconds).
+	CheckedAt int64 `json:"checked_at,omitempty"`
+	// LastError is the most recent check failure; empty after a good check.
+	LastError string `json:"last_error,omitempty"`
+}
+
+// AutoSwitch configures automatic switching on low credits (wired up in a
+// follow-up change; the fields are persisted from the start so the pool
+// schema is stable from day one).
+type AutoSwitch struct {
+	Enabled          bool    `json:"enabled"`
+	ThresholdPercent float64 `json:"threshold_percent"`
+}
+
+// DefaultAutoSwitchPercent is the remaining-percentage threshold below which
+// automatic switching considers moving to another account.
+const DefaultAutoSwitchPercent = 20
 
 // DefaultHost is the default listen host.
 const DefaultHost = "0.0.0.0"
@@ -125,6 +179,8 @@ func New(filePath string) (*Store, error) {
 			LogRetentionDays:   DefaultLogRetentionDays,
 			LogMaxEntries:      DefaultLogMaxEntries,
 			APIKeys:            []APIKey{},
+			Accounts:           []Account{},
+			AutoSwitch:         AutoSwitch{ThresholdPercent: DefaultAutoSwitchPercent},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -189,6 +245,32 @@ func (s *Store) load() error {
 	}
 	if cfg.IdleTimeoutSeconds > MaxIdleTimeoutSeconds {
 		cfg.IdleTimeoutSeconds = MaxIdleTimeoutSeconds
+		needsSave = true
+	}
+	// Multi-account migration: a legacy file carries a bare PAT and no pool.
+	// It becomes the single「默认账号」 entry; a hand-edited file whose PAT is
+	// not in the pool is imported the same way so the token is never dropped.
+	if cfg.Accounts == nil {
+		cfg.Accounts = []Account{}
+		needsSave = true
+	}
+	if cfg.PAT != "" && findAccountByPAT(cfg.Accounts, cfg.PAT) < 0 {
+		cfg.Accounts = append(cfg.Accounts, Account{
+			ID:        GenerateIDMust(),
+			PAT:       cfg.PAT,
+			Note:      "默认账号",
+			CreatedAt: time.Now().Unix(),
+		})
+		needsSave = true
+	}
+	if cfg.ActiveAccountID == "" && cfg.PAT != "" {
+		if i := findAccountByPAT(cfg.Accounts, cfg.PAT); i >= 0 {
+			cfg.ActiveAccountID = cfg.Accounts[i].ID
+			needsSave = true
+		}
+	}
+	if cfg.AutoSwitch.ThresholdPercent <= 0 {
+		cfg.AutoSwitch.ThresholdPercent = DefaultAutoSwitchPercent
 		needsSave = true
 	}
 	s.config = &cfg
@@ -338,6 +420,202 @@ func (s *Store) GetPAT() string {
 func (s *Store) SetPAT(pat string) error {
 	s.mu.Lock()
 	s.config.PAT = pat
+	s.mu.Unlock()
+	return s.save()
+}
+
+// --- Multi-Account Pool ---
+
+// ErrDuplicateAccount is returned by AddAccount when the same PAT is already
+// in the pool.
+var ErrDuplicateAccount = errors.New("该令牌已存在")
+
+// ErrActiveAccount is returned when an operation would leave the pool without
+// an active account or would delete the one currently in use.
+var ErrActiveAccount = errors.New("不能删除当前激活的账号，请先切换到其他账号")
+
+// findAccountByPAT returns the index of the account holding pat, or -1.
+// Caller must hold the lock.
+func findAccountByPAT(accounts []Account, pat string) int {
+	for i := range accounts {
+		if accounts[i].PAT == pat {
+			return i
+		}
+	}
+	return -1
+}
+
+// GenerateIDMust is GenerateID with panic-on-error: ID generation only fails
+// when the system CSPRNG is broken, in which case the process is in no state
+// to serve anyway.
+func GenerateIDMust() string {
+	id, err := GenerateID()
+	if err != nil {
+		panic(fmt.Sprintf("store: generate id: %v", err))
+	}
+	return id
+}
+
+// ListAccounts returns a copy of the account pool.
+func (s *Store) ListAccounts() []Account {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Account, len(s.config.Accounts))
+	copy(out, s.config.Accounts)
+	return out
+}
+
+// GetActiveAccountID returns the active account's ID ("" when unset).
+func (s *Store) GetActiveAccountID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.ActiveAccountID
+}
+
+// ClearActiveAccount unsets the active account marker while keeping the pool
+// entries. Used when the admin explicitly clears the PAT with an empty pool
+// mirror: the bridge is torn down, but the accounts remain for re-activation.
+func (s *Store) ClearActiveAccount() {
+	s.mu.Lock()
+	s.config.ActiveAccountID = ""
+	s.mu.Unlock()
+	_ = s.save()
+}
+
+// AddAccount appends a new account. When no account is active yet (fresh
+// install) it becomes the active one and its PAT is written to the mirrored
+// PAT field; otherwise the caller decides activation explicitly via
+// ActivateAccount, so adding never silently moves a running bridge.
+func (s *Store) AddAccount(pat, note string) (*Account, error) {
+	if pat == "" {
+		return nil, fmt.Errorf("令牌不能为空")
+	}
+	id := GenerateIDMust()
+	s.mu.Lock()
+	if findAccountByPAT(s.config.Accounts, pat) >= 0 {
+		s.mu.Unlock()
+		return nil, ErrDuplicateAccount
+	}
+	entry := Account{ID: id, PAT: pat, Note: note, CreatedAt: time.Now().Unix()}
+	s.config.Accounts = append(s.config.Accounts, entry)
+	if s.config.ActiveAccountID == "" {
+		s.config.ActiveAccountID = id
+		s.config.PAT = pat
+	}
+	s.mu.Unlock()
+	if err := s.save(); err != nil {
+		return nil, err
+	}
+	return &entry, nil
+}
+
+// DeleteAccount removes an account. Deleting the active one is refused: the
+// pool must always name an active account once it exists (the UI asks the
+// user to switch first, making the failover target explicit).
+func (s *Store) DeleteAccount(id string) error {
+	s.mu.Lock()
+	if s.config.ActiveAccountID == id {
+		s.mu.Unlock()
+		return ErrActiveAccount
+	}
+	found := false
+	filtered := s.config.Accounts[:0]
+	for _, acc := range s.config.Accounts {
+		if acc.ID == id {
+			found = true
+			continue
+		}
+		filtered = append(filtered, acc)
+	}
+	if !found {
+		s.mu.Unlock()
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	s.config.Accounts = filtered
+	s.mu.Unlock()
+	return s.save()
+}
+
+// ActivateAccount switches the active account: the PAT mirror is updated in
+// the same locked section so no reader can observe a split view. The bridge
+// rebuilds itself from the new PAT on its next access (bridgeProvider), and
+// the PAT-change hook clears the previous account's stats snapshot.
+func (s *Store) ActivateAccount(id string) error {
+	s.mu.Lock()
+	idx := -1
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	s.config.ActiveAccountID = id
+	s.config.PAT = s.config.Accounts[idx].PAT
+	s.mu.Unlock()
+	return s.save()
+}
+
+// UpdateAccountNote renames an account's note.
+func (s *Store) UpdateAccountNote(id, note string) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Note = note
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// SetAccountSnapshot replaces one account's quota snapshot. The zero
+// LastError clears a previous failure (check succeeded).
+func (s *Store) SetAccountSnapshot(id string, snap *AccountSnapshot) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Snapshot = snap
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// --- AutoSwitch (persisted from day one; consumed by automatic switching) ---
+
+// GetAutoSwitch returns a normalized copy of the auto-switch settings.
+func (s *Store) GetAutoSwitch() AutoSwitch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	as := s.config.AutoSwitch
+	if as.ThresholdPercent <= 0 {
+		as.ThresholdPercent = DefaultAutoSwitchPercent
+	}
+	return as
+}
+
+// SetAutoSwitch validates and persists the auto-switch settings.
+func (s *Store) SetAutoSwitch(enabled bool, thresholdPercent float64) error {
+	if thresholdPercent < 1 || thresholdPercent > 99 {
+		return fmt.Errorf("阈值需在 1-99 之间")
+	}
+	s.mu.Lock()
+	s.config.AutoSwitch = AutoSwitch{Enabled: enabled, ThresholdPercent: thresholdPercent}
 	s.mu.Unlock()
 	return s.save()
 }
