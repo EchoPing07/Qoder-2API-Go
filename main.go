@@ -56,10 +56,11 @@ type bridgeProvider struct {
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
 	return &bridgeProvider{
-		store:     st,
-		snapshots: map[string]*store.AccountSnapshot{},
-		bridges:   map[string]*bridge.OpenAiBridge{},
-		bridgePAT: map[string]string{},
+		store:       st,
+		snapshots:   map[string]*store.AccountSnapshot{},
+		bridges:     map[string]*bridge.OpenAiBridge{},
+		bridgePAT:   map[string]string{},
+		bridgeSlots: map[string]int{},
 	}
 }
 
@@ -158,9 +159,14 @@ func (p *bridgeProvider) bridgeFor(id, pat string) *bridge.OpenAiBridge {
 	n := p.maxConcurrency()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// 三个 map 逐一判空：测试或旧调用方可能构造了只初始化部分字段的 provider。
 	if p.bridges == nil {
 		p.bridges = map[string]*bridge.OpenAiBridge{}
+	}
+	if p.bridgePAT == nil {
 		p.bridgePAT = map[string]string{}
+	}
+	if p.bridgeSlots == nil {
 		p.bridgeSlots = map[string]int{}
 	}
 	b := p.bridges[id]
