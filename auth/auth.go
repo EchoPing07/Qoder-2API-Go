@@ -47,8 +47,22 @@ var CN = &RegionConfig{
 	OpenAPIBase: "https://openapi.qoder.com.cn",
 }
 
+// INTL 是 Qoder 国际区端点（qoder.sh），与 Python 版 QoderGateway 的上游一致。
+var INTL = &RegionConfig{
+	Name:        "intl",
+	AuthBase:    "https://center.qoder.sh",
+	ChatBase:    "https://api3.qoder.sh",
+	OpenAPIBase: "https://openapi.qoder.sh",
+}
+
+// Resolve 按 QODER_REGION 环境变量选择区域，默认国际区（存量账号均为 qoder.sh 国际区）。
 func Resolve(pat string) (string, *RegionConfig) {
-	return pat, CN
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("QODER_REGION"))) {
+	case "cn":
+		return pat, CN
+	default:
+		return pat, INTL
+	}
 }
 
 func AuthURL(region *RegionConfig, path string) string {
@@ -708,14 +722,14 @@ func requestJobToken(ctx context.Context, personalToken, refreshToken, securityO
 
 func ExchangeJobToken(ctx context.Context, personalToken, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
 	if region == nil {
-		region = CN
+		region = INTL
 	}
 	return requestJobToken(ctx, personalToken, "", "", false, machineID, machineToken, machineType, region)
 }
 
 func RefreshJobToken(ctx context.Context, personalToken, refreshToken, securityOauthToken, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
 	if region == nil {
-		region = CN
+		region = INTL
 	}
 	return requestJobToken(ctx, personalToken, refreshToken, securityOauthToken, true, machineID, machineToken, machineType, region)
 }
@@ -809,7 +823,7 @@ type QuotaUsage struct {
 // before any session is constructed.
 func FetchUserStatus(ctx context.Context, userID, machineID, machineToken, machineType string, region *RegionConfig) (map[string]interface{}, error) {
 	if region == nil {
-		region = CN
+		region = INTL
 	}
 	urlStr := AuthURL(region, "/algo/api/v3/user/status?Encode=1")
 	inner := userStatusInnerStruct{
@@ -836,7 +850,7 @@ func FetchQuotaUsage(ctx context.Context, bearer string, region *RegionConfig) (
 		return nil, fmt.Errorf("quota usage requires a security OAuth token")
 	}
 	if region == nil {
-		region = CN
+		region = INTL
 	}
 	urlStr := OpenAPIURL(region, "/api/v2/quota/usage")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
