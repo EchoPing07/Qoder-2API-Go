@@ -77,7 +77,7 @@ type OpenAiBridge struct {
 // NewOpenAiBridge creates a new bridge for the given PAT.
 func NewOpenAiBridge(pat string, region *auth.RegionConfig) *OpenAiBridge {
 	if region == nil {
-		region = auth.CN
+		region = auth.INTL
 	}
 	machineID := uuid.New().String()
 	rawToken := (uuid.New().String() + uuid.New().String())
