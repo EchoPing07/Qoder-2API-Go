@@ -446,11 +446,16 @@ func (r *Recorder) RecordUsage(accountID, model string, u *Usage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dirty = true
+	// Resolve the attribution bucket once; nil (no accountID) counts globally
+	// only — single-account deployments and tests.
+	var a *AccountStat
+	if accountID != "" {
+		a = r.accountLocked(accountID)
+	}
 	r.data.PromptTokens += int64(u.PromptTokens)
 	r.data.CompletionTokens += int64(u.CompletionTokens)
 	r.data.CachedTokens += int64(u.CachedTokens)
-	if accountID != "" {
-		a := r.accountLocked(accountID)
+	if a != nil {
 		a.PromptTokens += int64(u.PromptTokens)
 		a.CompletionTokens += int64(u.CompletionTokens)
 		a.CachedTokens += int64(u.CachedTokens)
@@ -463,8 +468,7 @@ func (r *Recorder) RecordUsage(accountID, model string, u *Usage) {
 	nowMs := time.Now().UnixMilli()
 	r.rollCycleLocked(nowMs)
 	r.data.CycleCredits += u.Credits
-	if accountID != "" {
-		a := r.accountLocked(accountID)
+	if a != nil {
 		a.Credits += u.Credits
 		a.BilledRequests++
 		a.CycleCredits += u.Credits
@@ -492,8 +496,7 @@ func (r *Recorder) RecordUsage(accountID, model string, u *Usage) {
 	h.Billed++
 	h.Credits += u.Credits
 
-	if accountID != "" {
-		a := r.accountLocked(accountID)
+	if a != nil {
 		am := a.ByModel[model]
 		if am == nil {
 			am = &ModelStat{Model: model}
@@ -884,10 +887,7 @@ func (r *Recorder) reportAt(nowMs int64, accountID string) *Report {
 			}
 		} else {
 			cycleCredits = 0
-			totals = &Data{
-				ByModel: map[string]*ModelStat{},
-				Hourly:  map[string]*HourStat{},
-			}
+			totals = newData()
 		}
 	}
 

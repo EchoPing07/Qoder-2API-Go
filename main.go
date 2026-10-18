@@ -271,23 +271,8 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 	}
 	if reason == "failure" && failedID != "" {
 		// Cool the failed account down first so the candidate pick below skips
-		// it (failures are rare; one save is fine). An already-longer cooldown
-		// (quota exhaustion cooling to the next reset) must not be shortened.
-		for _, acc := range s.store.ListAccounts() {
-			if acc.ID != failedID {
-				continue
-			}
-			snap := &store.AccountSnapshot{CooldownUntil: time.Now().Add(failureCooldown).Unix()}
-			if acc.Snapshot != nil {
-				cp := *acc.Snapshot
-				snap = &cp
-			}
-			if until := time.Now().Add(failureCooldown).Unix(); until > snap.CooldownUntil {
-				snap.CooldownUntil = until
-			}
-			_ = s.store.SetAccountSnapshot(failedID, snap)
-			break
-		}
+		// it (failures are rare; one save is fine).
+		coolAccountDown(s.store, failedID, time.Now().Add(failureCooldown).Unix())
 	}
 	if reason == "threshold" && time.Since(s.since) < minResidence {
 		return // anti-oscillation: honor the current account's residence
@@ -318,6 +303,25 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 	log.Printf("[bridge] auto-switch (%s): moved to account %s", reason, note)
 	if s.onSwitch != nil {
 		s.onSwitch()
+	}
+}
+
+// coolAccountDown raises an account's cooldown floor to until and persists it.
+// An already-longer cooldown (e.g. quota exhaustion cooling to the next reset)
+// is never shortened. A no-op for unknown accounts.
+func coolAccountDown(s *store.Store, id string, until int64) {
+	for _, acc := range s.ListAccounts() {
+		if acc.ID != id {
+			continue
+		}
+		snap := &store.AccountSnapshot{}
+		if acc.Snapshot != nil {
+			cp := *acc.Snapshot
+			snap = &cp
+		}
+		snap.CooldownUntil = max(snap.CooldownUntil, until)
+		_ = s.SetAccountSnapshot(id, snap)
+		return
 	}
 }
 
@@ -371,20 +375,20 @@ func (p *bridgeProvider) markQuotaExhausted(accountID string) {
 	if snap == nil {
 		return // not a pool account; nothing to mark
 	}
+	// Cooldown runs to the next reset when known, else the failure window;
+	// an already-longer cooldown is kept.
+	until := now.Add(failureCooldown).Unix()
 	if snap.NextResetAtMs > now.UnixMilli() {
-		snap.CooldownUntil = snap.NextResetAtMs / 1000
-	} else if until := now.Add(failureCooldown).Unix(); until > snap.CooldownUntil {
-		snap.CooldownUntil = until
+		until = max(until, snap.NextResetAtMs/1000)
 	}
+	snap.CooldownUntil = max(snap.CooldownUntil, until)
 	snap.IsExceeded = true
 	snap.CheckedAt = now.Unix()
 	_ = p.store.SetAccountSnapshot(accountID, snap)
 	p.snapMu.Lock()
 	if cur := p.snapshots[accountID]; cur != nil {
 		cur.IsExceeded = true
-		if snap.CooldownUntil > cur.CooldownUntil {
-			cur.CooldownUntil = snap.CooldownUntil
-		}
+		cur.CooldownUntil = max(cur.CooldownUntil, snap.CooldownUntil)
 	} else {
 		cp := *snap
 		p.snapshots[accountID] = &cp

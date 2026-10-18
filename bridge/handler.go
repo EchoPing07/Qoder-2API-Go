@@ -188,11 +188,11 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 				// nil means no candidate (or switching disabled) — fall
 				// through to the original 502 mapping.
 				if next := failover(rb.AccountID, quota); next != nil && next.Bridge != nil {
+					kind := "auth failure"
 					if quota {
-						log.Printf("[bridge] upstream quota exhausted on account %s; retrying once on the switched account", rb.AccountID)
-					} else {
-						log.Printf("[bridge] upstream auth failure on account %s; retrying once on the switched account", rb.AccountID)
+						kind = "quota exhausted"
 					}
+					log.Printf("[bridge] upstream %s on account %s; retrying once on the switched account", kind, rb.AccountID)
 					rb, b = next, next.Bridge
 					entry.KeyID, entry.KeyNote = next.KeyID, next.KeyNote
 					continue
