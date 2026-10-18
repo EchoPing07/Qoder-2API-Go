@@ -177,7 +177,12 @@ func (b *OpenAiBridge) EnsureAccountStatus(ctx context.Context) *auth.AccountSta
 		st = b.AccountStatus()
 	}
 
-	quota, err := auth.FetchQuotaUsage(ctx, b.currentSecurityOauth(), b.Region)
+	quotaBearer, err := b.quotaBearer(ctx)
+	if err != nil {
+		log.Printf("[bridge] WARN quota/usage token unavailable: %v", err)
+		return st
+	}
+	quota, err := auth.FetchQuotaUsage(ctx, quotaBearer, b.Region)
 	if err != nil {
 		log.Printf("[bridge] WARN quota/usage refresh failed: %v", err)
 		return st
@@ -347,6 +352,54 @@ func (b *OpenAiBridge) currentSecurityOauth() string {
 	return token
 }
 
+// quotaBearerTTLMargin refreshes the OpenAPI bearer this long before its
+// reported expiry so a quota call never races a token that dies mid-flight.
+const quotaBearerTTLMargin = 5 * time.Minute
+
+// quotaBearer returns the bearer to use for the quota/usage endpoint. The CN
+// region accepts the COSY session token directly; the global region rejects it
+// (401 TOKEN_EXPIRE) and needs a separately-issued OpenAPI token, cached here
+// and refreshed via its refresh token.
+func (b *OpenAiBridge) quotaBearer(ctx context.Context) (string, error) {
+	if !b.Region.NeedsOpenAPIToken {
+		return b.currentSecurityOauth(), nil
+	}
+	b.openAPIMu.Lock()
+	defer b.openAPIMu.Unlock()
+	if b.openAPIToken != "" && (b.openAPIExpMs == 0 || time.Now().UnixMilli() < b.openAPIExpMs-quotaBearerTTLMargin.Milliseconds()) {
+		return b.openAPIToken, nil
+	}
+	var tok *auth.OpenAPIToken
+	var err error
+	if b.openAPIRefresh != "" {
+		tok, err = auth.RefreshOpenAPIToken(ctx, b.openAPIRefresh, b.Region)
+		if err != nil {
+			log.Printf("[bridge] openapi token refresh failed (%v); re-exchanging PAT", err)
+			tok = nil
+		}
+	}
+	if tok == nil {
+		tok, err = auth.ExchangeOpenAPIToken(ctx, b.pat, b.Region)
+		if err != nil {
+			return "", err
+		}
+	}
+	b.openAPIToken = tok.Token
+	b.openAPIRefresh = tok.RefreshToken
+	b.openAPIExpMs = tok.ExpiresAtMs
+	return b.openAPIToken, nil
+}
+
+// invalidateOpenAPIBearer drops the cached OpenAPI bearer so the next
+// quotaBearer call mints a fresh one. forceRefresh only rotates the COSY
+// session, so a 401 from an OpenAPI endpoint needs this to make a retry useful.
+func (b *OpenAiBridge) invalidateOpenAPIBearer() {
+	b.openAPIMu.Lock()
+	b.openAPIToken = ""
+	b.openAPIExpMs = 0
+	b.openAPIMu.Unlock()
+}
+
 // doRenew renews the session token via refreshToken.
 func (b *OpenAiBridge) doRenew(ctx context.Context, force bool) error {
 	b.mu.Lock()
@@ -397,6 +450,18 @@ func (b *OpenAiBridge) forceRefresh(ctx context.Context) error {
 	b.refreshMu.Lock()
 	defer b.refreshMu.Unlock()
 	return b.doRenew(ctx, true)
+}
+
+// CachedCatalog returns the catalog only if one has already been fetched (no
+// upstream call). The router uses it to test model support without paying a
+// session round-trip per routing decision.
+func (b *OpenAiBridge) CachedCatalog() *models.ModelCatalog {
+	if b == nil {
+		return nil
+	}
+	b.catalogMu.Lock()
+	defer b.catalogMu.Unlock()
+	return b.catalog
 }
 
 // GetCatalog returns the dynamic model catalog (TTL cached, single-flight).

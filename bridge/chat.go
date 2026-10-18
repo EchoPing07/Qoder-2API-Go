@@ -238,11 +238,11 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	}
 
 	if effort != "" {
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning_effort=%s is_reasoning=%t",
-			len(prompt), openaiModel, effort, body.ModelConfig.IsReasoning)
+		log.Printf("[bridge] chat req: account=%s model=%s prompt_len=%d reasoning_effort=%s is_reasoning=%t",
+			b.Label(), openaiModel, len(prompt), effort, body.ModelConfig.IsReasoning)
 	} else {
-		log.Printf("[bridge] chat req: prompt_len=%d model=%s reasoning=default is_reasoning=%t",
-			len(prompt), openaiModel, body.ModelConfig.IsReasoning)
+		log.Printf("[bridge] chat req: account=%s model=%s prompt_len=%d reasoning=default is_reasoning=%t",
+			b.Label(), openaiModel, len(prompt), body.ModelConfig.IsReasoning)
 	}
 
 	url := auth.ChatURL(b.Region)
@@ -271,6 +271,8 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 		}
 	}
 	defer func() { <-b.chatSlots }()
+	b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
 
 	jsonBody, err := marshalNoEscape(body)
 	if err != nil {

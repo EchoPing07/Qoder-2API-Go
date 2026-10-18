@@ -61,10 +61,9 @@ function appShell(){
     logs:[], logTotal:0, logPage:1, logPageSize:20,
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
-    pat:{masked:'',input:''},
-    accounts:[], accountModal:false, accountForm:{pat:'',note:''},
+    accounts:[], accountModal:false, accountForm:{pat:'',note:'',region:'cn'},
     noteModal:false, noteForm:{id:'',note:''}, checkingId:'',
-    autoSwitch:{enabled:false, threshold:20},
+    autoSwitch:{enabled:false, threshold:20, strategy:'sticky', sticky_limit:30, max_retry_accounts:3},
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
@@ -98,8 +97,11 @@ function appShell(){
       // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发；
       // 后台标签页跳过（visibilityState），回到前台时立即补一次，避免展示陈旧数据。
       setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible') this.loadStats(); }, 15000);
+      // 账号页驻留时每 5 秒刷新一次账号池（在途/额度是动态的），后台标签页跳过。
+      setInterval(()=>{ if(this.loggedIn && this.view==='token' && document.visibilityState==='visible') this.loadAccounts(); }, 5000);
       document.addEventListener('visibilitychange', ()=>{
         if(!document.hidden && this.loggedIn && this.view==='stats') this.loadStats();
+        if(!document.hidden && this.loggedIn && this.view==='token') this.loadAccounts();
       });
       try{
         const r = await this.api('/admin/api/auth');

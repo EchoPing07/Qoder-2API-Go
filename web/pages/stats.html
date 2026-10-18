@@ -98,11 +98,32 @@
               <div class="spacer"></div>
               <span class="muted-xs" x-show="!models.loading && models.models.length" x-text="models.models.length + ' 个模型'"></span>
             </div>
+            <!-- 区域路由前缀切换：区分国内/国外/自动分配，避免平铺冗余 -->
+            <div class="prefix-bar" x-show="!models.loading && models.models.length">
+              <div class="row" style="align-items:center;justify-content:space-between;gap:6px">
+                <div class="prefix-tabs">
+                  <button type="button" class="prefix-tab" :class="modelPrefix==='' && 'active'" @click="modelPrefix=''">默认</button>
+                  <button type="button" class="prefix-tab" :class="modelPrefix==='cn/' && 'active'" @click="modelPrefix='cn/'">国内 cn/</button>
+                  <button type="button" class="prefix-tab" :class="modelPrefix==='gl/' && 'active'" @click="modelPrefix='gl/'">国际 gl/</button>
+                  <button type="button" class="prefix-tab" :class="modelPrefix==='auto/' && 'active'" @click="modelPrefix='auto/'">智能 auto/</button>
+                </div>
+                <button type="button" class="btn btn-ghost btn-sm prefix-guide-btn" @click="showPrefixGuide=!showPrefixGuide" :title="showPrefixGuide ? '收起前缀用法说明' : '展开前缀用法说明'">
+                  <span x-text="showPrefixGuide ? '收起说明' : '用法说明 ▾'"></span>
+                </button>
+              </div>
+              <span class="prefix-hint" x-text="prefixHint"></span>
+              <div class="prefix-guide-box" x-show="showPrefixGuide" x-cloak>
+                <div class="prefix-guide-item"><strong>无前缀：</strong>优先国内，无国内时跨区。日常直接用。</div>
+                <div class="prefix-guide-item"><strong>auto/：</strong>两区智能分流。双区都有账号时用，提并发。</div>
+                <div class="prefix-guide-item"><strong>cn/：</strong>仅走国内账号，不跨区。固定国内时用。</div>
+                <div class="prefix-guide-item"><strong>gl/：</strong>仅走国际账号，不跨区。消耗海外额度时用。</div>
+              </div>
+            </div>
             <div x-show="!models.loading && models.models.length">
               <div class="model-chips">
                 <template x-for="m in models.models" :key="m">
-                  <span class="model-chip" style="cursor:pointer" role="button" tabindex="0" @click="copy(m)" @keydown.enter.prevent="copy(m)" :title="'点击复制：' + m">
-                    <span class="model-chip-name" x-text="m"></span>
+                  <span class="model-chip" style="cursor:pointer" role="button" tabindex="0" @click="copy(modelName(m))" @keydown.enter.prevent="copy(modelName(m))" :title="'点击复制：' + modelName(m)">
+                    <span class="model-chip-name" x-text="modelName(m)"></span>
                     <span class="ic ic-sm" style="color:var(--muted-fg)" x-html="ic('copy')"></span>
                   </span>
                 </template>

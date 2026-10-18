@@ -879,7 +879,68 @@ func TestConfigLogLimitsEnvPinned(t *testing.T) {
 
 // -- Accounts --
 
-// TestAccountsCRUDFlow 添加（首个自动激活）→ 列表（掩码回显）→ 切换 → 删除守卫的完整链路。
+// TestAccountCheckinHandlers covers the manual check-in endpoint and the
+// per-account check-in setting endpoint.
+func TestAccountCheckinHandlers(t *testing.T) {
+	a, s := newAdmin(t)
+	entry, err := s.AddAccountWithRegion("pt-checkin-12345678", "签到账号", "")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	// Without a wired checkiner the endpoint reports unavailable.
+	w := doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": entry.ID})
+	if w.Code != 503 {
+		t.Fatalf("expected 503 without checkiner, got %d", w.Code)
+	}
+
+	// Wire a fake checkiner.
+	a.SetAccountCheckiner(func(ctx context.Context, id string) (auth.CheckinResult, error) {
+		if id != entry.ID {
+			t.Errorf("checkiner got id %q, want %q", id, entry.ID)
+		}
+		return auth.CheckinResult{Status: "success", Message: "签到成功 +5 积分", RewardCredits: 5}, nil
+	})
+	w = doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": entry.ID})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var res struct {
+		Status        string  `json:"status"`
+		RewardCredits float64 `json:"reward_credits"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "success" || res.RewardCredits != 5 {
+		t.Errorf("unexpected checkin result: %+v", res)
+	}
+
+	// Unknown account -> 404.
+	w = doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": "nope"})
+	if w.Code != 404 {
+		t.Errorf("expected 404 for unknown account, got %d", w.Code)
+	}
+
+	// Setting endpoint: enable auto + valid time.
+	w = doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "08:30"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	acc, _ := s.GetAccount(entry.ID)
+	if !acc.AutoCheckin || acc.CheckinTime != "08:30" {
+		t.Errorf("setting not persisted: auto=%v time=%q", acc.AutoCheckin, acc.CheckinTime)
+	}
+
+	// Invalid time -> 400.
+	w = doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "25:99"})
+	if w.Code != 400 {
+		t.Errorf("expected 400 for invalid time, got %d", w.Code)
+	}
+}
+
 func TestAccountsCRUDFlow(t *testing.T) {
 	a, s := newAdmin(t)
 	// 首个账号：创建即激活
@@ -934,23 +995,16 @@ func TestAccountsCRUDFlow(t *testing.T) {
 	if s.GetPAT() != "pt-two-12345678" {
 		t.Errorf("after switch pat=%q, want pt-two-12345678", s.GetPAT())
 	}
-	// 删除激活中的账号 → 400
-	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
-	if w.Code != 400 {
-		t.Errorf("deleting active should 400, got %d", w.Code)
-	}
-	// 切回去再删
-	otherID := list.Accounts[0].ID
-	if otherID == inactiveID {
-		otherID = list.Accounts[1].ID
-	}
-	doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": otherID})
+	// 删除激活中的账号 → 允许，激活顺延到剩余账号
 	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
 	if w.Code != 200 {
-		t.Errorf("delete failed: %d", w.Code)
+		t.Errorf("deleting active should succeed (200), got %d", w.Code)
 	}
 	if len(s.ListAccounts()) != 1 {
 		t.Errorf("expected 1 account after delete")
+	}
+	if s.GetActiveAccountID() != s.ListAccounts()[0].ID {
+		t.Errorf("active must advance to the survivor")
 	}
 }
 
@@ -1013,7 +1067,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 	a, s := newAdmin(t)
 	acc, _ := s.AddAccount("pt-check", "")
 	calls := 0
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		calls++
 		if pat != "pt-check" {
 			t.Errorf("checker pat = %q", pat)
@@ -1032,7 +1086,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 		t.Errorf("snapshot not persisted: %+v", snap)
 	}
 	// checker 失败：502 且 LastError 记入快照
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		return nil, errors.New("会话失败")
 	})
 	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
@@ -1120,5 +1174,142 @@ func TestAutoSwitchEndpoint(t *testing.T) {
 	w = doRequest(t, a.handleAutoSwitch, "DELETE", "/admin/api/accounts/auto", nil)
 	if w.Code != 405 {
 		t.Errorf("DELETE should 405, got %d", w.Code)
+	}
+}
+
+// TestAccountsRegionRoundTrip 添加时携带区域，列表回传区域；默认国内。
+func TestAccountsRegionRoundTrip(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-global-x", "note": "海外", "region": "global"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := s.AccountRegionByPAT("pt-global-x"); got != "global" {
+		t.Errorf("stored region = %q, want global", got)
+	}
+	w = doRequest(t, a.handleAccounts, "POST", "/admin/api/accounts", map[string]string{"pat": "pt-cn-account", "note": "国内"})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
+	var list struct {
+		Accounts []struct {
+			PATMasked string `json:"pat_masked"`
+			Region    string `json:"region"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	regions := map[string]string{}
+	for _, acc := range list.Accounts {
+		regions[acc.PATMasked] = acc.Region
+	}
+	if regions["pt-g****al-x"] != "global" {
+		t.Errorf("global account region view = %q", regions["pt-g****al-x"])
+	}
+	if regions["pt-c****ount"] != "cn" {
+		t.Errorf("cn account region view = %q", regions["pt-c****ount"])
+	}
+}
+
+// TestAccountCheckPassesRegion 检测端点必须把账号区域透传给 checker。
+func TestAccountCheckPassesRegion(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccountWithRegion("pt-global-check", "", "global")
+	var gotRegion string
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
+		gotRegion = region
+		return &store.AccountSnapshot{Remaining: 5, Total: 10, CheckedAt: 1700000000}, nil
+	})
+	w := doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotRegion != "global" {
+		t.Errorf("checker region = %q, want global", gotRegion)
+	}
+}
+
+// TestAutoSwitchRoutingFields auto 端点往返路由字段。
+func TestAutoSwitchRoutingFields(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto", map[string]interface{}{
+		"enabled": true, "threshold": 25, "strategy": "least-inflight",
+		"sticky_limit": 7, "max_retry_accounts": 5,
+	})
+	if w.Code != 200 {
+		t.Fatalf("POST status = %d: %s", w.Code, w.Body.String())
+	}
+	cfg := s.GetAutoSwitch()
+	if cfg.Strategy != "least-inflight" || cfg.StickyLimit != 7 || cfg.MaxRetryAccounts != 5 || !cfg.Enabled || cfg.Threshold != 25 {
+		t.Errorf("stored config = %+v", cfg)
+	}
+	w = doRequest(t, a.handleAutoSwitch, "GET", "/admin/api/accounts/auto", nil)
+	var got map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["strategy"] != "least-inflight" || got["sticky_limit"].(float64) != 7 || got["max_retry_accounts"].(float64) != 5 {
+		t.Errorf("GET payload = %+v", got)
+	}
+}
+
+// TestAccountWeightEndpoint 权重端点校验与往返。
+func TestAccountWeightEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-weight", "")
+	w := doRequest(t, a.handleAccountWeight, "POST", "/admin/api/accounts/weight", map[string]interface{}{"id": acc.ID, "weight": 7})
+	if w.Code != 200 {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	got, _ := s.GetAccount(acc.ID)
+	if store.AccountWeight(got) != 7 {
+		t.Errorf("weight = %d, want 7", store.AccountWeight(got))
+	}
+	w = doRequest(t, a.handleAccountWeight, "POST", "/admin/api/accounts/weight", map[string]interface{}{"id": acc.ID, "weight": 0})
+	if w.Code != 400 {
+		t.Errorf("weight 0 should 400, got %d", w.Code)
+	}
+	// 列表回传 weight 字段。
+	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
+	if !strings.Contains(w.Body.String(), `"weight":7`) {
+		t.Errorf("account list missing weight: %s", w.Body.String())
+	}
+}
+
+// Global accounts can arm automatic check-in (both regions are supported now).
+func TestAccountCheckinSettingAllowsGlobal(t *testing.T) {
+	a, s := newAdmin(t)
+	entry, err := s.AddAccountWithRegion("pt-global-12345678", "国际", "global")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	w := doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "09:00"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200 for global auto check-in, got %d: %s", w.Code, w.Body.String())
+	}
+	acc, _ := s.GetAccount(entry.ID)
+	if !acc.AutoCheckin || acc.CheckinTime != "09:00" {
+		t.Errorf("global checkin setting not persisted: %+v", acc)
+	}
+}
+
+// The account list marks every region as check-in supported.
+func TestAccountViewsCheckinSupported(t *testing.T) {
+	s := tempStore(t)
+	cn, _ := s.AddAccountWithRegion("pt-cn-12345678", "cn", "cn")
+	gl, _ := s.AddAccountWithRegion("pt-gl-12345678", "gl", "global")
+	views := accountViews(s.ListAccounts(), "", nil)
+	byID := map[string]accountView{}
+	for _, v := range views {
+		byID[v.ID] = v
+	}
+	if !byID[cn.ID].CheckinSupported {
+		t.Error("CN account must be checkin_supported")
+	}
+	if !byID[gl.ID].CheckinSupported {
+		t.Error("global account must be checkin_supported")
 	}
 }
