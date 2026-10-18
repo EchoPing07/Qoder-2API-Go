@@ -30,6 +30,11 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      # The only shell in the repo is the launchd helper; shellcheck catches
+      # the quoting/word-splitting class of bugs that no Go test can see.
+      - name: Shellcheck scripts
+        run: shellcheck -S warning scripts/*.sh
+
   # --- Build binaries for Windows / macOS / Linux (amd64 + arm64) ---
   build-binaries:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
