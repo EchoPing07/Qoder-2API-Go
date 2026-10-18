@@ -276,6 +276,19 @@ PAGE('stats', {
   },
 
   /* ── 模型（自「模型」页迁入：模型列表改在本页展示） ── */
+  modelPrefix: '',
+  showPrefixGuide: false,
+  get prefixHint(){
+    switch(this.modelPrefix){
+      case 'cn/': return '仅走国内账号，不跨区';
+      case 'gl/': return '仅走国际账号，不跨区';
+      case 'auto/': return '两区智能分流，均衡负载';
+      default: return '优先国内，缺省跨区回退（日常推荐）';
+    }
+  },
+  modelName(m){
+    return (this.modelPrefix || '') + m;
+  },
   async loadModels(){
     this.models.loading = true;
     try{
