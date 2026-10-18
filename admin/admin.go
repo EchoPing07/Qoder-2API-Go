@@ -30,9 +30,16 @@ const sessionDuration = 24 * time.Hour
 const adminMaxBody = 1 << 16 // 64 KiB
 
 // AccountChecker probes one PAT's real allowance through a throwaway bridge
-// (full session bootstrap) and returns the quota snapshot. Implemented by the
-// caller (main package) — the admin package stays free of bridge wiring.
-type AccountChecker func(ctx context.Context, pat string) (*store.AccountSnapshot, error)
+// (full session bootstrap) and returns the quota snapshot. The region selects
+// the Qoder deployment (""/"cn" = China, "global" = international).
+// Implemented by the caller (main package) — the admin package stays free of
+// bridge wiring.
+type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
+
+// AccountRuntime reports an account's live state for the panel: in-flight
+// requests, the per-account capacity, and the cumulative request count since
+// the process started. May be nil.
+type AccountRuntime func(accountID string) (inFlight, capacity int, requests int64)
 
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
@@ -41,6 +48,7 @@ type Admin struct {
 	stats          *stats.Recorder
 	logRec         *logs.Recorder
 	accountChecker AccountChecker
+	accountRuntime AccountRuntime
 	sessions       map[string]time.Time
 	sessionMu      sync.Mutex
 	limiter        *loginLimiter
@@ -67,6 +75,12 @@ func (a *Admin) SetAccountChecker(fn AccountChecker) {
 	a.accountChecker = fn
 }
 
+// SetAccountRuntime installs the per-account concurrency reporter used by the
+// account list. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountRuntime(fn AccountRuntime) {
+	a.accountRuntime = fn
+}
+
 // RegisterRoutes registers all admin API routes on the given mux.
 //
 // The WebUI itself is served by the web package (pages under /admin, assets
@@ -84,6 +98,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts", a.requireAuth(a.handleAccounts))
 	mux.HandleFunc("/admin/api/accounts/switch", a.requireAuth(a.handleAccountSwitch))
 	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
+	mux.HandleFunc("/admin/api/accounts/weight", a.requireAuth(a.handleAccountWeight))
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
 	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
@@ -650,22 +665,40 @@ type accountView struct {
 	ID        string                 `json:"id"`
 	PATMasked string                 `json:"pat_masked"`
 	Note      string                 `json:"note"`
+	Region    string                 `json:"region"`
+	Weight    int                    `json:"weight"`
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
+	InFlight  int                    `json:"in_flight"`
+	Capacity  int                    `json:"capacity"`
+	Requests  int64                  `json:"requests"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
 }
 
 // accountViews maps the pool to its wire form, marking the active entry.
-func accountViews(accounts []store.Account, activeID string) []accountView {
+func accountViews(accounts []store.Account, activeID string, runtime AccountRuntime) []accountView {
 	out := make([]accountView, 0, len(accounts))
 	for i := range accounts {
 		acc := accounts[i]
+		region := acc.Region
+		if region == "" {
+			region = "cn"
+		}
+		inflight, capacity, requests := 0, 0, int64(0)
+		if runtime != nil {
+			inflight, capacity, requests = runtime(acc.ID)
+		}
 		out = append(out, accountView{
 			ID:        acc.ID,
 			PATMasked: maskPAT(acc.PAT),
 			Note:      acc.Note,
+			Region:    region,
+			Weight:    store.AccountWeight(acc),
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
+			InFlight:  inflight,
+			Capacity:  capacity,
+			Requests:  requests,
 			Snapshot:  acc.Snapshot,
 		})
 	}
@@ -679,11 +712,12 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
+		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID(), a.accountRuntime)})
 	case http.MethodPost:
 		var body struct {
-			PAT  string `json:"pat"`
-			Note string `json:"note"`
+			PAT    string `json:"pat"`
+			Note   string `json:"note"`
+			Region string `json:"region"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -693,7 +727,7 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, map[string]string{"status": "switched"})
 			return
 		}
-		entry, err := a.store.AddAccount(body.PAT, body.Note)
+		entry, err := a.store.AddAccountWithRegion(body.PAT, body.Note, body.Region)
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
@@ -706,11 +740,7 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.store.DeleteAccount(id); err != nil {
-			if errors.Is(err, store.ErrActiveAccount) {
-				writeJSONError(w, 400, err.Error())
-			} else {
-				writeJSONError(w, 404, err.Error())
-			}
+			writeJSONError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
@@ -788,6 +818,28 @@ func (a *Admin) handleAccountNote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// handleAccountWeight serves POST /admin/api/accounts/weight {id, weight}: sets
+// one account's routing weight (1..100). Equal weights mean even distribution.
+func (a *Admin) handleAccountWeight(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID     string `json:"id"`
+		Weight int    `json:"weight"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.SetAccountWeight(body.ID, body.Weight); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
 // handleAccountCheck serves POST /admin/api/accounts/check {id?}: probes one
 // account (default: the active one) through a throwaway bridge and stores the
 // returned quota snapshot. This is the only account-side upstream call —
@@ -820,7 +872,7 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 503, "检测功能不可用")
 		return
 	}
-	snap, err := a.accountChecker(r.Context(), target.PAT)
+	snap, err := a.accountChecker(r.Context(), target.PAT, target.Region)
 	if err != nil {
 		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
 		writeJSONError(w, 502, "检测失败: "+err.Error())
@@ -839,17 +891,38 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		as := a.store.GetAutoSwitch()
-		writeJSON(w, 200, map[string]interface{}{"enabled": as.Enabled, "threshold": as.Threshold})
+		writeJSON(w, 200, map[string]interface{}{
+			"enabled":            as.Enabled,
+			"threshold":          as.Threshold,
+			"strategy":           as.Strategy,
+			"sticky_limit":       as.StickyLimit,
+			"max_retry_accounts": as.MaxRetryAccounts,
+		})
 	case http.MethodPost:
 		var body struct {
-			Enabled   bool    `json:"enabled"`
-			Threshold float64 `json:"threshold"`
+			Enabled          bool    `json:"enabled"`
+			Threshold        float64 `json:"threshold"`
+			Strategy         string  `json:"strategy"`
+			StickyLimit      int     `json:"sticky_limit"`
+			MaxRetryAccounts int     `json:"max_retry_accounts"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
 			return
 		}
-		if err := a.store.SetAutoSwitch(body.Enabled, body.Threshold); err != nil {
+		cfg := a.store.GetAutoSwitch()
+		cfg.Enabled = body.Enabled
+		cfg.Threshold = body.Threshold
+		if body.Strategy != "" {
+			cfg.Strategy = body.Strategy
+		}
+		if body.StickyLimit > 0 {
+			cfg.StickyLimit = body.StickyLimit
+		}
+		if body.MaxRetryAccounts > 0 {
+			cfg.MaxRetryAccounts = body.MaxRetryAccounts
+		}
+		if err := a.store.SetAutoSwitchConfig(cfg); err != nil {
 			writeJSONError(w, 400, err.Error())
 			return
 		}

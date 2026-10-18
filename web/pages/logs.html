@@ -28,12 +28,14 @@
 
           <div class="table-wrap" x-show="logs.length">
             <table>
-              <thead><tr><th>时间</th><th>模型</th><th>密钥</th><th>流式</th><th>输入 / 输出 / 总计</th><th>消耗</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
+              <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>区域</th><th>密钥</th><th>流式</th><th>输入 / 输出 / 总计</th><th>消耗</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
               <tbody>
                 <template x-for="l in logs" :key="l.id">
                   <tr>
                     <td class="muted-xs" x-text="ts(l.created_at,true)"></td>
                     <td><span class="mono" x-text="l.model||'—'"></span></td>
+                    <td class="muted-xs" x-text="l.account_note || (l.account_id ? l.account_id.slice(0,8) : '—')"></td>
+                    <td><span class="badge badge-muted" x-text="l.region || '—'"></span></td>
                     <td class="muted-xs" x-text="l.key_note || l.key_id || '—'"></td>
                     <td class="muted-xs" x-text="l.stream?'流式':'—'"></td>
                     <td class="muted-xs mono" x-text="(l.prompt_tokens||0)+' / '+(l.completion_tokens||0)+' / '+(l.total_tokens||0)"></td>

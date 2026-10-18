@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"syscall"
 
@@ -30,14 +31,20 @@ import (
 // -ldflags "-X main.Version=v1.2.3". It is only used for display (login page).
 var Version = "dev"
 
-// bridgeProvider manages a single OpenAiBridge for the current PAT.
-// When the PAT changes (via admin UI), the bridge is recreated on next access.
+// bridgeProvider owns the per-account bridges and routes requests across them.
+// It keeps one OpenAiBridge per account (lazily built and invalidated when the
+// account's PAT/region changes) so switching accounts no longer discards a
+// warmed-up session and model catalog.
 type bridgeProvider struct {
-	mu     sync.Mutex
-	bridge *bridge.OpenAiBridge
-	pat    string
-	store  *store.Store
-	switcher *autoSwitcher // nil in tests that build a provider directly
+	mu        sync.Mutex
+	bridges   map[string]*bridge.OpenAiBridge // accountID -> bridge
+	bridgeSig map[string]string               // accountID -> "pat|region" the bridge was built for
+	store     *store.Store
+	router    *router
+	// lastPAT tracks the PAT currentBridge last observed, so a PAT change can
+	// fire the recorder-clearing hook (the panel's account snapshot belongs to
+	// the previous account).
+	lastPAT string
 	// snapshots are the in-memory quota snapshots maintained by passive
 	// deduction and authoritative correction; flushed to disk periodically.
 	snapMu    sync.Mutex
@@ -46,10 +53,63 @@ type bridgeProvider struct {
 	// PAT was cleared. It runs without the provider lock held: the callback
 	// takes the recorder lock, and nesting the two risks a lock-order stall.
 	onPatChange func()
+
+	// reqMu guards reqCounts: per-account cumulative request counts since
+	// process start, shown in the panel so the spread is observable.
+	reqMu     sync.Mutex
+	reqCounts map[string]int64
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
-	return &bridgeProvider{store: st, snapshots: map[string]*store.AccountSnapshot{}}
+	p := &bridgeProvider{
+		store:     st,
+		bridges:   map[string]*bridge.OpenAiBridge{},
+		bridgeSig: map[string]string{},
+		snapshots: map[string]*store.AccountSnapshot{},
+		reqCounts: map[string]int64{},
+	}
+	p.router = newRouter(routerDeps{
+		accounts:    func() []store.Account { return st.ListAccounts() },
+		snapshot:    p.snapshotFor,
+		bridge:      p.bridgeForAccount,
+		config:      func() store.AutoSwitch { return st.GetAutoSwitch() },
+		markFailure: p.markAccountFailure,
+	})
+	return p
+}
+
+// snapshotFor returns the freshest snapshot for an account: the in-memory one
+// (updated by passive deduction / authoritative correction) or the persisted
+// one when no in-memory entry exists yet.
+func (p *bridgeProvider) snapshotFor(id string) *store.AccountSnapshot {
+	p.snapMu.Lock()
+	snap := p.snapshots[id]
+	p.snapMu.Unlock()
+	if snap != nil {
+		return snap
+	}
+	if acc, ok := p.store.GetAccount(id); ok {
+		return acc.Snapshot
+	}
+	return nil
+}
+
+// markAccountFailure writes a cooldown onto an account's in-memory snapshot so
+// the router skips it for a while. Memory-only; flushed by the 30s loop.
+func (p *bridgeProvider) markAccountFailure(accountID string, cooldownUntil int64) {
+	p.snapMu.Lock()
+	snap := p.snapshots[accountID]
+	if snap == nil {
+		if acc, ok := p.store.GetAccount(accountID); ok && acc.Snapshot != nil {
+			cp := *acc.Snapshot
+			snap = &cp
+		} else {
+			snap = &store.AccountSnapshot{}
+		}
+	}
+	snap.CooldownUntil = cooldownUntil
+	p.snapshots[accountID] = snap
+	p.snapMu.Unlock()
 }
 
 // AccountIDByPAT resolves a PAT to its pool entry ID ("" when absent).
@@ -70,51 +130,132 @@ func (p *bridgeProvider) setOnPatChange(fn func()) {
 	p.mu.Unlock()
 }
 
-// resolveBridge validates the API key and returns the bridge for the current
-// PAT plus the key's metadata for request logging. Returns nil if the key is
-// invalid or no PAT is configured.
-func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
-	key, ok := p.store.LookupKey(apiKey)
+// bridgeForAccount returns the bridge for one account, building it on first use
+// or rebuilding it when the account's PAT or region changed. Safe for
+// concurrent use; never holds the lock across upstream work.
+func (p *bridgeProvider) bridgeForAccount(acc store.Account) *bridge.OpenAiBridge {
+	sig := acc.PAT + "|" + acc.Region + "|" + acc.Note
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if b, ok := p.bridges[acc.ID]; ok && p.bridgeSig[acc.ID] == sig {
+		return b
+	}
+	b := bridge.NewOpenAiBridge(acc.PAT, auth.RegionByName(acc.Region))
+	b.SetLabel(accountLabel(acc))
+	p.bridges[acc.ID] = b
+	p.bridgeSig[acc.ID] = sig
+	return b
+}
+
+// accountLabel renders the account's log label: its note when set, otherwise a
+// masked PAT, always tagged with the region.
+func accountLabel(acc store.Account) string {
+	name := acc.Note
+	if name == "" {
+		if len(acc.PAT) > 8 {
+			name = acc.PAT[:4] + "****" + acc.PAT[len(acc.PAT)-4:]
+		} else if acc.PAT != "" {
+			name = "pt-****"
+		} else {
+			name = "账号"
+		}
+	}
+	region := "cn"
+	if acc.Region == "global" {
+		region = "global"
+	}
+	return name + "(" + region + ")"
+}
+
+// pruneBridges drops bridges for accounts that no longer exist (or whose
+// signature changed) so a deleted/replaced account cannot leak a stale session.
+func (p *bridgeProvider) pruneBridges(accounts []store.Account) {
+	live := make(map[string]struct{}, len(accounts))
+	for _, acc := range accounts {
+		live[acc.ID] = struct{}{}
+	}
+	p.mu.Lock()
+	for id := range p.bridges {
+		if _, ok := live[id]; !ok {
+			delete(p.bridges, id)
+			delete(p.bridgeSig, id)
+		}
+	}
+	p.mu.Unlock()
+}
+
+// resolveBridge validates the API key and routes the request to an account,
+// returning that account's bridge plus the key's metadata for request logging.
+// Returns nil if the key is invalid or no account can serve the request.
+func (p *bridgeProvider) resolveBridge(req bridge.ResolveRequest) *bridge.ResolvedBridge {
+	key, ok := p.store.LookupKey(req.APIKey)
 	if !ok {
 		return nil
 	}
-	b := p.currentBridge()
+	acc, stickyKey, ok := p.router.pick(key.ID, req.Model, req.StickySeed, req.Region, req.Exclude)
+	if !ok {
+		return nil
+	}
+	b := p.bridgeForAccount(acc)
 	if b == nil {
 		return nil
 	}
-	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: p.store.GetActiveAccountID()}
+	p.bumpRequestCount(acc.ID)
+	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
+		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
+	if stickyKey != "" {
+		accountID := acc.ID
+		rb.OnSuccess = func() { p.router.bind(stickyKey, accountID) }
+	}
+	return rb
 }
 
-// currentBridge returns the bridge for the current PAT, creating or recreating
-// the bridge when the PAT changes. A PAT change (including clearing it) also
-// fires onPatChange after the provider lock is released, so the cached account
-// snapshot of the previous PAT can be dropped.
+// bumpRequestCount increments one account's cumulative request counter (shown
+// in the panel). Memory-only: it resets on restart, which is the intended
+// "since this process started" semantic.
+func (p *bridgeProvider) bumpRequestCount(accountID string) {
+	if accountID == "" {
+		return
+	}
+	p.reqMu.Lock()
+	p.reqCounts[accountID]++
+	p.reqMu.Unlock()
+}
+
+// RequestCount returns the cumulative request count for an account.
+func (p *bridgeProvider) RequestCount(accountID string) int64 {
+	p.reqMu.Lock()
+	defer p.reqMu.Unlock()
+	return p.reqCounts[accountID]
+}
+
+// currentBridge returns the bridge for the active account (used by the account
+// loop, model fetcher, and legacy paths). Returns nil when no PAT is set. A PAT
+// change fires onPatChange so the panel drops the previous account's snapshot.
 func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 	pat := p.store.GetPAT()
+
 	p.mu.Lock()
-	changed := p.pat != "" && p.pat != pat
-	var b *bridge.OpenAiBridge
-	if pat == "" {
-		if changed {
-			// The old PAT/session must not linger once it is cleared.
-			p.bridge = nil
-			p.pat = ""
-		}
-	} else if p.bridge == nil || p.pat != pat {
-		realPAT, region := auth.Resolve(pat)
-		p.bridge = bridge.NewOpenAiBridge(realPAT, region)
-		p.pat = pat
-		b = p.bridge
-	} else {
-		b = p.bridge
-	}
+	changed := p.lastPAT != "" && p.lastPAT != pat
+	p.lastPAT = pat
 	hook := p.onPatChange
 	p.mu.Unlock()
-
 	if changed && hook != nil {
 		hook()
 	}
-	return b
+
+	activeID := p.store.GetActiveAccountID()
+	if activeID != "" {
+		if acc, ok := p.store.GetAccount(activeID); ok && acc.PAT != "" {
+			return p.bridgeForAccount(acc)
+		}
+	}
+	// Legacy: a bare PAT with no pool entry.
+	if pat == "" {
+		return nil
+	}
+	acc := store.Account{PAT: pat, Region: p.store.AccountRegionByPAT(pat)}
+	return p.bridgeForAccount(acc)
 }
 
 // accountRefreshCadence keeps the authoritative allowance reasonably fresh
@@ -151,177 +292,84 @@ func clearAccountOnPatChange(rec *stats.Recorder) {
 	rec.ClearAccount()
 }
 
-// ═══ Automatic account switching ═══
+// ═══ Account health signals ═══
 //
-// Three signals feed the pool snapshots, in decreasing trust order, and none
-// of them adds a polling loop:
+// Routing itself lives in routing.go (the router spreads requests across the
+// pool). These helpers keep the per-account snapshots the router reads fresh:
 //
-//  1. authoritative correction — the existing 60s account loop already fetches
-//     the active account's quota; its result is written back into the snapshot
-//     and hard-exhaustion sets a cooldown until the next reset;
+//  1. authoritative correction — the account loop fetches each account's quota
+//     in rotation; the result is written back into the snapshot and hard
+//     exhaustion arms a cooldown until the next reset;
 //  2. failure fallback — a chat request dying on an upstream 401/403 before any
-//     byte reached the client puts the failed account into a short cooldown and
-//     moves to the next candidate; the request retries once on the new bridge;
+//     byte reached the client marks that account cooling and retries on another;
 //  3. passive deduction — the usage frame of every billed request carries
-//     credits, which are subtracted from the current account's remaining
-//     snapshot; a threshold breach schedules a switch.
-//
-// Switching itself is still SetPAT(): the bridge rebuilds lazily, the stats
-// snapshot is cleared by the existing PAT-change hook, and patWriteMu keeps
-// account-loop writes from landing across a switch.
+//     credits, which are subtracted from the serving account's snapshot. The
+//     threshold is enforced by the router (low-credit accounts stop receiving
+//     new requests), not by switching the single active account.
 
-const (
-	// failureCooldown is the exclusion window applied after a chat-path auth
-	// failure: long enough to stop hammering a dead token, short enough that
-	// a fixed credential recovers without admin action.
-	failureCooldown = 5 * time.Minute
-	// minResidence is the minimum time an account stays active before
-	// automatic switching may move away from it again (anti-oscillation).
-	minResidence = 60 * time.Second
-	// switchHysteresis requires a candidate to beat the threshold by this much
-	// margin (credits) so an account hovering at the threshold cannot
-	// flip-flop.
-	switchHysteresis = 5.0
-)
-
-// autoSwitcher owns the switching state machine. It mutates the pool through
-// the store (ActivateAccount) and never holds locks across upstream calls.
-type autoSwitcher struct {
-	mu       sync.Mutex
-	store    *store.Store
-	since    time.Time // when the current account became active
-	lastAsk  time.Time // last "no candidate" log instant (throttle for the stay-put warning)
-	onSwitch func()    // fired after a successful automatic switch (stats snapshot clear)
-}
-
-func newAutoSwitcher(st *store.Store) *autoSwitcher {
-	return &autoSwitcher{store: st, since: time.Now()}
-}
-
-// setOnSwitch installs the post-switch hook (must happen before serving).
-func (s *autoSwitcher) setOnSwitch(fn func()) { s.onSwitch = fn }
-
-// pickCandidate returns the pool entry to switch to: skipping cooling-down
-// accounts, preferring the one with the most remaining credits that sits
-// comfortably above the threshold (+ hysteresis), falling back to the highest
-// remaining when every candidate sits below it — a partially charged account
-// still beats a dead one. Returns "" when nobody qualifies.
-func pickCandidate(accounts []store.Account, activeID string, threshold float64) string {
-	type cand struct {
-		id         string
-		remaining  float64
-		ready      bool // comfortably above the threshold
+// handleChatFailover implements bridge.FailoverFunc: mark the failed account
+// cooling, exclude it, and route the request to another account. Returns nil
+// when no other account can serve it (the original error surfaces).
+func (p *bridgeProvider) handleChatFailover(failedAccountID string, req bridge.ResolveRequest, excluded map[string]bool) *bridge.ResolvedBridge {
+	p.router.markFailure(failedAccountID)
+	if excluded == nil {
+		excluded = map[string]bool{}
 	}
-	var pool []cand
-	for _, acc := range accounts {
-		if acc.ID == activeID || acc.Snapshot == nil {
-			continue
-		}
-		if acc.Snapshot.CooldownUntil > time.Now().Unix() {
-			continue
-		}
-		remaining := acc.Snapshot.Remaining
-		pool = append(pool, cand{acc.ID, remaining, remaining > threshold+switchHysteresis && !acc.Snapshot.IsExceeded})
+	excluded[failedAccountID] = true
+	key, ok := p.store.LookupKey(req.APIKey)
+	if !ok {
+		return nil
 	}
-	// Prefer ready candidates (most credits first), then any candidate
-	// (still most credits first). Accounts without a snapshot never qualify:
-	// no data beats guessing.
-	for _, wantReady := range []bool{true, false} {
-		best := ""
-		bestRemaining := -1.0
-		for _, c := range pool {
-			if c.ready != wantReady || c.remaining <= bestRemaining {
-				continue
-			}
-			best, bestRemaining = c.id, c.remaining
-		}
-		if best != "" {
-			return best
-		}
+	acc, stickyKey, ok := p.router.pick(key.ID, req.Model, req.StickySeed, req.Region, excluded)
+	if !ok {
+		return nil
 	}
-	return ""
-}
-
-// maybeSwitch evaluates the auto-switch conditions for reason ("threshold" or
-// "failure") and switches when a candidate exists. Serializes against itself;
-// concurrent failures dedupe because the second caller re-reads the store and
-// finds itself already on the account the first one switched to.
-func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cfg := s.store.GetAutoSwitch()
-	if !cfg.Enabled {
-		return
-	}
-	activeID := s.store.GetActiveAccountID()
-	if failedID != "" && failedID != activeID {
-		// Someone already switched away from the failed account.
-		return
-	}
-	if reason == "failure" && failedID != "" {
-		// Cool the failed account down first so the candidate pick below skips
-		// it (failures are rare; one save is fine).
-		for _, acc := range s.store.ListAccounts() {
-			if acc.ID != failedID {
-				continue
-			}
-			snap := &store.AccountSnapshot{CooldownUntil: time.Now().Add(failureCooldown).Unix()}
-			if acc.Snapshot != nil {
-				cp := *acc.Snapshot
-				snap = &cp
-				snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
-			}
-			_ = s.store.SetAccountSnapshot(failedID, snap)
-			break
-		}
-	}
-	if reason == "threshold" && time.Since(s.since) < minResidence {
-		return // anti-oscillation: honor the current account's residence
-	}
-	id := pickCandidate(s.store.ListAccounts(), activeID, cfg.Threshold)
-	if id == "" {
-		// Keep serving and say so once per account loop.
-		if time.Since(s.lastAsk) > accountRefreshCadence {
-			s.lastAsk = time.Now()
-			log.Printf("[bridge] WARN auto-switch: no eligible candidate above %.0f credits; staying on the current account", cfg.Threshold)
-		}
-		return
-	}
-	if err := s.store.ActivateAccount(id); err != nil {
-		log.Printf("[bridge] WARN auto-switch failed: %v", err)
-		return
-	}
-	s.since = time.Now()
-	note := id
-	for _, acc := range s.store.ListAccounts() {
-		if acc.ID == id {
-			note = acc.Note
-			if note == "" {
-				note = acc.PAT[:4] + "****"
-			}
-		}
-	}
-	log.Printf("[bridge] auto-switch (%s): moved to account %s", reason, note)
-	if s.onSwitch != nil {
-		s.onSwitch()
-	}
-}
-
-// handleChatFailover implements bridge.FailoverFunc: report the auth failure
-// of failedAccountID, cool it down, switch to a candidate, and hand back the
-// replacement bridge — or nil to give up and surface the original error.
-func (p *bridgeProvider) handleChatFailover(failedAccountID string) *bridge.ResolvedBridge {
-	activeID := p.store.GetActiveAccountID()
-	p.switcher.maybeSwitch("failure", failedAccountID)
-	if p.store.GetActiveAccountID() == activeID {
-		return nil // no switch happened: no point retrying on the same bridge
-	}
-	// The PAT mirror moved, so currentBridge rebuilds lazily on the new PAT.
-	b := p.currentBridge()
+	b := p.bridgeForAccount(acc)
 	if b == nil {
 		return nil
 	}
-	return &bridge.ResolvedBridge{Bridge: b, AccountID: p.store.GetActiveAccountID()}
+	p.bumpRequestCount(acc.ID)
+	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
+		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
+	if stickyKey != "" {
+		accountID := acc.ID
+		rb.OnSuccess = func() { p.router.bind(stickyKey, accountID) }
+	}
+	return rb
+}
+
+// modelsUnion merges the model names from every account's catalog so the admin
+// panel (and /v1/models via the default account) reflects models available in
+// any region. Falls back to the built-in catalog when no bridge exists.
+func (p *bridgeProvider) modelsUnion(ctx context.Context) []string {
+	accounts := p.store.ListAccounts()
+	if len(accounts) == 0 {
+		b := p.currentBridge()
+		if b == nil {
+			return models.DefaultCatalog().Keys()
+		}
+		return b.GetCatalog(ctx).Keys()
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, acc := range accounts {
+		b := p.bridgeForAccount(acc)
+		if b == nil {
+			continue
+		}
+		for _, name := range b.GetCatalog(ctx).Keys() {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return models.DefaultCatalog().Keys()
+	}
+	sort.Strings(out)
+	return out
 }
 
 // deductCredits passively applies one usage frame to the current account's
@@ -355,12 +403,9 @@ func (p *bridgeProvider) deductCredits(accountID string, credits float64) {
 		snap.Remaining = 0
 	}
 	p.snapshots[accountID] = snap
-	remaining := snap.Remaining
 	p.snapMu.Unlock()
-
-	if cfg := p.store.GetAutoSwitch(); cfg.Enabled && remaining <= cfg.Threshold {
-		p.switcher.maybeSwitch("threshold", accountID)
-	}
+	// The router excludes low-credit accounts on its own (see routing.go), so
+	// no explicit switch is needed here — the next request simply routes away.
 }
 
 // flushAccountSnapshots persists the passively deducted snapshots. Runs on the
@@ -429,7 +474,7 @@ func (p *bridgeProvider) applyQuotaToSnapshot(accountID string, st *auth.Account
 		if st.NextResetAtMs > time.Now().UnixMilli() {
 			snap.CooldownUntil = st.NextResetAtMs / 1000
 		} else {
-			snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
+			snap.CooldownUntil = time.Now().Add(routerFailureCooldown).Unix()
 		}
 	} else {
 		snap.CooldownUntil = 0
@@ -530,13 +575,6 @@ func main() {
 	// The loop also drains a stop channel so graceful shutdown can trigger a
 	// final flush, avoiding loss of the last <=30s of stats.
 	rec := stats.NewRecorder(st)
-	// Automatic switching state machine: ownership of the pool switch, fed by
-	// the quota loop (authoritative), the failover path (failure) and the
-	// usage sink (threshold). The post-switch hook reuses the PAT-change
-	// clear so the panel drops the previous account's snapshot.
-	switcher := newAutoSwitcher(st)
-	provider.switcher = switcher
-	switcher.setOnSwitch(func() { clearAccountOnPatChange(rec) })
 	// Request-log recorder: same persistence model as stats (in-memory on the
 	// request path, flushed out of band). Entries are metadata only.
 	logRec := logs.NewRecorder(st, logRetention, logMaxEntries)
@@ -577,37 +615,42 @@ func main() {
 		}
 	}()
 
-	// Model fetcher for admin UI
+	// Model fetcher for admin UI: union of every account's catalog so the panel
+	// shows models available across all regions/accounts.
 	modelFetcher := func(ctx context.Context) []string {
-		b := provider.currentBridge()
-		if b == nil {
-			return models.DefaultCatalog().Keys()
-		}
-		catalog := b.GetCatalog(ctx)
-		return catalog.Keys()
+		return provider.modelsUnion(ctx)
 	}
 
-	// Subscription account loop: refreshes identity metadata from /user/status
-	// and authoritative allowance totals from OpenAPI /api/v2/quota/usage out
-	// of band. The admin panel's 15-second poll remains memory-only.
+	// Subscription account loop: refreshes each account's identity metadata
+	// (/user/status) and authoritative allowance (OpenAPI quota/usage) out of
+	// band. It probes ONE account per tick in rotation, so N accounts are all
+	// refreshed within N minutes while upstream load stays at ~1 call/minute.
+	// The stats recorder (panel headline) is only updated when the probed
+	// account is the active one.
 	//
 	// The loop has its own stop/done pair so shutdown can join it before the
 	// final stats flush: its last SetAccount/SetBillingCycle would otherwise
 	// land after that flush and be lost on exit.
 	accountStop := make(chan struct{})
 	accountDone := make(chan struct{})
-	applyAccount := func(ctx context.Context) {
-		// Capture the PAT this refresh belongs to: if it changes while the
-		// fetch is in flight, the snapshot must be dropped rather than written
-		// after the PAT-change hook cleared the previous account.
-		pat := provider.store.GetPAT()
-		b := provider.currentBridge()
+
+	// applyAccountFor probes one account and folds the result into its pool
+	// snapshot. When it is the active account, the panel recorder is updated
+	// too. Returns true when a status was obtained.
+	applyAccountFor := func(ctx context.Context, acc store.Account, activeID string) bool {
+		b := provider.bridgeForAccount(acc)
 		if b == nil {
-			return // no PAT configured yet
+			return false
 		}
 		st := b.EnsureAccountStatus(ctx)
 		if st == nil {
-			return // upstream unreachable: keep the last known state
+			return false // upstream unreachable: keep the last known state
+		}
+		// Authoritative correction: merge into that account's snapshot and arm
+		// the hard-exhaustion cooldown.
+		provider.applyQuotaToSnapshot(acc.ID, st)
+		if acc.ID != activeID {
+			return true
 		}
 		account := &stats.Account{
 			Plan:                 st.Plan,
@@ -637,31 +680,69 @@ func main() {
 				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
 			}
 		}
-		// The write section runs under patWriteMu and re-checks the PAT inside it:
-		// the PAT-change hook clears the recorder under the same lock, so a
+		// The write section runs under patWriteMu and re-checks the PAT inside
+		// it: the PAT-change hook clears the recorder under the same lock, so a
 		// snapshot fetched for the previous PAT can no longer land after that
 		// clear. The fetch above stays outside the lock (it can take 30s).
-		applyAccountWrite(rec, provider, pat, st.NextResetAtMs, account)
-		// Authoritative correction (signal 1): merge the OpenAPI result into the
-		// account snapshot and arm the hard-exhaustion cooldown. Runs after the
-		// recorder write so a switch racing this write evaluates fresh data.
-		provider.applyQuotaToSnapshot(provider.store.GetActiveAccountID(), st)
+		applyAccountWrite(rec, provider, provider.store.GetPAT(), st.NextResetAtMs, account)
+		return true
 	}
+
+	// probeAccounts returns the rotation order: the active account first, then
+	// the rest by ID. Empty pool (legacy bare PAT) yields a synthetic account.
+	probeAccounts := func() []store.Account {
+		accounts := provider.store.ListAccounts()
+		if len(accounts) == 0 {
+			pat := provider.store.GetPAT()
+			if pat == "" {
+				return nil
+			}
+			return []store.Account{{ID: "", PAT: pat, Region: provider.store.AccountRegionByPAT(pat)}}
+		}
+		activeID := provider.store.GetActiveAccountID()
+		out := make([]store.Account, 0, len(accounts))
+		for _, acc := range accounts {
+			if acc.ID == activeID {
+				out = append(out, acc)
+			}
+		}
+		for _, acc := range accounts {
+			if acc.ID != activeID {
+				out = append(out, acc)
+			}
+		}
+		return out
+	}
+
 	go func() {
 		defer close(accountDone)
-		// Fetch once immediately so the panel is populated from the start
-		// rather than after the first tick.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		applyAccount(ctx)
-		cancel()
+		// Fetch the active account once immediately so the panel is populated
+		// from the start rather than after the first tick.
+		activeID := provider.store.GetActiveAccountID()
+		for _, acc := range probeAccounts() {
+			if acc.ID == activeID || activeID == "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				applyAccountFor(ctx, acc, activeID)
+				cancel()
+				break
+			}
+		}
 
 		ticker := time.NewTicker(accountRefreshCadence)
 		defer ticker.Stop()
+		cursor := 0
 		for {
 			select {
 			case <-ticker.C:
+				list := probeAccounts()
+				if len(list) == 0 {
+					continue
+				}
+				provider.pruneBridges(provider.store.ListAccounts())
+				acc := list[cursor%len(list)]
+				cursor++
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				applyAccount(ctx)
+				applyAccountFor(ctx, acc, provider.store.GetActiveAccountID())
 				cancel()
 			case <-accountStop:
 				return
@@ -671,13 +752,24 @@ func main() {
 
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec, logRec)
+	// Per-account runtime for the panel: in-flight, capacity and cumulative
+	// request count (shows how the router spreads load).
+	adminInst.SetAccountRuntime(func(accountID string) (int, int, int64) {
+		inflight, capacity := 0, 0
+		if acc, ok := st.GetAccount(accountID); ok {
+			if b := provider.bridgeForAccount(acc); b != nil {
+				inflight, capacity = b.InFlight(), b.Capacity()
+			}
+		}
+		return inflight, capacity, provider.RequestCount(accountID)
+	})
 	// Account「检测」runs a throwaway bridge through a full session bootstrap
 	// and returns the authoritative quota snapshot; the admin layer only owns
 	// the endpoint. On-demand only — every check costs a session round-trip.
 	// The result also seeds the auto-switch snapshot for that account.
-	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
-		realPAT, region := auth.Resolve(pat)
-		b := bridge.NewOpenAiBridge(realPAT, region)
+	adminInst.SetAccountChecker(func(ctx context.Context, pat, regionName string) (*store.AccountSnapshot, error) {
+		region := auth.RegionByName(regionName)
+		b := bridge.NewOpenAiBridge(pat, region)
 		acct := b.EnsureAccountStatus(ctx)
 		if acct == nil {
 			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")
@@ -711,14 +803,14 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	// failover hands a chat-path auth failure to the auto-switcher and, when
-	// the active account moved, returns the rebuilt bridge for a single retry.
-	failover := func(failedAccountID string) *bridge.ResolvedBridge {
-		return provider.handleChatFailover(failedAccountID)
+	// failover routes a chat-path auth failure to another account (excluding
+	// every account already tried) and returns its bridge for the retry.
+	failover := func(failedAccountID string, req bridge.ResolveRequest, excluded map[string]bool) *bridge.ResolvedBridge {
+		return provider.handleChatFailover(failedAccountID, req, excluded)
 	}
-	// usageHook feeds the usage sink with the account context: billed credits
-	// passively deduct the current account's snapshot (signal 3) and a
-	// threshold breach schedules an automatic switch.
+	// usageHook feeds the usage sink with the serving account: billed credits
+	// passively deduct that account's snapshot (the router then avoids it once
+	// it drops below the threshold).
 	usageHook := func(accountID string, u *transform.Usage) {
 		if u != nil && u.Billable {
 			provider.deductCredits(accountID, u.Credits)

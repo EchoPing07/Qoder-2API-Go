@@ -15,32 +15,38 @@
             <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
             <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
-            <span class="muted-xs">API 桥接使用激活中的账号；切换后桥接会话在下次请求时自动重建</span>
+            <span class="muted-xs">请求按负载均衡策略（含权重）分散到各账号；「请求数」为本次运行以来的累计次数</span>
           </div>
           <div class="table-wrap" x-show="accounts.length">
             <table>
-              <thead><tr><th>令牌</th><th>备注</th><th>剩余额度</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
+              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>权重</th><th>请求数</th><th>在途</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
               <tbody>
                 <template x-for="acc in accounts" :key="acc.id">
                   <tr>
                     <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
-                        <span class="badge badge-ok" x-show="acc.active">使用中</span>
-                      </div>
+                      <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
                     </td>
+                    <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
                     <td x-text="accountQuota(acc)"></td>
+                    <td>
+                      <input class="weight-input mono" type="number" min="1" max="100" step="1"
+                             :value="acc.weight||1"
+                             @change="setAccountWeight(acc, $event)"
+                             @keydown.enter.prevent="$event.target.blur()"
+                             :title="'权重 1-100，越大分到越多请求'">
+                    </td>
+                    <td class="muted-xs mono" x-text="fmt(acc.requests||0)"></td>
+                    <td class="muted-xs mono" x-text="acc.in_flight||0"></td>
                     <td><span class="badge" :class="accountStatusClass(acc)" x-text="accountStatus(acc)"></span></td>
                     <td class="muted-xs" x-text="acc.snapshot && acc.snapshot.checked_at ? ts(acc.snapshot.checked_at) : '—'"></td>
                     <td>
                       <div class="row" style="gap:2px;flex-wrap:nowrap;justify-content:flex-end">
-                        <button class="btn btn-ghost btn-sm" x-show="!acc.active" @click="switchAccount(acc)">切换</button>
                         <button class="btn btn-ghost btn-sm" @click="checkAccount(acc)" :disabled="checkingId===acc.id">
                           <span class="spin" x-show="checkingId===acc.id"></span>
                           <span x-show="checkingId!==acc.id">检测</span>
                         </button>
-                        <button class="btn btn-ghost btn-sm" @click="editAccountNote(acc)">备注</button>
+                        <button class="btn btn-ghost btn-sm" @click="editAccountNote(acc)">编辑</button>
                         <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteAccount(acc)">删除</button>
                       </div>
                     </td>
@@ -57,19 +63,37 @@
 
         <div class="card">
           <div class="card-head">
-            <h3>自动切换</h3>
+            <h3>负载均衡 / 自动切换</h3>
             <div class="spacer"></div>
-            <span class="muted-xs">激活账号额度低于阈值时自动切到余额充足的账号</span>
+            <span class="muted-xs">多账号时请求按策略分散（可按账号权重倾斜），避免都打在一个账号上</span>
           </div>
           <div class="switch-row">
-            <span class="sw-label">启用自动切换</span>
-            <button type="button" class="switch" :class="autoSwitch.enabled ? 'on' : ''" @click="autoSwitch.enabled = !autoSwitch.enabled" aria-label="启用自动切换"></button>
+            <span class="sw-label">启用（低于阈值的账号停止接新请求）</span>
+            <button type="button" class="switch" :class="autoSwitch.enabled ? 'on' : ''" @click="autoSwitch.enabled = !autoSwitch.enabled" aria-label="启用负载均衡"></button>
           </div>
           <div class="form-row">
-            <label class="label">阈值（剩余积分，低于此值自动切换）</label>
-            <input class="input" type="number" min="1" step="1" x-model.number="autoSwitch.threshold">
-            <p class="field-hint">当前账号剩余积分 ≤ 阈值时切到余额最多的账号（预留 5 积分滞回防振荡）；所有账号都低于阈值时留守当前账号并继续服务。硬耗尽的账号冷却到下次重置点。</p>
+            <label class="label">分配策略</label>
+            <select class="input select select-offset" x-model="autoSwitch.strategy">
+              <option value="sticky">粘性轮换（同一会话优先同账号，达到次数后轮换）</option>
+              <option value="round-robin">纯轮询（每个请求换账号）</option>
+              <option value="least-inflight">最少在途（优先空闲账号）</option>
+            </select>
           </div>
+          <div class="form-row">
+            <label class="label">粘性次数（同一会话最多连续使用同一账号的次数）</label>
+            <input class="input" type="number" min="1" step="1" x-model.number="autoSwitch.sticky_limit">
+            <p class="field-hint">达到该次数后切换到下一个账号，避免单账号被上游限流（10605）。纯轮询策略下此项忽略。</p>
+          </div>
+          <div class="form-row">
+            <label class="label">最大重试账号数（单请求遇到鉴权失败时最多尝试的账号数）</label>
+            <input class="input" type="number" min="1" max="16" step="1" x-model.number="autoSwitch.max_retry_accounts">
+          </div>
+          <div class="form-row">
+            <label class="label">阈值（剩余积分，低于此值的账号停止接新请求）</label>
+            <input class="input" type="number" min="1" step="1" x-model.number="autoSwitch.threshold">
+            <p class="field-hint">剩余积分 ≤ 阈值的账号会被排除在分配之外；全部账号都低于阈值时才继续使用。硬耗尽的账号冷却到下次重置点。</p>
+          </div>
+          <p class="field-hint">模型名前缀可选指定区域：<code>cn/模型名</code>（国内）、<code>gl/模型名</code>（国际）、<code>auto/模型名</code>（两区智能分配）。不写前缀默认国内，无国内账号时跨区。</p>
           <div class="action-row">
             <div class="spacer"></div>
             <button class="btn btn-sm" @click="saveAutoSwitch()" :disabled="loading">
@@ -88,6 +112,14 @@
         <div class="modal-title">添加账号</div>
         <p class="modal-msg">填入 Qoder 个人访问令牌（PAT）。令牌相同时视为切换到已有账号。</p>
         <div class="form-row"><label class="label">令牌</label><input class="input mono" x-model="accountForm.pat" placeholder="pt-..." autocomplete="off"></div>
+        <div class="form-row">
+          <label class="label">区域</label>
+          <select class="input select select-offset" x-model="accountForm.region">
+            <option value="cn">国内版（qoder.com.cn）</option>
+            <option value="global">国际版（qoder.sh）</option>
+          </select>
+          <p class="field-hint">令牌所属区域必须匹配，否则会提示「personal token is invalid」。</p>
+        </div>
         <div class="form-row"><label class="label">备注</label><input class="input" x-model="accountForm.note" placeholder="可选描述" autocomplete="off"></div>
         <div class="modal-foot">
           <button type="button" class="btn btn-secondary btn-sm" @click="accountModal=false">取消</button>
@@ -101,12 +133,13 @@
   </form>
 </template>
 
-<!-- ═══ 备注弹窗 ═══ -->
+<!-- ═══ 编辑备注弹窗（权重在表格内联编辑） ═══ -->
 <template x-if="noteModal">
   <div class="overlay" @click.self="noteModal=false">
     <form class="modal" @submit.prevent="saveAccountNote()">
-      <div class="modal-title">修改备注</div>
+      <div class="modal-title">编辑备注</div>
       <div class="form-row"><label class="label">备注</label><input class="input" x-model="noteForm.note" placeholder="可选描述" autocomplete="off"></div>
+      <p class="field-hint">权重可直接在表格的「权重」列中修改。</p>
       <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="noteModal=false">取消</button>
         <button type="submit" class="btn btn-sm" :disabled="loading">保存</button>

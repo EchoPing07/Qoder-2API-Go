@@ -543,7 +543,11 @@ func TestMovedModelsAndTier(t *testing.T) {
 	for _, want := range []string{
 		`<h3>模型列表</h3>`,
 		`x-text="models.models.length + ' 个模型'"`,
-		`@click="copy(m)"`, // 点击卡片复制模型名的既有行为
+		`@click="copy(modelName(m))"`, // 点击卡片复制模型名（支持前缀）
+		`class="prefix-tabs"`,
+		`x-text="prefixHint"`,
+		`class="prefix-guide-box"`,
+		`showPrefixGuide`,
 	} {
 		if !strings.Contains(stats, want) {
 			t.Errorf("统计页缺少迁入的模型列表元素 %s", want)
@@ -562,15 +566,15 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 	tokenJS := read(assetFS, "assets/pages/token.js")
 
-	// 令牌页已升级为账号页：账号池表格（掩码回显 + 激活徽标 + 切换/检测/备注/删除）
+	// 令牌页已升级为账号页：账号池表格（掩码回显 + 请求数/检测/编辑/删除）
 	// 与添加弹窗必须存在，路由 key 仍为 token。
 	for _, want := range []string{
 		`<h1>账号</h1>`,
 		`<h3>账号池</h3>`,
 		`x-text="acc.pat_masked"`,
-		`x-show="acc.active"`,
-		`@click="switchAccount(acc)"`,
+		`x-text="fmt(acc.requests||0)"`,
 		`@click="checkAccount(acc)"`,
+		`@click="editAccountNote(acc)"`,
 		`@click="deleteAccount(acc)"`,
 		`@submit.prevent="createAccount()"`,
 	} {
@@ -579,10 +583,12 @@ func TestMovedModelsAndTier(t *testing.T) {
 		}
 	}
 
-	// 自动切换设置卡：开关 + 阈值输入 + 保存动作必须存在
+	// 负载均衡设置卡：开关 + 策略 + 阈值输入 + 保存动作必须存在
 	for _, want := range []string{
-		`<h3>自动切换</h3>`,
+		`<h3>负载均衡 / 自动切换</h3>`,
 		`x-model.number="autoSwitch.threshold"`,
+		`x-model="autoSwitch.strategy"`,
+		`x-model.number="autoSwitch.sticky_limit"`,
 		`@click="saveAutoSwitch()"`,
 	} {
 		if !strings.Contains(token, want) {
@@ -603,7 +609,7 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 	// 账号 API 调用路径须走 /admin/api/accounts*（与 admin 路由的契约由
 	// TestFrontendAPIPathsMatchAdminRoutes 守住，这里只守语义入口）。
-	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/switch'", "'/admin/api/accounts/check'", "'/admin/api/accounts/auto'"} {
+	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/weight'", "'/admin/api/accounts/check'", "'/admin/api/accounts/auto'"} {
 		if !strings.Contains(tokenJS, want) {
 			t.Errorf("账号页缺少 API 调用 %s", want)
 		}
@@ -612,6 +618,9 @@ func TestMovedModelsAndTier(t *testing.T) {
 	statsJS := read(assetFS, "assets/pages/stats.js")
 	if !strings.Contains(statsJS, "this.loadModels()") {
 		t.Error("统计页 load() 必须加载模型列表（模型页已移除）")
+	}
+	if !strings.Contains(statsJS, "modelPrefix:") || !strings.Contains(statsJS, "modelName(m)") {
+		t.Error("统计页脚本必须包含区域前缀状态与拼接方法")
 	}
 }
 
@@ -851,7 +860,7 @@ Object.keys(PAGES).forEach(function (k) {
   const orig = PAGES[k].load;
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
-['loadStats', 'loadKeys', 'loadPAT', 'loadAccounts', 'loadAutoSwitch', 'loadModels', 'loadConfig'].forEach(function (m) {
+['loadStats', 'loadKeys', 'loadAccounts', 'loadAutoSwitch', 'loadModels', 'loadConfig'].forEach(function (m) {
   if (typeof inst[m] === 'function') inst[m] = function () { loads.push(m); };
 });
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）
@@ -863,11 +872,27 @@ function fail(msg) {
 }
 function count(name) { return loads.filter(function (x) { return x === name; }).length; }
 
-// 1) 首屏页必须进场并加载数据（回归：entered 预置首屏 key 会使 load() 被跳过）
-inst.afterLogin();
-if (count('enter:stats') !== 1) fail('首屏页 stats 应恰好进场一次');
-if (count('loadStats') !== 1) fail('首屏页 stats 的 load() 未把数据请求发出去');
-if (count('loadModels') !== 1) fail('首屏页 stats 的 load() 未把模型列表请求发出去（模型页已迁入统计页）');
+	// 1) 首屏页必须进场并加载数据（回归：entered 预置首屏 key 会使 load() 被跳过）
+	inst.afterLogin();
+	if (count('enter:stats') !== 1) fail('首屏页 stats 应恰好进场一次');
+	if (count('loadStats') !== 1) fail('首屏页 stats 的 load() 未把数据请求发出去');
+	if (count('loadModels') !== 1) fail('首屏页 stats 的 load() 未把模型列表请求发出去（模型页已迁入统计页）');
+
+	// 1.1) 模型区域前缀切换与拼接逻辑（区分国内/国外/自动分配）
+	if (inst.modelPrefix !== '') fail('初始 modelPrefix 必须为空');
+	if (inst.modelName('DeepSeek-Flash') !== 'DeepSeek-Flash') fail('默认 modelName 应返回裸名');
+	if (!inst.prefixHint || inst.prefixHint.indexOf('国内') === -1) fail('默认前缀提示异常');
+	inst.modelPrefix = 'cn/';
+	if (inst.modelName('DeepSeek-Flash') !== 'cn/DeepSeek-Flash') fail('cn/ 前缀拼接失败');
+	if (inst.prefixHint.indexOf('国内') === -1) fail('cn/ 前缀提示异常');
+	inst.modelPrefix = 'gl/';
+	if (inst.modelName('DeepSeek-Flash') !== 'gl/DeepSeek-Flash') fail('gl/ 前缀拼接失败');
+	if (inst.prefixHint.indexOf('国际') === -1) fail('gl/ 前缀提示异常');
+		inst.modelPrefix = 'auto/';
+		if (inst.modelName('DeepSeek-Flash') !== 'auto/DeepSeek-Flash') fail('auto/ 前缀拼接失败');
+		if (inst.prefixHint.indexOf('智能') === -1) fail('auto/ 前缀提示异常');
+		if (inst.showPrefixGuide !== false) fail('初始 showPrefixGuide 必须为 false');
+		inst.modelPrefix = '';
 
 // 2) 切页：目标页进场一次，view 切换，URL 换成 /admin/<key>，移动端侧栏收起
 inst.mobileNav = true;

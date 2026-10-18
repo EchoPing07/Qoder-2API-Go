@@ -572,20 +572,23 @@ func TestActivateAccountSwitch(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountGuard 删除激活中的账号被拒绝（ErrActiveAccount）；删除其他账号后
-// 激活状态不受影响。
+// TestDeleteAccountGuard 删除激活账号时激活标记顺延到剩余首个账号；删光后清空
+// 激活与 PAT 镜像；未知 id 报错。
 func TestDeleteAccountGuard(t *testing.T) {
 	s := tempStore(t)
 	first, _ := s.AddAccount("pt-a", "")
 	second, _ := s.AddAccount("pt-b", "")
-	if err := s.DeleteAccount(first.ID); !errors.Is(err, ErrActiveAccount) {
-		t.Errorf("deleting active must fail with ErrActiveAccount, got %v", err)
+	if err := s.DeleteAccount(first.ID); err != nil {
+		t.Fatalf("deleting the active account must succeed, got %v", err)
+	}
+	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() != second.ID || s.GetPAT() != "pt-b" {
+		t.Errorf("active must advance to the survivor: active=%q pat=%q", s.GetActiveAccountID(), s.GetPAT())
 	}
 	if err := s.DeleteAccount(second.ID); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
-	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() != first.ID {
-		t.Error("active account must survive the other's deletion")
+	if len(s.ListAccounts()) != 0 || s.GetActiveAccountID() != "" || s.GetPAT() != "" {
+		t.Errorf("deleting the last account must clear active/pat: active=%q pat=%q", s.GetActiveAccountID(), s.GetPAT())
 	}
 	if err := s.DeleteAccount("nonexistent"); err == nil {
 		t.Error("unknown id must fail")
@@ -679,8 +682,8 @@ func TestSnapshotCooldownRoundTrip(t *testing.T) {
 	a1, _ := s.AddAccount("pt-c1", "")
 	a2, _ := s.AddAccount("pt-c2", "")
 	if err := s.SaveSnapshots(map[string]*AccountSnapshot{
-		a1.ID: {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
-		a2.ID: {Remaining: 90, Total: 100, CheckedAt: 1700000000},
+		a1.ID:  {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
+		a2.ID:  {Remaining: 90, Total: 100, CheckedAt: 1700000000},
 		"gone": {Remaining: 1}, // 未知 ID 被忽略
 	}); err != nil {
 		t.Fatalf("SaveSnapshots: %v", err)
@@ -700,5 +703,110 @@ func TestSnapshotCooldownRoundTrip(t *testing.T) {
 	// 空批次是 no-op
 	if err := s2.SaveSnapshots(nil); err != nil {
 		t.Errorf("empty batch must be a no-op, got %v", err)
+	}
+}
+
+// TestAddAccountWithRegion 区域持久化：默认空为国内，global 归一化保存；按 PAT
+// 可反查区域；重复 PAT 无论区域都视为重复。
+func TestAddAccountWithRegion(t *testing.T) {
+	s := tempStore(t)
+	cn, err := s.AddAccount("pt-cn", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cn.Region != "" {
+		t.Errorf("default region = %q, want empty (CN)", cn.Region)
+	}
+	if got := s.AccountRegionByPAT("pt-cn"); got != "" {
+		t.Errorf("AccountRegionByPAT(cn) = %q", got)
+	}
+	g, err := s.AddAccountWithRegion("pt-global", "海外", "Global")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Region != "global" {
+		t.Errorf("global region = %q, want global", g.Region)
+	}
+	if got := s.AccountRegionByPAT("pt-global"); got != "global" {
+		t.Errorf("AccountRegionByPAT(global) = %q", got)
+	}
+	if _, err := s.AddAccountWithRegion("pt-global", "", "cn"); !errors.Is(err, ErrDuplicateAccount) {
+		t.Errorf("same PAT in another region must be a duplicate, got %v", err)
+	}
+	// 持久化后重新加载仍保留区域。
+	reloaded, err := New(s.filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.AccountRegionByPAT("pt-global"); got != "global" {
+		t.Errorf("region lost after reload: %q", got)
+	}
+	if acc, ok := reloaded.GetAccount(g.ID); !ok || acc.Region != "global" {
+		t.Errorf("GetAccount lost region: %+v ok=%v", acc, ok)
+	}
+}
+
+// TestAutoSwitchRoutingConfig 路由配置字段默认值、持久化与校验。
+func TestAutoSwitchRoutingConfig(t *testing.T) {
+	s := tempStore(t)
+	as := s.GetAutoSwitch()
+	if as.Strategy != StrategySticky || as.StickyLimit != DefaultStickyLimit || as.MaxRetryAccounts != DefaultMaxRetryAccounts {
+		t.Errorf("defaults = %+v", as)
+	}
+	cfg := AutoSwitch{Enabled: true, Threshold: 30, Strategy: StrategyLeastInFlight, StickyLimit: 5, MaxRetryAccounts: 6}
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Reload from disk: the new fields must persist.
+	reloaded, err := New(s.filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reloaded.GetAutoSwitch()
+	if got.Strategy != StrategyLeastInFlight || got.StickyLimit != 5 || got.MaxRetryAccounts != 6 || got.Threshold != 30 {
+		t.Errorf("reloaded = %+v", got)
+	}
+	// Validation.
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: "bogus", StickyLimit: 1, MaxRetryAccounts: 1}); err == nil {
+		t.Error("unknown strategy must be rejected")
+	}
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: StrategySticky, StickyLimit: 1, MaxRetryAccounts: 99}); err == nil {
+		t.Error("out-of-range max retry must be rejected")
+	}
+	if err := s.SetAutoSwitchConfig(AutoSwitch{Threshold: 1, Strategy: StrategySticky, StickyLimit: 0, MaxRetryAccounts: 1}); err == nil {
+		t.Error("zero sticky limit must be rejected")
+	}
+	// SetAutoSwitch (legacy) preserves the routing knobs.
+	if err := s.SetAutoSwitch(true, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.GetAutoSwitch(); got.Strategy != StrategyLeastInFlight || got.StickyLimit != 5 {
+		t.Errorf("SetAutoSwitch must preserve routing knobs: %+v", got)
+	}
+}
+
+// TestSetAccountWeight 权重校验与持久化。
+func TestSetAccountWeight(t *testing.T) {
+	s := tempStore(t)
+	acc, _ := s.AddAccount("pt-w", "")
+	if got := AccountWeight(*acc); got != DefaultAccountWeight {
+		t.Errorf("default weight = %d, want %d", got, DefaultAccountWeight)
+	}
+	if err := s.SetAccountWeight(acc.ID, 5); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _ := New(s.filePath)
+	got, ok := reloaded.GetAccount(acc.ID)
+	if !ok || AccountWeight(got) != 5 {
+		t.Errorf("weight not persisted: %+v", got)
+	}
+	if err := s.SetAccountWeight(acc.ID, 0); err == nil {
+		t.Error("weight 0 must be rejected")
+	}
+	if err := s.SetAccountWeight(acc.ID, 101); err == nil {
+		t.Error("weight 101 must be rejected")
+	}
+	if err := s.SetAccountWeight("nope", 5); err == nil {
+		t.Error("unknown id must error")
 	}
 }

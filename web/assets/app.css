@@ -117,6 +117,8 @@ a{color:inherit;text-decoration:none}
 .input:focus,.select:focus{border-color:color-mix(in oklab,var(--fg) 32%,var(--input));box-shadow:0 0 0 3px color-mix(in oklab,var(--input) 28%,transparent)}
 .input:disabled{opacity:.55;cursor:not-allowed}
 .select{appearance:none;background-image:var(--chevron);background-repeat:no-repeat;background-position:right 10px center;padding-right:30px;cursor:pointer}
+/* 下拉箭头略微左移，避免贴边（账号页的区域/策略选择器使用） */
+.select-offset{background-position:right 16px center;padding-right:36px}
 .input-sm,.select-sm{height:30px;font-size:var(--fs-xs);border-radius:7px}
 .form-row{margin-bottom:14px}
 .form-grid{display:grid;gap:0 12px}
@@ -178,6 +180,9 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .cell-edit{height:26px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;width:130px;outline:none;transition:border-color .15s,background .15s}
 .cell-edit:hover{border-color:var(--input)}
 .cell-edit:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
+.weight-input{height:26px;width:64px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;text-align:center;outline:none;transition:border-color .15s,background .15s}
+.weight-input:hover{border-color:var(--input)}
+.weight-input:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
 .key-chip{background:var(--secondary);padding:3px 8px;border-radius:6px;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis;display:inline-block}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
 .filters .input,.filters .select{width:auto}
@@ -275,9 +280,21 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .model-track{height:6px;border-radius:9999px;background:color-mix(in oklab,var(--muted-fg) 12%,transparent);overflow:hidden}
 .model-fill{height:100%;border-radius:9999px;background:var(--fg);opacity:.82;transition:width .4s}
 .model-count{font-size:var(--fs-2xs);color:var(--muted-fg);text-align:right;font-variant-numeric:tabular-nums}
+.prefix-bar{display:flex;flex-direction:column;gap:6px;margin:2px 0 10px}
+.prefix-tabs{display:inline-flex;background:color-mix(in oklab,var(--muted-fg) 10%,transparent);border-radius:7px;padding:2px;gap:2px;width:fit-content}
+.prefix-tab{border:none;background:transparent;color:var(--muted-fg);font-size:var(--fs-2xs);padding:3px 9px;border-radius:5px;cursor:pointer;font-family:inherit;font-weight:500;line-height:1.4;transition:background .15s,color .15s,box-shadow .15s;white-space:nowrap;user-select:none}
+.prefix-tab:hover{color:var(--fg)}
+.prefix-tab.active{background:var(--card);color:var(--fg);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.dark .prefix-tab.active{background:var(--secondary);color:var(--fg);box-shadow:0 1px 3px rgba(0,0,0,.35)}
+.prefix-guide-btn{height:22px;padding:0 7px;font-size:var(--fs-2xs);color:var(--muted-fg);border-radius:5px}
+.prefix-guide-btn:hover{color:var(--fg)}
+.prefix-hint{font-size:var(--fs-2xs);color:var(--muted-fg);line-height:1.4}
+.prefix-guide-box{margin-top:2px;padding:9px 12px;background:color-mix(in oklab,var(--secondary) 75%,transparent);border:1px solid color-mix(in oklab,var(--border) 60%,transparent);border-radius:8px;font-size:var(--fs-2xs);line-height:1.6;color:var(--muted-fg);display:flex;flex-direction:column;gap:5px}
+.prefix-guide-box strong{color:var(--fg);font-weight:600}
 .model-chips{display:flex;flex-wrap:wrap;gap:8px;max-height:340px;overflow-y:auto;padding:2px}
-.model-chip{display:inline-flex;align-items:center;gap:6px;background:var(--secondary);border:1px solid color-mix(in oklab,var(--border) 60%,transparent);border-radius:7px;padding:5px 9px;font-size:var(--fs-xs);line-height:1.4;max-width:100%}
-.model-chip .model-chip-name{color:var(--fg);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px}
+.model-chip{display:inline-flex;align-items:center;gap:6px;background:var(--secondary);border:1px solid color-mix(in oklab,var(--border) 60%,transparent);border-radius:7px;padding:5px 9px;font-size:var(--fs-xs);line-height:1.4;max-width:100%;transition:background .15s,border-color .15s}
+.model-chip:hover{background:var(--accent);border-color:color-mix(in oklab,var(--border) 90%,transparent)}
+.model-chip .model-chip-name{color:var(--fg);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
 .model-chip .model-chip-rate{color:var(--muted-fg);font-size:var(--fs-2xs)}
 .file-input{font-size:var(--fs-xs);color:var(--muted-fg);max-width:240px}
 .file-input::file-selector-button{margin-right:10px;padding:5px 10px;border-radius:7px;border:1px solid var(--border);background:var(--secondary);color:var(--secondary-fg);font-size:var(--fs-xs);cursor:pointer}
