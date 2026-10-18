@@ -29,7 +29,13 @@
                     <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
                     <td x-text="accountQuota(acc)"></td>
-                    <td class="muted-xs mono" x-text="acc.weight||1"></td>
+                    <td>
+                      <input class="weight-input mono" type="number" min="1" max="100" step="1"
+                             :value="acc.weight||1"
+                             @change="setAccountWeight(acc, $event)"
+                             @keydown.enter.prevent="$event.target.blur()"
+                             :title="'权重 1-100，越大分到越多请求'">
+                    </td>
                     <td class="muted-xs mono" x-text="fmt(acc.requests||0)"></td>
                     <td class="muted-xs mono" x-text="acc.in_flight||0"></td>
                     <td><span class="badge" :class="accountStatusClass(acc)" x-text="accountStatus(acc)"></span></td>
@@ -127,17 +133,13 @@
   </form>
 </template>
 
-<!-- ═══ 编辑账号弹窗（备注 + 权重） ═══ -->
+<!-- ═══ 编辑备注弹窗（权重在表格内联编辑） ═══ -->
 <template x-if="noteModal">
   <div class="overlay" @click.self="noteModal=false">
     <form class="modal" @submit.prevent="saveAccountNote()">
-      <div class="modal-title">编辑账号</div>
+      <div class="modal-title">编辑备注</div>
       <div class="form-row"><label class="label">备注</label><input class="input" x-model="noteForm.note" placeholder="可选描述" autocomplete="off"></div>
-      <div class="form-row">
-        <label class="label">权重（1-100，越大分到越多请求）</label>
-        <input class="input" type="number" min="1" max="100" step="1" x-model.number="noteForm.weight">
-        <p class="field-hint">各账号权重相同时平均分配；权重越大，分配到的请求比例越高。仅在负载均衡的轮询/粘性策略下生效。</p>
-      </div>
+      <p class="field-hint">权重可直接在表格的「权重」列中修改。</p>
       <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="noteModal=false">取消</button>
         <button type="submit" class="btn btn-sm" :disabled="loading">保存</button>

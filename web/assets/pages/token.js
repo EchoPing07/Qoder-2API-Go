@@ -21,7 +21,7 @@ PAGE('token', {
     })();
   },
   deleteAccount(acc){
-    this.askConfirm('删除账号','确定删除此账号？激活中的账号需先切换到其他账号后才能删除。', ()=>{
+    this.askConfirm('删除账号','确定删除此账号？删除后不可恢复。', ()=>{
       this.busy(async()=>{
         await this.api('/admin/api/accounts?id='+encodeURIComponent(acc.id),{method:'DELETE'});
         this.toast('账号已删除','ok'); this.loadAccounts();
@@ -29,21 +29,37 @@ PAGE('token', {
     });
   },
   editAccountNote(acc){
-    this.noteForm = {id:acc.id, note:acc.note||'', weight:acc.weight||1};
+    this.noteForm = {id:acc.id, note:acc.note||''};
     this.noteModal = true;
   },
   async saveAccountNote(){
-    const w = Number(this.noteForm.weight);
-    if(!Number.isFinite(w) || w < 1 || w > 100){ this.toast('权重需在 1..100 之间','err'); return; }
     this.busy(async()=>{
       await this.api('/admin/api/accounts/note',{method:'POST',body:JSON.stringify({
         id:this.noteForm.id, note:(this.noteForm.note||'').trim() })});
-      await this.api('/admin/api/accounts/weight',{method:'POST',body:JSON.stringify({
-        id:this.noteForm.id, weight:w })});
-      this.toast('账号已更新','ok');
+      this.toast('备注已更新','ok');
       this.noteModal = false;
       this.loadAccounts();
     })();
+  },
+  /* 权重：表格内联编辑，失焦/回车即保存（1..100）；失败时回滚到原值 */
+  async setAccountWeight(acc, ev){
+    const el = ev.target;
+    const w = Number(el.value);
+    const prev = acc.weight || 1;
+    if(!Number.isFinite(w) || w < 1 || w > 100){
+      this.toast('权重需在 1..100 之间','err');
+      el.value = prev;
+      return;
+    }
+    if(w === prev) return;
+    try{
+      await this.api('/admin/api/accounts/weight',{method:'POST',body:JSON.stringify({id:acc.id, weight:w})});
+      acc.weight = w;
+      this.toast('权重已更新','ok');
+    }catch(e){
+      el.value = prev;
+      this.toast(e.message,'err');
+    }
   },
   /* 检测：经临时会话查询一次真实额度并落快照；每次检测都是一次完整会话引导，勿高频点击 */
   async checkAccount(acc){

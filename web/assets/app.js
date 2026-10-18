@@ -62,7 +62,7 @@ function appShell(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
     accounts:[], accountModal:false, accountForm:{pat:'',note:'',region:'cn'},
-    noteModal:false, noteForm:{id:'',note:'',weight:1}, checkingId:'',
+    noteModal:false, noteForm:{id:'',note:''}, checkingId:'',
     autoSwitch:{enabled:false, threshold:20, strategy:'sticky', sticky_limit:30, max_retry_accounts:3},
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',

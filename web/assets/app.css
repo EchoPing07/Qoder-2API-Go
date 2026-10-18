@@ -180,6 +180,9 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .cell-edit{height:26px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;width:130px;outline:none;transition:border-color .15s,background .15s}
 .cell-edit:hover{border-color:var(--input)}
 .cell-edit:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
+.weight-input{height:26px;width:64px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;text-align:center;outline:none;transition:border-color .15s,background .15s}
+.weight-input:hover{border-color:var(--input)}
+.weight-input:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
 .key-chip{background:var(--secondary);padding:3px 8px;border-radius:6px;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis;display:inline-block}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
 .filters .input,.filters .select{width:auto}
