@@ -8,6 +8,11 @@ data.json
 # Local reference repos (do not push)
 references/
 
+# Local tooling / runtime artifacts
+.zcode/
+run/
+*.log
+
 # OS files
 .DS_Store
 Thumbs.db
