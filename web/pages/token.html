@@ -69,7 +69,7 @@
           </div>
           <div class="form-row">
             <label class="label">分配策略</label>
-            <select class="input" x-model="autoSwitch.strategy">
+            <select class="input select select-offset" x-model="autoSwitch.strategy">
               <option value="sticky">粘性轮换（同一会话优先同账号，达到次数后轮换）</option>
               <option value="round-robin">纯轮询（每个请求换账号）</option>
               <option value="least-inflight">最少在途（优先空闲账号）</option>
@@ -110,7 +110,7 @@
         <div class="form-row"><label class="label">令牌</label><input class="input mono" x-model="accountForm.pat" placeholder="pt-..." autocomplete="off"></div>
         <div class="form-row">
           <label class="label">区域</label>
-          <select class="input" x-model="accountForm.region">
+          <select class="input select select-offset" x-model="accountForm.region">
             <option value="cn">国内版（qoder.com.cn）</option>
             <option value="global">国际版（qoder.sh）</option>
           </select>
