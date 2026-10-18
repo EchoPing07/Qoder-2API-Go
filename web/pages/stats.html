@@ -44,11 +44,12 @@
           </article>
         </div>
 
-        <!-- 额度明细：Qoder 官方账号级额度，账号无任何可用池时整卡隐藏 -->
-        <div class="card" x-show="quotaPoolsList.length">
+        <!-- 额度明细：Qoder 官方账号级额度，账号无任何可用池时整卡隐藏；
+             多账号（负载均衡）下按账号逐行列出各账号的积分池与合计 -->
+        <div class="card" x-show="quotaRows.length">
           <div class="card-head">
             <h3>额度明细</h3>
-            <span class="muted-xs">Qoder 官方账号级额度，每分钟刷新</span>
+            <span class="muted-xs" x-text="lbEnabled && poolAccountRows.length > 1 ? 'Qoder 官方账号级额度，负载均衡下按账号展示，轮询刷新' : 'Qoder 官方账号级额度，每分钟刷新'"></span>
             <div class="spacer"></div>
             <span class="muted-xs" x-text="quotaSummary"></span>
           </div>
@@ -56,7 +57,7 @@
             <table>
               <thead><tr><th>额度来源</th><th style="text-align:right">已用 / 总额</th><th style="text-align:right">剩余</th><th style="width:200px">使用率</th><th>状态</th></tr></thead>
               <tbody>
-                <template x-for="p in quotaPoolsList" :key="p.name">
+                <template x-for="(p, idx) in quotaRows" :key="idx">
                   <tr>
                     <td x-text="p.name"></td>
                     <td style="text-align:right" x-text="fmtCredits(p.used) + ' / ' + fmtCredits(p.total)"></td>

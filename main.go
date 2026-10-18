@@ -42,6 +42,7 @@ type bridgeProvider struct {
 	bridgePAT   map[string]string // accountID -> 建桥时的 PAT（变更时重建）
 	bridgeSlots map[string]int    // accountID -> 建桥时的并发槽（面板值变更时重建）
 	rr          uint64            // 轮询计数（atomic 语义，仅持 mu 时访问）
+	refreshRR   int               // 周期额度刷新的轮询计数（仅持 mu 时访问）
 	store       *store.Store
 	switcher    *autoSwitcher // nil in tests that build a provider directly
 	// snapshots are the in-memory quota snapshots maintained by passive
@@ -126,9 +127,10 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 	}
 	now := time.Now().Unix()
 	type candidate struct {
-		id   string
-		pat  string
-		note string
+		id     string
+		pat    string
+		note   string
+		region string
 	}
 	var cands []candidate
 	for _, acc := range p.store.ListAccounts() {
@@ -148,7 +150,7 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 				continue
 			}
 		}
-		cands = append(cands, candidate{acc.ID, acc.PAT, accountDisplayName(acc)})
+		cands = append(cands, candidate{acc.ID, acc.PAT, accountDisplayName(acc), acc.Region})
 	}
 	if len(cands) == 0 {
 		return nil
@@ -157,7 +159,7 @@ func (p *bridgeProvider) pickBridge() *bridge.ResolvedBridge {
 	p.rr++
 	c := cands[p.rr%uint64(len(cands))]
 	p.mu.Unlock()
-	b := p.bridgeFor(c.id, c.pat)
+	b := p.bridgeFor(c.id, c.pat, auth.RegionFor(c.region))
 	return &bridge.ResolvedBridge{Bridge: b, AccountID: c.id, AccountNote: c.note}
 }
 
@@ -171,9 +173,9 @@ func accountDisplayName(acc store.Account) string {
 }
 
 // bridgeFor returns the cached bridge for a specific pool account, building it
-// on first use — or rebuilding when the account's PAT or the panel-configured
-// concurrency window changed.
-func (p *bridgeProvider) bridgeFor(id, pat string) *bridge.OpenAiBridge {
+// on first use — or rebuilding when the account's PAT, region, or the
+// panel-configured concurrency window changed.
+func (p *bridgeProvider) bridgeFor(id, pat string, region *auth.RegionConfig) *bridge.OpenAiBridge {
 	n := p.maxConcurrency()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -188,9 +190,8 @@ func (p *bridgeProvider) bridgeFor(id, pat string) *bridge.OpenAiBridge {
 		p.bridgeSlots = map[string]int{}
 	}
 	b := p.bridges[id]
-	if b == nil || p.bridgePAT[id] != pat || p.bridgeSlots[id] != n {
-		realPAT, region := auth.Resolve(pat)
-		b = bridge.NewOpenAiBridgeWithConcurrency(realPAT, region, n)
+	if b == nil || p.bridgePAT[id] != pat || p.bridgeSlots[id] != n || b.Region.Name != region.Name {
+		b = bridge.NewOpenAiBridgeWithConcurrency(pat, region, n)
 		p.bridges[id] = b
 		p.bridgePAT[id] = pat
 		p.bridgeSlots[id] = n
@@ -206,6 +207,32 @@ func (p *bridgeProvider) maxConcurrency() int {
 		return v
 	}
 	return bridge.MaxConcurrencyFromEnv()
+}
+
+// refreshNextPoolAccount 在负载均衡开启时，按轮询刷新一个非主账号的额度快照。
+// 由账号刷新循环每个周期调用一次，池内所有账号都能周期性拿到权威额度数据。
+// 跳过停用与最近一次检测失败的账号（后者的 PAT 大概率已失效，不浪费上游调用）。
+func (p *bridgeProvider) refreshNextPoolAccount(ctx context.Context) {
+	accounts := p.store.ListAccounts()
+	activeID := p.store.GetActiveAccountID()
+	p.mu.Lock()
+	p.refreshRR++
+	idx := int(p.refreshRR) % len(accounts)
+	p.mu.Unlock()
+	for off := 0; off < len(accounts); off++ {
+		acc := accounts[(idx+off)%len(accounts)]
+		if acc.ID == activeID || acc.PAT == "" || acc.Disabled {
+			continue
+		}
+		if acc.Snapshot != nil && acc.Snapshot.LastError != "" {
+			continue
+		}
+		b := p.bridgeFor(acc.ID, acc.PAT, auth.RegionFor(acc.Region))
+		if st := b.EnsureAccountStatus(ctx); st != nil {
+			p.applyQuotaToSnapshot(acc.ID, st)
+		}
+		return
+	}
 }
 
 // cooldownAccount marks an account unusable until failureCooldown so the
@@ -803,6 +830,12 @@ func main() {
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				applyAccount(ctx)
+				// 负载均衡开启时，每个周期额外轮询刷新一个非主账号的额度
+				// 快照：池内所有账号的「额度明细」都能周期性拿到权威数据，
+				// 而不是只有主账号（其余账号依赖被动扣减）。
+				if provider.store.GetLoadBalance().Enabled {
+					provider.refreshNextPoolAccount(ctx)
+				}
 				cancel()
 			case <-accountStop:
 				return
@@ -823,7 +856,7 @@ func main() {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			b := provider.bridgeFor(acc.ID, acc.PAT)
+			b := provider.bridgeFor(acc.ID, acc.PAT, auth.RegionFor(acc.Region))
 			if acct := b.EnsureAccountStatus(ctx); acct != nil {
 				provider.applyQuotaToSnapshot(acc.ID, acct)
 			}
@@ -838,9 +871,8 @@ func main() {
 	// and returns the authoritative quota snapshot; the admin layer only owns
 	// the endpoint. On-demand only — every check costs a session round-trip.
 	// The result also seeds the auto-switch snapshot for that account.
-	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
-		realPAT, region := auth.Resolve(pat)
-		b := bridge.NewOpenAiBridge(realPAT, region)
+	adminInst.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
+		b := bridge.NewOpenAiBridgeWithConcurrency(pat, auth.RegionFor(region), provider.maxConcurrency())
 		acct := b.EnsureAccountStatus(ctx)
 		if acct == nil {
 			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")

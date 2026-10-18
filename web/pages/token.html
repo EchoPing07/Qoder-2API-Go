@@ -34,6 +34,7 @@
                         <span class="badge badge-ok" x-show="acc.active && !acc.disabled && loadBalance.enabled">主账号</span>
                         <span class="badge badge-muted" x-show="!acc.active && !acc.disabled && loadBalance.enabled">分流中</span>
                         <span class="badge badge-muted" x-show="acc.disabled">已停用</span>
+                        <span class="badge badge-muted" x-show="acc.region" x-text="acc.region === 'cn' ? '国内区' : '国际区'"></span>
                       </div>
                     </td>
                     <td x-text="acc.note || '—'"></td>
@@ -44,6 +45,7 @@
                       <div class="row" style="gap:2px;flex-wrap:nowrap;justify-content:flex-end">
                         <button class="btn btn-ghost btn-sm" x-show="!acc.active" @click="switchAccount(acc)">切换</button>
                         <button class="btn btn-ghost btn-sm" @click="toggleAccountEnabled(acc)" x-text="acc.disabled ? '启用' : '停用'"></button>
+                        <button class="btn btn-ghost btn-sm" @click="toggleAccountRegion(acc)" x-text="acc.region ? '区域:'+(acc.region==='cn'?'国内':'国际') : '区域'"></button>
                         <button class="btn btn-ghost btn-sm" @click="checkAccount(acc)" :disabled="checkingId===acc.id">
                           <span class="spin" x-show="checkingId===acc.id"></span>
                           <span x-show="checkingId!==acc.id">检测</span>
@@ -125,6 +127,13 @@
         <div class="modal-title">添加账号</div>
         <p class="modal-msg">填入 Qoder 个人访问令牌（PAT）。令牌相同时视为切换到已有账号。</p>
         <div class="form-row"><label class="label">令牌</label><input class="input mono" x-model="accountForm.pat" placeholder="pt-..." autocomplete="off"></div>
+        <div class="form-row"><label class="label">区域（两区 PAT 不通用）</label>
+          <select class="select" x-model="accountForm.region">
+            <option value="">跟随全局默认</option>
+            <option value="intl">国际区（qoder.sh）</option>
+            <option value="cn">国内区（qoder.com.cn）</option>
+          </select>
+        </div>
         <div class="form-row"><label class="label">备注</label><input class="input" x-model="accountForm.note" placeholder="可选描述" autocomplete="off"></div>
         <div class="modal-foot">
           <button type="button" class="btn btn-secondary btn-sm" @click="accountModal=false">取消</button>

@@ -88,12 +88,46 @@ PAGE('stats', {
     const statusKind = pool.available && remaining > 0 ? 'badge-ok' : (pool.available ? 'badge-err' : 'badge-muted');
     return Object.assign(pool, { used, total, remaining, ratio, statusText, statusKind });
   },
+  /* ── 多账号（负载均衡）视角：按账号逐行展示池内额度 ──
+   * 数据来自各账号的额度快照（被动扣减 + 周期权威刷新）。主账号排最前，
+   * 检测失败/停用的账号也列出但标注状态——它们不参与分流。 */
+  get poolAccountRows(){
+    const list = (this.stats||{}).pool_accounts || [];
+    return list.map(function(a){
+      const s = a.snapshot || {};
+      const failed = !!s.last_error;
+      const total = Number(s.total || 0);
+      const remaining = Number(s.remaining || 0);
+      const used = total > 0 ? total - remaining : 0;
+      const ratio = total > 0 ? Math.min(Math.max(used / total, 0), 1) : 0;
+      let statusText = '可用', statusKind = 'badge-ok';
+      if (a.disabled) { statusText = '已停用'; statusKind = 'badge-muted'; }
+      else if (failed) { statusText = '检测失败'; statusKind = 'badge-err'; }
+      else if (s.is_exceeded || (total > 0 && remaining <= 0)) { statusText = '已耗尽'; statusKind = 'badge-err'; }
+      return {
+        name: (a.active ? '主账号 · ' : '') + (a.note || a.pat_masked) + (a.disabled ? '（停用）' : ''),
+        used, total, remaining, ratio, statusText, statusKind,
+        available: !a.disabled && !failed && !s.is_exceeded && remaining > 0,
+      };
+    });
+  },
+  /* 负载均衡开关：开启且池内多于一个账号时，「额度明细」切换为按账号逐行。 */
+  get lbEnabled(){
+    return ((this.stats||{}).load_balance || {}).enabled === true;
+  },
+  /* 额度明细行：负载均衡开启且池内多账号时按账号逐行；
+   * 关闭（或单账号）时保持原有的按额度池逐行。 */
+  get quotaRows(){
+    const poolRows = this.poolAccountRows;
+    if (this.lbEnabled && poolRows.length > 1) return poolRows;
+    return this.quotaPoolsList;
+  },
   /* 合计剩余只累计可花费的额度：不可用池仍有明细行（标 不可用），
    * 但把它的剩余加进合计会与该行自相矛盾。 */
   get quotaSummary(){
     let totalRemaining = 0;
-    this.quotaPoolsList.forEach(function(pool){
-      if (pool.available) totalRemaining += pool.remaining;
+    this.quotaRows.forEach(function(row){
+      if (row.available) totalRemaining += row.remaining;
     });
     const resetMs = Number((this.stats||{}).next_reset_ms || 0);
     return '合计剩余 ' + this.fmtCredits(totalRemaining) +
@@ -111,7 +145,13 @@ PAGE('stats', {
     const resetMs = Number(d.next_reset_ms || 0);
     const pools = this.quotaPoolsList;
     let text;
-    if (pools.length > 0) {
+    const acctRows = this.poolAccountRows;
+    if (this.lbEnabled && acctRows.length > 1) {
+      // 多账号（负载均衡）：主账号一个人的池子不再代表全貌，改报全池合计。
+      let sum = 0;
+      acctRows.forEach(function(r){ if (r.available) sum += r.remaining; });
+      text = '全池合计剩余 ' + this.fmtCredits(sum);
+    } else if (pools.length > 0) {
       // The headline describes the pool that actually carries the allowance.
       // Naming it explicitly keeps a free account (whose budget lives in the
       // add-on pool) from reading as the plan pool being exhausted.

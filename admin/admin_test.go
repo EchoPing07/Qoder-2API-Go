@@ -1013,7 +1013,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 	a, s := newAdmin(t)
 	acc, _ := s.AddAccount("pt-check", "")
 	calls := 0
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		calls++
 		if pat != "pt-check" {
 			t.Errorf("checker pat = %q", pat)
@@ -1032,7 +1032,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 		t.Errorf("snapshot not persisted: %+v", snap)
 	}
 	// checker 失败：502 且 LastError 记入快照
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		return nil, errors.New("会话失败")
 	})
 	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})

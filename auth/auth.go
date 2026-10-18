@@ -65,6 +65,20 @@ func Resolve(pat string) (string, *RegionConfig) {
 	}
 }
 
+// RegionFor 解析单个账号的区域：账号显式指定（"cn" / "intl"）优先，
+// 未指定时回退全局默认（QODER_REGION，默认 intl）。两区 PAT 不通用，
+// 混合账号池必须逐账号携带自己的区域。
+func RegionFor(accountRegion string) *RegionConfig {
+	switch strings.ToLower(strings.TrimSpace(accountRegion)) {
+	case "cn":
+		return CN
+	case "intl":
+		return INTL
+	}
+	_, region := Resolve("")
+	return region
+}
+
 func AuthURL(region *RegionConfig, path string) string {
 	return region.AuthBase + path
 }

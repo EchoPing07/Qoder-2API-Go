@@ -13,10 +13,10 @@ PAGE('token', {
     if(!pat){ this.toast('令牌不能为空','err'); return; }
     this.busy(async()=>{
       await this.api('/admin/api/accounts',{method:'POST',body:JSON.stringify({
-        pat, note:(this.accountForm.note||'').trim() })});
+        pat, note:(this.accountForm.note||'').trim(), region:(this.accountForm.region||'').trim() })});
       this.toast('账号已添加','ok');
       this.accountModal = false;
-      this.accountForm = {pat:'',note:''};
+      this.accountForm = {pat:'',note:'',region:''};
       this.loadAccounts(); this.loadPAT();
     })();
   },
@@ -76,6 +76,20 @@ PAGE('token', {
       }
       this.toast(`全部检测完成：成功 ${ok}，失败 ${fail}`, fail ? 'err' : 'ok');
     } finally { this.bulkChecking = false; this.loadAccounts(); }
+  },
+
+  /* ── 区域切换：两区 PAT 不通用，逐账号指定上游区域 ── */
+  toggleAccountRegion(acc){
+    const to = acc.region === 'cn' ? 'intl' : 'cn';
+    const label = to === 'cn' ? '国内区（qoder.com.cn）' : '国际区（qoder.sh）';
+    this.askConfirm('切换账号区域', '将「'+(acc.note||acc.pat_masked)+'」的上游区域切换为 '+label+'。注意：两区 PAT 不通用，切错区域会导致检测失败。', ()=>{
+      this.busy(async()=>{
+        await this.api('/admin/api/accounts/region',{method:'POST',body:JSON.stringify({
+          id: acc.id, region: to })});
+        this.toast('区域已切换为 '+label,'ok');
+        this.loadAccounts();
+      })();
+    }, {okText:'切换区域', danger:false});
   },
 
   /* ── 启用/停用：停用的账号不参与负载均衡，也不是自动切换候选 ── */

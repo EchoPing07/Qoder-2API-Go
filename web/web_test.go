@@ -715,13 +715,13 @@ func TestQuotaSourceSelectionIgnoresEmptyPools(t *testing.T) {
 func TestQuotaSummaryOnlyCountsAvailablePools(t *testing.T) {
 	src := statsPageJS(t)
 
-	guard := "if (pool.available) totalRemaining += pool.remaining;"
+	guard := "if (row.available) totalRemaining += row.remaining;"
 	if !strings.Contains(src, guard) {
 		t.Errorf("合计剩余只累计可花费的额度；缺少守卫 %q", guard)
 	}
 	// Any other accumulation must carry the same availability guard.
 	for _, line := range strings.Split(src, "\n") {
-		if strings.Contains(line, "totalRemaining += ") && !strings.Contains(line, "pool.available") {
+		if strings.Contains(line, "totalRemaining += ") && !strings.Contains(line, "available") {
 			t.Errorf("totalRemaining 未带可用性守卫即累计：%q", strings.TrimSpace(line))
 		}
 	}

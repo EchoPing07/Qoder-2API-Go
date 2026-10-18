@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,6 +77,33 @@ type Account struct {
 	// Disabled 为 true 时该账号不参与负载均衡，也不是自动切换的候选
 	//（旧配置缺省该字段视为启用）。
 	Disabled bool `json:"disabled,omitempty"`
+	// Region 是该账号的上游区域（"cn" / "intl"）；空表示跟随全局默认。
+	// 两区 PAT 不通用，混布时必须逐账号指定。
+	Region string `json:"region,omitempty"`
+}
+
+// SetAccountRegion validates and persists a pool account's upstream region
+// ("cn" / "intl"；空串跟随全局默认). Takes effect lazily as the account's
+// bridge is rebuilt on the next request.
+func (s *Store) SetAccountRegion(id, region string) error {
+	r := strings.ToLower(strings.TrimSpace(region))
+	if r != "" && r != "cn" && r != "intl" {
+		return fmt.Errorf("区域仅支持 cn / intl")
+	}
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Region = r
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
 }
 
 // AccountSnapshot is the per-account quota snapshot from the authoritative

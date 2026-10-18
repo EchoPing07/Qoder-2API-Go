@@ -62,7 +62,7 @@ function appShell(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
     pat:{masked:'',input:''},
-    accounts:[], accountModal:false, accountForm:{pat:'',note:''},
+    accounts:[], accountModal:false, accountForm:{pat:'',note:'',region:''},
     noteModal:false, noteForm:{id:'',note:''}, checkingId:'', bulkChecking:false,
     autoSwitch:{enabled:false, threshold:20},
     loadBalance:{enabled:false, threshold:5, max_concurrency:0},

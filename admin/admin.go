@@ -33,7 +33,7 @@ const adminMaxBody = 1 << 16 // 64 KiB
 // AccountChecker probes one PAT's real allowance through a throwaway bridge
 // (full session bootstrap) and returns the quota snapshot. Implemented by the
 // caller (main package) — the admin package stays free of bridge wiring.
-type AccountChecker func(ctx context.Context, pat string) (*store.AccountSnapshot, error)
+type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
 
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
@@ -88,6 +88,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
 	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
 	mux.HandleFunc("/admin/api/accounts/enabled", a.requireAuth(a.handleAccountEnabled))
+	mux.HandleFunc("/admin/api/accounts/region", a.requireAuth(a.handleAccountRegion))
 	mux.HandleFunc("/admin/api/loadbalance", a.requireAuth(a.handleLoadBalance))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
@@ -656,6 +657,7 @@ type accountView struct {
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
 	Disabled  bool                   `json:"disabled"`
+	Region    string                 `json:"region"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
 }
 
@@ -671,6 +673,7 @@ func accountViews(accounts []store.Account, activeID string) []accountView {
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
 			Disabled:  acc.Disabled,
+			Region:    acc.Region,
 			Snapshot:  acc.Snapshot,
 		})
 	}
@@ -687,8 +690,9 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
 	case http.MethodPost:
 		var body struct {
-			PAT  string `json:"pat"`
-			Note string `json:"note"`
+			PAT    string `json:"pat"`
+			Note   string `json:"note"`
+			Region string `json:"region"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -702,6 +706,9 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
+		}
+		if body.Region != "" {
+			_ = a.store.SetAccountRegion(entry.ID, body.Region)
 		}
 		writeJSON(w, 201, entry)
 	case http.MethodDelete:
@@ -825,7 +832,7 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 503, "检测功能不可用")
 		return
 	}
-	snap, err := a.accountChecker(r.Context(), target.PAT)
+	snap, err := a.accountChecker(r.Context(), target.PAT, target.Region)
 	if err != nil {
 		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
 		writeJSONError(w, 502, "检测失败: "+err.Error())
@@ -880,6 +887,29 @@ func (a *Admin) handleAccountEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.SetAccountEnabled(body.ID, body.Disabled); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountRegion serves POST /admin/api/accounts/region: sets a pool
+// account's upstream region ("cn" / "intl" / "" = follow the global default).
+// 两区 PAT 不通用，混合账号池必须逐账号指定。
+func (a *Admin) handleAccountRegion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID     string `json:"id"`
+		Region string `json:"region"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.SetAccountRegion(body.ID, body.Region); err != nil {
 		writeJSONError(w, 400, err.Error())
 		return
 	}
@@ -949,11 +979,25 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 405, "方法不允许")
 		return
 	}
+	var out map[string]interface{}
 	if a.stats == nil {
-		writeJSON(w, 200, stats.Report{})
-		return
+		raw, _ := json.Marshal(stats.Report{})
+		out = map[string]interface{}{}
+		_ = json.Unmarshal(raw, &out)
+	} else {
+		raw, err := json.Marshal(a.stats.Report())
+		if err != nil {
+			writeJSONError(w, 500, err.Error())
+			return
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			writeJSONError(w, 500, err.Error())
+			return
+		}
 	}
-	writeJSON(w, 200, a.stats.Report())
+	out["pool_accounts"] = accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())
+	out["load_balance"] = a.store.GetLoadBalance()
+	writeJSON(w, 200, out)
 }
 
 // --- Logs endpoint ---
