@@ -448,6 +448,11 @@ func (p *bridgeProvider) handleChatFailover(failedAccountID string, req bridge.R
 		excluded = map[string]bool{}
 	}
 	excluded[failedAccountID] = true
+	// excluded holds every account this request already tried, so the configured
+	// retry budget caps how many accounts one chat request may consume.
+	if len(excluded) >= p.store.GetAutoSwitch().MaxRetryAccounts {
+		return nil
+	}
 	key, ok := p.store.LookupKey(req.APIKey)
 	if !ok {
 		return nil

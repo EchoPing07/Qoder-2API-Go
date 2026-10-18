@@ -105,10 +105,10 @@ func filterRegion(accounts []store.Account, region string) []store.Account {
 }
 
 // usable reports whether acc may receive a new request: not excluded, not
-// cooling down, not hard-exhausted, and — when auto-switch is enabled — not
-// below the credit threshold. Saturation is checked separately so the router
-// can still queue onto a busy account rather than fail.
-func (r *router) usable(acc store.Account, exclude map[string]bool, cfg store.AutoSwitch, now time.Time) bool {
+// cooling down, not hard-exhausted, and — when auto-switch is enabled and
+// applyThreshold is set — not below the credit threshold. Saturation is checked
+// separately so the router can still queue onto a busy account rather than fail.
+func (r *router) usable(acc store.Account, exclude map[string]bool, cfg store.AutoSwitch, now time.Time, applyThreshold bool) bool {
 	if exclude[acc.ID] {
 		return false
 	}
@@ -122,7 +122,7 @@ func (r *router) usable(acc store.Account, exclude map[string]bool, cfg store.Au
 	if snap.IsExceeded {
 		return false
 	}
-	if cfg.Enabled && snap.Total > 0 && snap.Remaining <= cfg.Threshold {
+	if applyThreshold && cfg.Enabled && snap.Total > 0 && snap.Remaining <= cfg.Threshold {
 		return false
 	}
 	return true
@@ -180,9 +180,29 @@ func (r *router) pick(apiKeyID, bareModel, seed string, filter models.RegionFilt
 	now := time.Now()
 
 	candidates := make([]store.Account, 0, len(base))
+	eligible := 0
 	for _, acc := range base {
-		if r.usable(acc, exclude, cfg, now) {
+		if exclude[acc.ID] {
+			continue
+		}
+		eligible++
+		if r.usable(acc, exclude, cfg, now, true) {
 			candidates = append(candidates, acc)
+		}
+	}
+	// A pool where every remaining account sits below the credit threshold keeps
+	// serving on those accounts instead of failing the request; the relaxation
+	// applies only when the threshold is the sole reason nothing was usable, so
+	// cooling or exhausted accounts still yield no route.
+	if len(candidates) == 0 && eligible > 0 {
+		relaxed := make([]store.Account, 0, eligible)
+		for _, acc := range base {
+			if r.usable(acc, exclude, cfg, now, false) {
+				relaxed = append(relaxed, acc)
+			}
+		}
+		if len(relaxed) == eligible {
+			candidates = relaxed
 		}
 	}
 	candidates = r.supportsModel(candidates, bareModel)
