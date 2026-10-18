@@ -59,6 +59,9 @@ type Config struct {
 	Accounts        []Account  `json:"accounts,omitempty"`
 	ActiveAccountID string     `json:"active_account_id,omitempty"`
 	AutoSwitch      AutoSwitch `json:"auto_switch"`
+	// CheckinTime is the default daily check-in time ("HH:MM", local server
+	// time). Accounts may override it with their own CheckinTime.
+	CheckinTime string `json:"checkin_time,omitempty"`
 }
 
 // Account is one Qoder PAT in the multi-account pool. Snapshot is nil until
@@ -78,6 +81,17 @@ type Account struct {
 	Weight    int              `json:"weight,omitempty"`
 	CreatedAt int64            `json:"created_at"`
 	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
+	// AutoCheckin enables the daily automatic check-in for this account.
+	AutoCheckin bool `json:"auto_checkin,omitempty"`
+	// CheckinTime is this account's daily check-in time ("HH:MM", local server
+	// time). Empty falls back to the global Config.CheckinTime default.
+	CheckinTime string `json:"checkin_time,omitempty"`
+	// LastCheckinAt/Status/Msg record the most recent check-in result (epoch
+	// seconds). Status mirrors the auth.CheckinResult status ("success",
+	// "already", "skipped") or "error" on failure.
+	LastCheckinAt     int64  `json:"last_checkin_at,omitempty"`
+	LastCheckinStatus string `json:"last_checkin_status,omitempty"`
+	LastCheckinMsg    string `json:"last_checkin_msg,omitempty"`
 }
 
 // DefaultAccountWeight is the weight assumed when an account carries none.
@@ -86,6 +100,17 @@ const DefaultAccountWeight = 1
 // MaxAccountWeight bounds the per-account weight (the smooth weighted
 // round-robin arithmetic stays well within int range).
 const MaxAccountWeight = 100
+
+// DefaultCheckinTime is the default daily check-in time (local server time).
+const DefaultCheckinTime = "10:15"
+
+// ValidateCheckinTime checks that s is a valid "HH:MM" wall-clock time.
+func ValidateCheckinTime(s string) error {
+	if _, err := time.Parse("15:04", strings.TrimSpace(s)); err != nil {
+		return fmt.Errorf("签到时间格式应为 HH:MM")
+	}
+	return nil
+}
 
 // AccountWeight returns the effective weight (>=1) for routing.
 func AccountWeight(acc Account) int {
@@ -329,6 +354,10 @@ func (s *Store) load() error {
 	}
 	if cfg.AutoSwitch.Threshold <= 0 {
 		cfg.AutoSwitch.Threshold = DefaultAutoSwitchThreshold
+		needsSave = true
+	}
+	if strings.TrimSpace(cfg.CheckinTime) == "" {
+		cfg.CheckinTime = DefaultCheckinTime
 		needsSave = true
 	}
 	if cfg.AutoSwitch.Strategy == "" {
@@ -715,6 +744,75 @@ func (s *Store) SetAccountWeight(id string, weight int) error {
 	if !found {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	return s.save()
+}
+
+// UpdateAccountCheckin sets one account's automatic check-in flag and its
+// per-account check-in time override ("" = use the global default).
+func (s *Store) UpdateAccountCheckin(id string, auto bool, checkinTime string) error {
+	checkinTime = strings.TrimSpace(checkinTime)
+	if checkinTime != "" {
+		if err := ValidateCheckinTime(checkinTime); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].AutoCheckin = auto
+			s.config.Accounts[i].CheckinTime = checkinTime
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// RecordCheckin stores the most recent check-in result on one account.
+func (s *Store) RecordCheckin(id, status, msg string, at time.Time) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].LastCheckinAt = at.Unix()
+			s.config.Accounts[i].LastCheckinStatus = status
+			s.config.Accounts[i].LastCheckinMsg = msg
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// GetCheckinTime returns the global default check-in time (HH:MM), falling
+// back to DefaultCheckinTime when unset.
+func (s *Store) GetCheckinTime() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if strings.TrimSpace(s.config.CheckinTime) == "" {
+		return DefaultCheckinTime
+	}
+	return s.config.CheckinTime
+}
+
+// SetCheckinTime validates and persists the global default check-in time.
+func (s *Store) SetCheckinTime(v string) error {
+	v = strings.TrimSpace(v)
+	if err := ValidateCheckinTime(v); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.config.CheckinTime = v
+	s.mu.Unlock()
 	return s.save()
 }
 

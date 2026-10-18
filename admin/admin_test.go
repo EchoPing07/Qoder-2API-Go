@@ -879,7 +879,68 @@ func TestConfigLogLimitsEnvPinned(t *testing.T) {
 
 // -- Accounts --
 
-// TestAccountsCRUDFlow 添加（首个自动激活）→ 列表（掩码回显）→ 切换 → 删除守卫的完整链路。
+// TestAccountCheckinHandlers covers the manual check-in endpoint and the
+// per-account check-in setting endpoint.
+func TestAccountCheckinHandlers(t *testing.T) {
+	a, s := newAdmin(t)
+	entry, err := s.AddAccountWithRegion("pt-checkin-12345678", "签到账号", "")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	// Without a wired checkiner the endpoint reports unavailable.
+	w := doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": entry.ID})
+	if w.Code != 503 {
+		t.Fatalf("expected 503 without checkiner, got %d", w.Code)
+	}
+
+	// Wire a fake checkiner.
+	a.SetAccountCheckiner(func(ctx context.Context, id string) (auth.CheckinResult, error) {
+		if id != entry.ID {
+			t.Errorf("checkiner got id %q, want %q", id, entry.ID)
+		}
+		return auth.CheckinResult{Status: "success", Message: "签到成功 +5 积分", RewardCredits: 5}, nil
+	})
+	w = doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": entry.ID})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var res struct {
+		Status        string  `json:"status"`
+		RewardCredits float64 `json:"reward_credits"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "success" || res.RewardCredits != 5 {
+		t.Errorf("unexpected checkin result: %+v", res)
+	}
+
+	// Unknown account -> 404.
+	w = doRequest(t, a.handleAccountCheckin, "POST", "/admin/api/accounts/checkin", map[string]string{"id": "nope"})
+	if w.Code != 404 {
+		t.Errorf("expected 404 for unknown account, got %d", w.Code)
+	}
+
+	// Setting endpoint: enable auto + valid time.
+	w = doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "08:30"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	acc, _ := s.GetAccount(entry.ID)
+	if !acc.AutoCheckin || acc.CheckinTime != "08:30" {
+		t.Errorf("setting not persisted: auto=%v time=%q", acc.AutoCheckin, acc.CheckinTime)
+	}
+
+	// Invalid time -> 400.
+	w = doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "25:99"})
+	if w.Code != 400 {
+		t.Errorf("expected 400 for invalid time, got %d", w.Code)
+	}
+}
+
 func TestAccountsCRUDFlow(t *testing.T) {
 	a, s := newAdmin(t)
 	// 首个账号：创建即激活
@@ -1214,5 +1275,41 @@ func TestAccountWeightEndpoint(t *testing.T) {
 	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
 	if !strings.Contains(w.Body.String(), `"weight":7`) {
 		t.Errorf("account list missing weight: %s", w.Body.String())
+	}
+}
+
+// Global accounts can arm automatic check-in (both regions are supported now).
+func TestAccountCheckinSettingAllowsGlobal(t *testing.T) {
+	a, s := newAdmin(t)
+	entry, err := s.AddAccountWithRegion("pt-global-12345678", "国际", "global")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	w := doRequest(t, a.handleAccountCheckinSetting, "POST", "/admin/api/accounts/checkin-setting", map[string]interface{}{
+		"id": entry.ID, "auto_checkin": true, "checkin_time": "09:00"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200 for global auto check-in, got %d: %s", w.Code, w.Body.String())
+	}
+	acc, _ := s.GetAccount(entry.ID)
+	if !acc.AutoCheckin || acc.CheckinTime != "09:00" {
+		t.Errorf("global checkin setting not persisted: %+v", acc)
+	}
+}
+
+// The account list marks every region as check-in supported.
+func TestAccountViewsCheckinSupported(t *testing.T) {
+	s := tempStore(t)
+	cn, _ := s.AddAccountWithRegion("pt-cn-12345678", "cn", "cn")
+	gl, _ := s.AddAccountWithRegion("pt-gl-12345678", "gl", "global")
+	views := accountViews(s.ListAccounts(), "", nil)
+	byID := map[string]accountView{}
+	for _, v := range views {
+		byID[v.ID] = v
+	}
+	if !byID[cn.ID].CheckinSupported {
+		t.Error("CN account must be checkin_supported")
+	}
+	if !byID[gl.ID].CheckinSupported {
+		t.Error("global account must be checkin_supported")
 	}
 }

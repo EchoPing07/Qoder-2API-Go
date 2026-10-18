@@ -13,6 +13,7 @@ PAGE('settings', {
         idle_timeout_seconds: r.idle_timeout_seconds || '',
         log_retention_days: r.log_retention_days || '',
         log_max_entries: r.log_max_entries || '',
+        checkin_time: r.checkin_time || '',
       };
     }catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示
   },
@@ -52,6 +53,13 @@ PAGE('settings', {
         const lm = parseInt(lmRaw, 10);
         if(!lm || lm < 100 || lm > 100000){ this.toast('日志条数上限需在 100-100000 之间','err'); return; }
         body.log_max_entries = lm;
+      }
+      /* 签到时间：HH:MM，留空 = 不下发（保持当前值）。 */
+      const ckRaw = c.checkin_time;
+      if(ckRaw !== null && ckRaw !== undefined && String(ckRaw).trim() !== ''){
+        const ck = String(ckRaw).trim();
+        if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(ck)){ this.toast('签到时间格式应为 HH:MM','err'); return; }
+        body.checkin_time = ck;
       }
       const r = await this.api('/admin/api/config',{method:'POST',body:JSON.stringify(body)});
       this.toast('配置已保存（超时配置即时生效）');

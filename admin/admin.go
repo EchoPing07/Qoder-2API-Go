@@ -41,17 +41,23 @@ type AccountChecker func(ctx context.Context, pat, region string) (*store.Accoun
 // the process started. May be nil.
 type AccountRuntime func(accountID string) (inFlight, capacity int, requests int64)
 
+// AccountCheckiner runs a single daily check-in for one account and returns the
+// result. Implemented by the caller (main package) so admin stays free of
+// bridge wiring. May be nil.
+type AccountCheckiner func(ctx context.Context, accountID string) (auth.CheckinResult, error)
+
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
-	store          *store.Store
-	modelFetcher   ModelFetcher
-	stats          *stats.Recorder
-	logRec         *logs.Recorder
-	accountChecker AccountChecker
-	accountRuntime AccountRuntime
-	sessions       map[string]time.Time
-	sessionMu      sync.Mutex
-	limiter        *loginLimiter
+	store            *store.Store
+	modelFetcher     ModelFetcher
+	stats            *stats.Recorder
+	logRec           *logs.Recorder
+	accountChecker   AccountChecker
+	accountRuntime   AccountRuntime
+	accountCheckiner AccountCheckiner
+	sessions         map[string]time.Time
+	sessionMu        sync.Mutex
+	limiter          *loginLimiter
 }
 
 // ModelFetcher returns the current model catalog (dynamic or fallback).
@@ -81,6 +87,12 @@ func (a *Admin) SetAccountRuntime(fn AccountRuntime) {
 	a.accountRuntime = fn
 }
 
+// SetAccountCheckiner installs the per-account daily check-in runner used by
+// the manual check-in endpoint. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountCheckiner(fn AccountCheckiner) {
+	a.accountCheckiner = fn
+}
+
 // RegisterRoutes registers all admin API routes on the given mux.
 //
 // The WebUI itself is served by the web package (pages under /admin, assets
@@ -100,6 +112,8 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
 	mux.HandleFunc("/admin/api/accounts/weight", a.requireAuth(a.handleAccountWeight))
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
+	mux.HandleFunc("/admin/api/accounts/checkin", a.requireAuth(a.handleAccountCheckin))
+	mux.HandleFunc("/admin/api/accounts/checkin-setting", a.requireAuth(a.handleAccountCheckinSetting))
 	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
@@ -491,6 +505,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
 			"log_retention_days":   retentionDays,
 			"log_max_entries":      maxEntries,
+			"checkin_time":         a.store.GetCheckinTime(),
 		})
 	case http.MethodPost:
 		var body struct {
@@ -500,6 +515,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
 			LogRetentionDays   int    `json:"log_retention_days"`
 			LogMaxEntries      int    `json:"log_max_entries"`
+			CheckinTime        string `json:"checkin_time"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -554,6 +570,15 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Check-in time is optional (empty = keep current). Validate before saving
+		// anything so a bad value cannot leave a partial update.
+		wantsCheckinTime := strings.TrimSpace(body.CheckinTime) != ""
+		if wantsCheckinTime {
+			if err := store.ValidateCheckinTime(body.CheckinTime); err != nil {
+				writeJSONError(w, 400, "签到时间："+err.Error())
+				return
+			}
+		}
 		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
@@ -578,6 +603,12 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.LogMaxEntries != 0 {
 			if err := a.store.SetLogMaxEntries(body.LogMaxEntries); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if wantsCheckinTime {
+			if err := a.store.SetCheckinTime(body.CheckinTime); err != nil {
 				writeJSONError(w, 500, err.Error())
 				return
 			}
@@ -608,6 +639,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
 			"log_retention_days":   retentionDays,
 			"log_max_entries":      maxEntries,
+			"checkin_time":         a.store.GetCheckinTime(),
 			"restart":              "修改主机或端口后需要重启服务才能生效（超时与日志配置已即时生效）",
 		})
 	default:
@@ -673,6 +705,15 @@ type accountView struct {
 	Capacity  int                    `json:"capacity"`
 	Requests  int64                  `json:"requests"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
+	// Daily check-in state.
+	AutoCheckin       bool   `json:"auto_checkin"`
+	CheckinTime       string `json:"checkin_time"`
+	LastCheckinAt     int64  `json:"last_checkin_at"`
+	LastCheckinStatus string `json:"last_checkin_status"`
+	LastCheckinMsg    string `json:"last_checkin_msg"`
+	// CheckinSupported is false for regions where daily check-in is unavailable
+	// (currently global/qoder.sh); the panel hides the controls there.
+	CheckinSupported bool `json:"checkin_supported"`
 }
 
 // accountViews maps the pool to its wire form, marking the active entry.
@@ -689,17 +730,24 @@ func accountViews(accounts []store.Account, activeID string, runtime AccountRunt
 			inflight, capacity, requests = runtime(acc.ID)
 		}
 		out = append(out, accountView{
-			ID:        acc.ID,
-			PATMasked: maskPAT(acc.PAT),
-			Note:      acc.Note,
-			Region:    region,
-			Weight:    store.AccountWeight(acc),
-			CreatedAt: acc.CreatedAt,
-			Active:    acc.ID == activeID,
-			InFlight:  inflight,
-			Capacity:  capacity,
-			Requests:  requests,
-			Snapshot:  acc.Snapshot,
+			ID:                acc.ID,
+			PATMasked:         maskPAT(acc.PAT),
+			Note:              acc.Note,
+			Region:            region,
+			Weight:            store.AccountWeight(acc),
+			CreatedAt:         acc.CreatedAt,
+			Active:            acc.ID == activeID,
+			InFlight:          inflight,
+			Capacity:          capacity,
+			Requests:          requests,
+			Snapshot:          acc.Snapshot,
+			AutoCheckin:       acc.AutoCheckin,
+			CheckinTime:       acc.CheckinTime,
+			LastCheckinAt:     acc.LastCheckinAt,
+			LastCheckinStatus: acc.LastCheckinStatus,
+			LastCheckinMsg:    acc.LastCheckinMsg,
+			// Both CN and global support daily check-in.
+			CheckinSupported: true,
 		})
 	}
 	return out
@@ -883,6 +931,74 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"snapshot": snap})
+}
+
+// handleAccountCheckin serves POST /admin/api/accounts/checkin {id}: runs one
+// daily check-in for the account and returns its result.
+func (a *Admin) handleAccountCheckin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if body.ID == "" {
+		writeJSONError(w, 400, "缺少 id 参数")
+		return
+	}
+	if _, ok := a.store.GetAccount(body.ID); !ok {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	if a.accountCheckiner == nil {
+		writeJSONError(w, 503, "签到功能不可用")
+		return
+	}
+	res, err := a.accountCheckiner(r.Context(), body.ID)
+	if err != nil {
+		writeJSONError(w, 502, "签到失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"status":         res.Status,
+		"message":        res.Message,
+		"reward_credits": res.RewardCredits,
+	})
+}
+
+// handleAccountCheckinSetting serves POST /admin/api/accounts/checkin-setting
+// {id, auto_checkin, checkin_time}: the per-account automatic check-in switch
+// and optional time override.
+func (a *Admin) handleAccountCheckinSetting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID          string `json:"id"`
+		AutoCheckin bool   `json:"auto_checkin"`
+		CheckinTime string `json:"checkin_time"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	acc, ok := a.store.GetAccount(body.ID)
+	if !ok {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	_ = acc // both regions support check-in
+	if err := a.store.UpdateAccountCheckin(body.ID, body.AutoCheckin, body.CheckinTime); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 // handleAutoSwitch serves GET/POST /admin/api/accounts/auto: the automatic

@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"qoder2api/admin"
@@ -58,15 +60,21 @@ type bridgeProvider struct {
 	// process start, shown in the panel so the spread is observable.
 	reqMu     sync.Mutex
 	reqCounts map[string]int64
+
+	// checkinMu guards checkinRunning: accounts with an in-flight check-in, so
+	// the scheduler and a manual trigger cannot run the same account twice.
+	checkinMu      sync.Mutex
+	checkinRunning map[string]bool
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
 	p := &bridgeProvider{
-		store:     st,
-		bridges:   map[string]*bridge.OpenAiBridge{},
-		bridgeSig: map[string]string{},
-		snapshots: map[string]*store.AccountSnapshot{},
-		reqCounts: map[string]int64{},
+		store:          st,
+		bridges:        map[string]*bridge.OpenAiBridge{},
+		bridgeSig:      map[string]string{},
+		snapshots:      map[string]*store.AccountSnapshot{},
+		reqCounts:      map[string]int64{},
+		checkinRunning: map[string]bool{},
 	}
 	p.router = newRouter(routerDeps{
 		accounts:    func() []store.Account { return st.ListAccounts() },
@@ -227,6 +235,130 @@ func (p *bridgeProvider) RequestCount(accountID string) int64 {
 	p.reqMu.Lock()
 	defer p.reqMu.Unlock()
 	return p.reqCounts[accountID]
+}
+
+// --- Daily check-in ---
+
+// tryAcquireCheckin marks an account's check-in as running. Returns false when
+// one is already in flight (manual trigger racing the scheduler, etc.).
+func (p *bridgeProvider) tryAcquireCheckin(accountID string) bool {
+	p.checkinMu.Lock()
+	defer p.checkinMu.Unlock()
+	if p.checkinRunning[accountID] {
+		return false
+	}
+	p.checkinRunning[accountID] = true
+	return true
+}
+
+func (p *bridgeProvider) releaseCheckin(accountID string) {
+	p.checkinMu.Lock()
+	delete(p.checkinRunning, accountID)
+	p.checkinMu.Unlock()
+}
+
+// CheckinAccount runs one manual or scheduled check-in for an account, records
+// the outcome on the account, and returns it. Failures are recorded with status
+// "error" so the panel shows the reason.
+//
+// Both regions are supported: CN uses the COSY securityOauthToken as the Bearer
+// and global uses the OpenAPI token (the bridge picks the right one). Both rely
+// on the genuine desktop fingerprint from the installed Qoder app, without which
+// the campaign service withholds the daily-credit activity.
+func (p *bridgeProvider) CheckinAccount(ctx context.Context, accountID string) (auth.CheckinResult, error) {
+	acc, ok := p.store.GetAccount(accountID)
+	if !ok {
+		return auth.CheckinResult{}, fmt.Errorf("账号不存在: %s", accountID)
+	}
+	b := p.bridgeForAccount(acc)
+	if b == nil {
+		return auth.CheckinResult{}, fmt.Errorf("无法创建账号会话")
+	}
+	result, err := b.Checkin(ctx)
+	if err != nil {
+		_ = p.store.RecordCheckin(accountID, "error", err.Error(), time.Now())
+		return auth.CheckinResult{}, err
+	}
+	_ = p.store.RecordCheckin(accountID, result.Status, result.Message, time.Now())
+	return result, nil
+}
+
+// CheckinRegionSupported reports whether daily check-in is available for the
+// account's region. Both CN and global are supported (global needs the OpenAPI
+// bearer, handled in the bridge).
+func CheckinRegionSupported(region string) bool {
+	return true
+}
+
+// checkinDue reports whether an account is due for its daily automatic
+// check-in at now. Accounts that already succeeded/already/skipped today are
+// not re-run; a previous "error" is retried after a 30-minute gap.
+func checkinDue(acc store.Account, configuredTime string, now time.Time) bool {
+	if !acc.AutoCheckin || acc.PAT == "" {
+		return false
+	}
+	due, ok := checkinSlot(configuredTime, acc.ID, now)
+	if !ok || now.Before(due) {
+		return false
+	}
+	if acc.LastCheckinAt > 0 {
+		last := time.Unix(acc.LastCheckinAt, 0).In(now.Location())
+		sameDay := last.Year() == now.Year() && last.YearDay() == now.YearDay()
+		if sameDay {
+			if acc.LastCheckinStatus != "error" {
+				return false // already done today
+			}
+			if now.Sub(last) < 30*time.Minute {
+				return false // retry cooldown after a failure
+			}
+		}
+	}
+	return true
+}
+
+// checkinSlot resolves a configured "HH:MM" into today's instant, adding a
+// per-account sub-minute jitter so a pool does not stampede the endpoint at the
+// same second. ok is false when the configured time cannot be parsed.
+func checkinSlot(value, accountID string, now time.Time) (time.Time, bool) {
+	parsed, err := time.Parse("15:04", strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, false
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(accountID))
+	return time.Date(now.Year(), now.Month(), now.Day(),
+		parsed.Hour(), parsed.Minute(), int(h.Sum32()%60), 0, now.Location()), true
+}
+
+// runScheduledCheckins launches check-ins for every auto-enabled account whose
+// daily slot has passed. Each run is guarded by checkinRunning and performed in
+// its own goroutine so a slow account does not block the others or the caller.
+func (p *bridgeProvider) runScheduledCheckins(now time.Time) {
+	defaultTime := p.store.GetCheckinTime()
+	for _, acc := range p.store.ListAccounts() {
+		configured := acc.CheckinTime
+		if strings.TrimSpace(configured) == "" {
+			configured = defaultTime
+		}
+		if !checkinDue(acc, configured, now) {
+			continue
+		}
+		if !p.tryAcquireCheckin(acc.ID) {
+			continue
+		}
+		accountID := acc.ID
+		go func() {
+			defer p.releaseCheckin(accountID)
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			res, err := p.CheckinAccount(ctx, accountID)
+			if err != nil {
+				log.Printf("[checkin] %s failed: %v", accountID, err)
+				return
+			}
+			log.Printf("[checkin] %s: %s (%s)", accountID, res.Status, res.Message)
+		}()
+	}
 }
 
 // currentBridge returns the bridge for the active account (used by the account
@@ -727,6 +859,8 @@ func main() {
 				break
 			}
 		}
+		// Kick off any auto check-in that is already due on startup.
+		provider.runScheduledCheckins(time.Now())
 
 		ticker := time.NewTicker(accountRefreshCadence)
 		defer ticker.Stop()
@@ -734,6 +868,9 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
+				// Daily automatic check-ins ride the same once-a-minute cadence;
+				// due accounts run in their own goroutines (see runScheduledCheckins).
+				provider.runScheduledCheckins(time.Now())
 				list := probeAccounts()
 				if len(list) == 0 {
 					continue
@@ -762,6 +899,15 @@ func main() {
 			}
 		}
 		return inflight, capacity, provider.RequestCount(accountID)
+	})
+	// Account「签到」runs a single check-in for one account (manual trigger from
+	// the panel) and records the result on the account.
+	adminInst.SetAccountCheckiner(func(ctx context.Context, accountID string) (auth.CheckinResult, error) {
+		if !provider.tryAcquireCheckin(accountID) {
+			return auth.CheckinResult{}, fmt.Errorf("该账号正在签到中，请稍候")
+		}
+		defer provider.releaseCheckin(accountID)
+		return provider.CheckinAccount(ctx, accountID)
 	})
 	// Account「检测」runs a throwaway bridge through a full session bootstrap
 	// and returns the authoritative quota snapshot; the admin layer only owns

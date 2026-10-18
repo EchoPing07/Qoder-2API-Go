@@ -2,6 +2,10 @@
 PAGE('token', {
   realtime: true,
 
+  /* ── 签到状态 ── */
+  checkingInId: '',
+  defaultCheckinTime: '10:15',
+
   /* ── 账号池 ── */
   async loadAccounts(){
     try{ const r = await this.api('/admin/api/accounts'); this.accounts = r.accounts||[]; }
@@ -72,8 +76,57 @@ PAGE('token', {
     finally{ this.checkingId = ''; }
   },
 
+  /* ── 每日签到 ── */
+  /* 手动签到：调用后端领取今日积分，完成后刷新账号池展示最近结果 */
+  async checkinAccount(acc){
+    this.checkingInId = acc.id;
+    try{
+      const r = await this.api('/admin/api/accounts/checkin',{method:'POST',body:JSON.stringify({id:acc.id})});
+      this.toast(r.message || '签到完成', r.status==='success' ? 'ok' : '');
+      this.loadAccounts();
+    }catch(e){ this.toast(e.message,'err'); this.loadAccounts(); }
+    finally{ this.checkingInId = ''; }
+  },
+  /* 自动签到开关：即时保存 */
+  async toggleAutoCheckin(acc){
+    const next = !acc.auto_checkin;
+    try{
+      await this.api('/admin/api/accounts/checkin-setting',{method:'POST',body:JSON.stringify({
+        id: acc.id, auto_checkin: next, checkin_time: acc.checkin_time || '' })});
+      acc.auto_checkin = next;
+      this.toast(next ? '已开启自动签到' : '已关闭自动签到','ok');
+    }catch(e){ this.toast(e.message,'err'); this.loadAccounts(); }
+  },
+  /* 每账号签到时间：留空 = 使用全局默认；失焦/回车即保存 */
+  async setCheckinTime(acc, ev){
+    const v = String(ev.target.value || '').trim();
+    try{
+      await this.api('/admin/api/accounts/checkin-setting',{method:'POST',body:JSON.stringify({
+        id: acc.id, auto_checkin: !!acc.auto_checkin, checkin_time: v })});
+      acc.checkin_time = v;
+      this.toast('签到时间已更新','ok');
+    }catch(e){ this.toast(e.message,'err'); this.loadAccounts(); }
+  },
+  checkinStatus(acc){
+    switch(acc.last_checkin_status){
+      case 'success': return '签到成功';
+      case 'already': return '今日已签';
+      case 'skipped': return '暂无可签到活动';
+      case 'error':   return '签到失败';
+      default:        return '未签到';
+    }
+  },
+  checkinStatusClass(acc){
+    switch(acc.last_checkin_status){
+      case 'success': return 'badge-ok';
+      case 'already': return 'badge-muted';
+      case 'skipped': return 'badge-muted';
+      case 'error':   return 'badge-err';
+      default:        return 'badge-muted';
+    }
+  },
+
   /* ── 表格展示 ── */
-  /* 剩余额度：快照存在才展示（checked_at 为零说明从未检测过） */
   accountQuota(acc){
     const s = acc.snapshot;
     if(!s || !s.checked_at || s.last_error) return '—';
@@ -131,7 +184,15 @@ PAGE('token', {
     })();
   },
 
+  /* 默认签到时间：用于「留空 = 使用默认」的提示占位 */
+  async loadCheckinDefaults(){
+    try{
+      const r = await this.api('/admin/api/config');
+      if(r.checkin_time) this.defaultCheckinTime = r.checkin_time;
+    }catch(e){ /* 非关键：保留内置默认 */ }
+  },
+
   /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
    * 不参与统计页的定时刷新） ── */
-  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadStats(); },
+  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadStats(); this.loadCheckinDefaults(); },
 });

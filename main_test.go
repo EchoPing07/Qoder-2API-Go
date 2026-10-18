@@ -761,3 +761,94 @@ func TestRouterEqualWeightsEven(t *testing.T) {
 		t.Errorf("equal weights must split evenly: A=%d B=%d", counts[a.ID], counts[b.ID])
 	}
 }
+
+// -- Daily check-in scheduling --
+
+func TestCheckinSlot(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	got, ok := checkinSlot("09:00", "acct-1", now)
+	if !ok {
+		t.Fatal("checkinSlot returned !ok for a valid time")
+	}
+	if got.Hour() != 9 || got.Minute() != 0 || got.Day() != 18 {
+		t.Errorf("unexpected slot: %v", got)
+	}
+	if _, ok := checkinSlot("bad", "acct-1", now); ok {
+		t.Error("checkinSlot accepted an invalid time")
+	}
+}
+
+func TestCheckinDue(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	base := store.Account{ID: "a1", PAT: "p", AutoCheckin: true}
+
+	// Disabled auto check-in is never due.
+	off := base
+	off.AutoCheckin = false
+	if checkinDue(off, "09:00", now) {
+		t.Error("account without AutoCheckin must not be due")
+	}
+	// Before the configured time: not due.
+	if checkinDue(base, "13:00", now) {
+		t.Error("account must not be due before its slot")
+	}
+	// After the slot, never checked: due.
+	if !checkinDue(base, "09:00", now) {
+		t.Error("account must be due after its slot when never checked")
+	}
+	// Already succeeded today: not due.
+	done := base
+	done.LastCheckinAt = time.Date(2026, 10, 18, 9, 1, 0, 0, time.Local).Unix()
+	done.LastCheckinStatus = "success"
+	if checkinDue(done, "09:00", now) {
+		t.Error("account already checked in today must not be due")
+	}
+	// Errored recently: within the 30-minute retry cooldown, not due.
+	errored := base
+	errored.LastCheckinAt = now.Add(-10 * time.Minute).Unix()
+	errored.LastCheckinStatus = "error"
+	if checkinDue(errored, "09:00", now) {
+		t.Error("account in retry cooldown must not be due")
+	}
+	// Errored long ago: due for retry.
+	erroredOld := base
+	erroredOld.LastCheckinAt = now.Add(-1 * time.Hour).Unix()
+	erroredOld.LastCheckinStatus = "error"
+	if !checkinDue(erroredOld, "09:00", now) {
+		t.Error("account past retry cooldown must be due")
+	}
+}
+
+func TestTryAcquireCheckinGuard(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	p := newBridgeProvider(s)
+	if !p.tryAcquireCheckin("a1") {
+		t.Fatal("first acquire should succeed")
+	}
+	if p.tryAcquireCheckin("a1") {
+		t.Error("second concurrent acquire must be rejected")
+	}
+	p.releaseCheckin("a1")
+	if !p.tryAcquireCheckin("a1") {
+		t.Error("acquire after release should succeed")
+	}
+}
+
+func TestCheckinRegionSupported(t *testing.T) {
+	for _, r := range []string{"", "cn", "global"} {
+		if !CheckinRegionSupported(r) {
+			t.Errorf("region %q must be check-in supported", r)
+		}
+	}
+}
+
+func TestCheckinDueIncludesGlobal(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	acc := store.Account{ID: "g1", PAT: "p", Region: "global", AutoCheckin: true}
+	if !checkinDue(acc, "09:00", now) {
+		t.Error("global account with auto check-in must be due after its slot")
+	}
+}

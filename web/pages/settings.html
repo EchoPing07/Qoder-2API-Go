@@ -56,6 +56,15 @@
             </div>
             <p class="field-hint">请求日志仅存元信息，不保存对话内容；超期或超量的最旧日志会被自动删除，两个限制同时生效。保存后立即生效，无需重启；留空表示保持当前值</p>
           </div>
+
+          <div class="card">
+            <div class="card-head"><h3>签到配置</h3></div>
+            <div class="form-row">
+              <label class="label">默认签到时间</label>
+              <input class="input" type="time" x-model="config.checkin_time" placeholder="10:15">
+              <p class="field-hint">开启「自动签到」的账号会在每天此时间自动领取积分（服务器本地时间）。账号页可为单个账号覆盖该时间。保存后立即生效。</p>
+            </div>
+          </div>
           </div>
 
           <div class="space">
