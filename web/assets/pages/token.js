@@ -17,17 +17,8 @@ PAGE('token', {
       this.toast('账号已添加','ok');
       this.accountModal = false;
       this.accountForm = {pat:'',note:'',region:'cn'};
-      this.loadAccounts(); this.loadPAT();
+      this.loadAccounts();
     })();
-  },
-  switchAccount(acc){
-    this.askConfirm('切换账号','切换后 API 桥接将使用该账号的令牌，桥接会话在下次请求时自动重建。', ()=>{
-      this.busy(async()=>{
-        await this.api('/admin/api/accounts/switch',{method:'POST',body:JSON.stringify({id:acc.id})});
-        this.toast('已切换到 '+(acc.note||acc.pat_masked),'ok');
-        this.loadAccounts(); this.loadPAT();
-      })();
-    }, {okText:'切换', danger:false});
   },
   deleteAccount(acc){
     this.askConfirm('删除账号','确定删除此账号？激活中的账号需先切换到其他账号后才能删除。', ()=>{
@@ -38,14 +29,18 @@ PAGE('token', {
     });
   },
   editAccountNote(acc){
-    this.noteForm = {id:acc.id, note:acc.note||''};
+    this.noteForm = {id:acc.id, note:acc.note||'', weight:acc.weight||1};
     this.noteModal = true;
   },
   async saveAccountNote(){
+    const w = Number(this.noteForm.weight);
+    if(!Number.isFinite(w) || w < 1 || w > 100){ this.toast('权重需在 1..100 之间','err'); return; }
     this.busy(async()=>{
       await this.api('/admin/api/accounts/note',{method:'POST',body:JSON.stringify({
         id:this.noteForm.id, note:(this.noteForm.note||'').trim() })});
-      this.toast('备注已保存','ok');
+      await this.api('/admin/api/accounts/weight',{method:'POST',body:JSON.stringify({
+        id:this.noteForm.id, weight:w })});
+      this.toast('账号已更新','ok');
       this.noteModal = false;
       this.loadAccounts();
     })();
@@ -91,14 +86,6 @@ PAGE('token', {
     return 'badge-muted';
   },
 
-  /* ── PAT（旧字段保留：面板底部不再单独展示，数据仍由激活账号镜像） ── */
-  async loadPAT(){
-    try{
-      const r = await this.api('/admin/api/pat');
-      this.pat.masked = r.pat_masked || '';
-    }catch(e){ this.toast(e.message,'err'); }
-  },
-
   /* ── 自动切换设置 ── */
   async loadAutoSwitch(){
     try{
@@ -130,5 +117,5 @@ PAGE('token', {
 
   /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
    * 不参与统计页的定时刷新） ── */
-  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadPAT(); this.loadStats(); },
+  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadStats(); },
 });

@@ -572,20 +572,23 @@ func TestActivateAccountSwitch(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountGuard 删除激活中的账号被拒绝（ErrActiveAccount）；删除其他账号后
-// 激活状态不受影响。
+// TestDeleteAccountGuard 删除激活账号时激活标记顺延到剩余首个账号；删光后清空
+// 激活与 PAT 镜像；未知 id 报错。
 func TestDeleteAccountGuard(t *testing.T) {
 	s := tempStore(t)
 	first, _ := s.AddAccount("pt-a", "")
 	second, _ := s.AddAccount("pt-b", "")
-	if err := s.DeleteAccount(first.ID); !errors.Is(err, ErrActiveAccount) {
-		t.Errorf("deleting active must fail with ErrActiveAccount, got %v", err)
+	if err := s.DeleteAccount(first.ID); err != nil {
+		t.Fatalf("deleting the active account must succeed, got %v", err)
+	}
+	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() != second.ID || s.GetPAT() != "pt-b" {
+		t.Errorf("active must advance to the survivor: active=%q pat=%q", s.GetActiveAccountID(), s.GetPAT())
 	}
 	if err := s.DeleteAccount(second.ID); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
-	if len(s.ListAccounts()) != 1 || s.GetActiveAccountID() != first.ID {
-		t.Error("active account must survive the other's deletion")
+	if len(s.ListAccounts()) != 0 || s.GetActiveAccountID() != "" || s.GetPAT() != "" {
+		t.Errorf("deleting the last account must clear active/pat: active=%q pat=%q", s.GetActiveAccountID(), s.GetPAT())
 	}
 	if err := s.DeleteAccount("nonexistent"); err == nil {
 		t.Error("unknown id must fail")
@@ -779,5 +782,31 @@ func TestAutoSwitchRoutingConfig(t *testing.T) {
 	}
 	if got := s.GetAutoSwitch(); got.Strategy != StrategyLeastInFlight || got.StickyLimit != 5 {
 		t.Errorf("SetAutoSwitch must preserve routing knobs: %+v", got)
+	}
+}
+
+// TestSetAccountWeight 权重校验与持久化。
+func TestSetAccountWeight(t *testing.T) {
+	s := tempStore(t)
+	acc, _ := s.AddAccount("pt-w", "")
+	if got := AccountWeight(*acc); got != DefaultAccountWeight {
+		t.Errorf("default weight = %d, want %d", got, DefaultAccountWeight)
+	}
+	if err := s.SetAccountWeight(acc.ID, 5); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _ := New(s.filePath)
+	got, ok := reloaded.GetAccount(acc.ID)
+	if !ok || AccountWeight(got) != 5 {
+		t.Errorf("weight not persisted: %+v", got)
+	}
+	if err := s.SetAccountWeight(acc.ID, 0); err == nil {
+		t.Error("weight 0 must be rejected")
+	}
+	if err := s.SetAccountWeight(acc.ID, 101); err == nil {
+		t.Error("weight 101 must be rejected")
+	}
+	if err := s.SetAccountWeight("nope", 5); err == nil {
+		t.Error("unknown id must error")
 	}
 }

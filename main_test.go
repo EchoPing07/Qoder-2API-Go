@@ -703,3 +703,61 @@ func TestDeductCreditsWithoutBaseline(t *testing.T) {
 		t.Error("deduction without baseline must not fabricate a snapshot")
 	}
 }
+
+// TestRouterWeightedDistribution 权重不同时按比例分配（平滑加权轮询）。
+func TestRouterWeightedDistribution(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.AddAccount("pt-a", "A")
+	b, _ := s.AddAccount("pt-b", "B")
+	s.SetAutoSwitch(true, 20)
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// A 权重 3，B 权重 1 → 期望约 3:1。
+	if err := s.SetAccountWeight(a.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAccountWeight(b.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	p := newBridgeProvider(s)
+	counts := map[string]int{}
+	const n = 40
+	for i := 0; i < n; i++ {
+		id := pickWith(p, "m", models.RegionDefault, nil)
+		counts[id]++
+	}
+	ratio := float64(counts[a.ID]) / float64(counts[b.ID])
+	if ratio < 2.5 || ratio > 3.5 {
+		t.Errorf("weight 3:1 distribution off: A=%d B=%d ratio=%.2f", counts[a.ID], counts[b.ID], ratio)
+	}
+}
+
+// TestRouterEqualWeightsEven 权重相同时退化为均分。
+func TestRouterEqualWeightsEven(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.AddAccount("pt-a", "A")
+	b, _ := s.AddAccount("pt-b", "B")
+	s.SetAutoSwitch(true, 20)
+	cfg := s.GetAutoSwitch()
+	cfg.Strategy = store.StrategyRoundRobin
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	p := newBridgeProvider(s)
+	counts := map[string]int{}
+	for i := 0; i < 20; i++ {
+		counts[pickWith(p, "m", models.RegionDefault, nil)]++
+	}
+	if counts[a.ID] != 10 || counts[b.ID] != 10 {
+		t.Errorf("equal weights must split evenly: A=%d B=%d", counts[a.ID], counts[b.ID])
+	}
+}

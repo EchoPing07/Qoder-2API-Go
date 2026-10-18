@@ -53,6 +53,11 @@ type bridgeProvider struct {
 	// PAT was cleared. It runs without the provider lock held: the callback
 	// takes the recorder lock, and nesting the two risks a lock-order stall.
 	onPatChange func()
+
+	// reqMu guards reqCounts: per-account cumulative request counts since
+	// process start, shown in the panel so the spread is observable.
+	reqMu     sync.Mutex
+	reqCounts map[string]int64
 }
 
 func newBridgeProvider(st *store.Store) *bridgeProvider {
@@ -61,6 +66,7 @@ func newBridgeProvider(st *store.Store) *bridgeProvider {
 		bridges:   map[string]*bridge.OpenAiBridge{},
 		bridgeSig: map[string]string{},
 		snapshots: map[string]*store.AccountSnapshot{},
+		reqCounts: map[string]int64{},
 	}
 	p.router = newRouter(routerDeps{
 		accounts:    func() []store.Account { return st.ListAccounts() },
@@ -194,6 +200,7 @@ func (p *bridgeProvider) resolveBridge(req bridge.ResolveRequest) *bridge.Resolv
 	if b == nil {
 		return nil
 	}
+	p.bumpRequestCount(acc.ID)
 	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
 		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
 	if stickyKey != "" {
@@ -201,6 +208,25 @@ func (p *bridgeProvider) resolveBridge(req bridge.ResolveRequest) *bridge.Resolv
 		rb.OnSuccess = func() { p.router.bind(stickyKey, accountID) }
 	}
 	return rb
+}
+
+// bumpRequestCount increments one account's cumulative request counter (shown
+// in the panel). Memory-only: it resets on restart, which is the intended
+// "since this process started" semantic.
+func (p *bridgeProvider) bumpRequestCount(accountID string) {
+	if accountID == "" {
+		return
+	}
+	p.reqMu.Lock()
+	p.reqCounts[accountID]++
+	p.reqMu.Unlock()
+}
+
+// RequestCount returns the cumulative request count for an account.
+func (p *bridgeProvider) RequestCount(accountID string) int64 {
+	p.reqMu.Lock()
+	defer p.reqMu.Unlock()
+	return p.reqCounts[accountID]
 }
 
 // currentBridge returns the bridge for the active account (used by the account
@@ -302,6 +328,7 @@ func (p *bridgeProvider) handleChatFailover(failedAccountID string, req bridge.R
 	if b == nil {
 		return nil
 	}
+	p.bumpRequestCount(acc.ID)
 	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
 		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
 	if stickyKey != "" {
@@ -310,8 +337,6 @@ func (p *bridgeProvider) handleChatFailover(failedAccountID string, req bridge.R
 	}
 	return rb
 }
-
-// currentBridge returns the bridge for the active account
 
 // modelsUnion merges the model names from every account's catalog so the admin
 // panel (and /v1/models via the default account) reflects models available in
@@ -727,15 +752,16 @@ func main() {
 
 	// Initialize admin
 	adminInst := admin.New(st, modelFetcher, rec, logRec)
-	// Per-account in-flight count for the panel: shows how the router spreads
-	// load. Reads only the in-memory bridge counters.
-	adminInst.SetAccountRuntime(func(accountID string) (int, int) {
+	// Per-account runtime for the panel: in-flight, capacity and cumulative
+	// request count (shows how the router spreads load).
+	adminInst.SetAccountRuntime(func(accountID string) (int, int, int64) {
+		inflight, capacity := 0, 0
 		if acc, ok := st.GetAccount(accountID); ok {
 			if b := provider.bridgeForAccount(acc); b != nil {
-				return b.InFlight(), b.Capacity()
+				inflight, capacity = b.InFlight(), b.Capacity()
 			}
 		}
-		return 0, 0
+		return inflight, capacity, provider.RequestCount(accountID)
 	})
 	// Account「检测」runs a throwaway bridge through a full session bootstrap
 	// and returns the authoritative quota snapshot; the admin layer only owns

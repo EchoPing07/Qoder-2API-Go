@@ -934,23 +934,16 @@ func TestAccountsCRUDFlow(t *testing.T) {
 	if s.GetPAT() != "pt-two-12345678" {
 		t.Errorf("after switch pat=%q, want pt-two-12345678", s.GetPAT())
 	}
-	// 删除激活中的账号 → 400
-	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
-	if w.Code != 400 {
-		t.Errorf("deleting active should 400, got %d", w.Code)
-	}
-	// 切回去再删
-	otherID := list.Accounts[0].ID
-	if otherID == inactiveID {
-		otherID = list.Accounts[1].ID
-	}
-	doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": otherID})
+	// 删除激活中的账号 → 允许，激活顺延到剩余账号
 	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+inactiveID, nil)
 	if w.Code != 200 {
-		t.Errorf("delete failed: %d", w.Code)
+		t.Errorf("deleting active should succeed (200), got %d", w.Code)
 	}
 	if len(s.ListAccounts()) != 1 {
 		t.Errorf("expected 1 account after delete")
+	}
+	if s.GetActiveAccountID() != s.ListAccounts()[0].ID {
+		t.Errorf("active must advance to the survivor")
 	}
 }
 
@@ -1198,5 +1191,28 @@ func TestAutoSwitchRoutingFields(t *testing.T) {
 	}
 	if got["strategy"] != "least-inflight" || got["sticky_limit"].(float64) != 7 || got["max_retry_accounts"].(float64) != 5 {
 		t.Errorf("GET payload = %+v", got)
+	}
+}
+
+// TestAccountWeightEndpoint 权重端点校验与往返。
+func TestAccountWeightEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-weight", "")
+	w := doRequest(t, a.handleAccountWeight, "POST", "/admin/api/accounts/weight", map[string]interface{}{"id": acc.ID, "weight": 7})
+	if w.Code != 200 {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	got, _ := s.GetAccount(acc.ID)
+	if store.AccountWeight(got) != 7 {
+		t.Errorf("weight = %d, want 7", store.AccountWeight(got))
+	}
+	w = doRequest(t, a.handleAccountWeight, "POST", "/admin/api/accounts/weight", map[string]interface{}{"id": acc.ID, "weight": 0})
+	if w.Code != 400 {
+		t.Errorf("weight 0 should 400, got %d", w.Code)
+	}
+	// 列表回传 weight 字段。
+	w = doRequest(t, a.handleAccounts, "GET", "/admin/api/accounts", nil)
+	if !strings.Contains(w.Body.String(), `"weight":7`) {
+		t.Errorf("account list missing weight: %s", w.Body.String())
 	}
 }

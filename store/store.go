@@ -71,9 +71,31 @@ type Account struct {
 	// Region selects the Qoder deployment for this PAT: ""/"cn" = China
 	// (qoder.com.cn), "global" = international (qoder.sh). Empty keeps the
 	// historical CN default for accounts created before regions existed.
-	Region    string           `json:"region,omitempty"`
+	Region string `json:"region,omitempty"`
+	// Weight is the relative share of requests this account receives when the
+	// pool uses weighted rotation (1..100). 0 means the default weight (1);
+	// equal weights degrade to plain rotation.
+	Weight    int              `json:"weight,omitempty"`
 	CreatedAt int64            `json:"created_at"`
 	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
+}
+
+// DefaultAccountWeight is the weight assumed when an account carries none.
+const DefaultAccountWeight = 1
+
+// MaxAccountWeight bounds the per-account weight (the smooth weighted
+// round-robin arithmetic stays well within int range).
+const MaxAccountWeight = 100
+
+// AccountWeight returns the effective weight (>=1) for routing.
+func AccountWeight(acc Account) int {
+	if acc.Weight < 1 {
+		return DefaultAccountWeight
+	}
+	if acc.Weight > MaxAccountWeight {
+		return MaxAccountWeight
+	}
+	return acc.Weight
 }
 
 // AccountSnapshot is the per-account quota snapshot from the authoritative
@@ -600,15 +622,13 @@ func (s *Store) AccountRegionByPAT(pat string) string {
 	return ""
 }
 
-// DeleteAccount removes an account. Deleting the active one is refused: the
-// pool must always name an active account once it exists (the UI asks the
-// user to switch first, making the failover target explicit).
+// DeleteAccount removes an account. Deleting the active one is allowed: the
+// active marker then moves to the first remaining account (and the PAT mirror
+// follows), so the pool always names an active account while it is non-empty.
+// This lets the panel drop the manual "switch" action entirely.
 func (s *Store) DeleteAccount(id string) error {
 	s.mu.Lock()
-	if s.config.ActiveAccountID == id {
-		s.mu.Unlock()
-		return ErrActiveAccount
-	}
+	wasActive := s.config.ActiveAccountID == id
 	found := false
 	filtered := s.config.Accounts[:0]
 	for _, acc := range s.config.Accounts {
@@ -623,6 +643,15 @@ func (s *Store) DeleteAccount(id string) error {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
 	s.config.Accounts = filtered
+	if wasActive {
+		if len(filtered) > 0 {
+			s.config.ActiveAccountID = filtered[0].ID
+			s.config.PAT = filtered[0].PAT
+		} else {
+			s.config.ActiveAccountID = ""
+			s.config.PAT = ""
+		}
+	}
 	s.mu.Unlock()
 	return s.save()
 }
@@ -657,6 +686,27 @@ func (s *Store) UpdateAccountNote(id, note string) error {
 	for i := range s.config.Accounts {
 		if s.config.Accounts[i].ID == id {
 			s.config.Accounts[i].Note = note
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// SetAccountWeight updates one account's routing weight (1..MaxAccountWeight).
+func (s *Store) SetAccountWeight(id string, weight int) error {
+	if weight < 1 || weight > MaxAccountWeight {
+		return fmt.Errorf("权重需在 %d..%d 之间", 1, MaxAccountWeight)
+	}
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Weight = weight
 			found = true
 			break
 		}

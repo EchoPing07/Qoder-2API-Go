@@ -56,6 +56,8 @@ type router struct {
 	mu     sync.Mutex
 	sticky map[string]*binding
 	cursor map[string]string // routeKey -> last picked account ID (stable rotation)
+	// wrr holds the smooth-weighted-round-robin running weights per route.
+	wrr map[string]map[string]int
 }
 
 func newRouter(deps routerDeps) *router {
@@ -63,6 +65,7 @@ func newRouter(deps routerDeps) *router {
 		deps:   deps,
 		sticky: make(map[string]*binding),
 		cursor: make(map[string]string),
+		wrr:    make(map[string]map[string]int),
 	}
 }
 
@@ -232,6 +235,10 @@ func (r *router) pick(apiKeyID, bareModel, seed string, filter models.RegionFilt
 // rotate advances the stable ID cursor and returns the next account. Sorting by
 // ID and resuming after the last-picked ID keeps rotation stable even as the
 // candidate set changes (cooling/exclusion), which an index cursor cannot do.
+//
+// When the candidates carry differing weights, it uses smooth weighted
+// round-robin instead, so a heavier account receives proportionally more
+// requests without bursting; equal weights degrade to the plain ID cursor.
 func (r *router) rotate(candidates []store.Account, filter models.RegionFilter, bareModel, strategy string) store.Account {
 	routeKey := filter.String() + "|" + bareModel
 
@@ -247,6 +254,10 @@ func (r *router) rotate(candidates []store.Account, filter models.RegionFilter, 
 		r.cursor[routeKey] = best.ID
 		r.mu.Unlock()
 		return best
+	}
+
+	if acc, ok := r.weightedRotate(routeKey, candidates); ok {
+		return acc
 	}
 
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
@@ -271,6 +282,64 @@ func (r *router) rotate(candidates []store.Account, filter models.RegionFilter, 
 	r.cursor[routeKey] = chosen.ID
 	r.mu.Unlock()
 	return chosen
+}
+
+// weightedRotate performs one step of smooth weighted round-robin. It returns
+// ok=false when every candidate has the same weight (caller falls back to the
+// plain ID cursor, which is cheaper and gives identical fairness).
+func (r *router) weightedRotate(routeKey string, candidates []store.Account) (store.Account, bool) {
+	if len(candidates) == 0 {
+		return store.Account{}, false
+	}
+	total := 0
+	uniform := true
+	first := store.AccountWeight(candidates[0])
+	for _, acc := range candidates {
+		w := store.AccountWeight(acc)
+		total += w
+		if w != first {
+			uniform = false
+		}
+	}
+	if uniform {
+		// Drop any stale running weights so a later weight change starts clean.
+		r.mu.Lock()
+		delete(r.wrr, routeKey)
+		r.mu.Unlock()
+		return store.Account{}, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.wrr[routeKey]
+	if state == nil {
+		state = make(map[string]int, len(candidates))
+		r.wrr[routeKey] = state
+	}
+	// Drop entries for accounts that left the candidate set (cooling/excluded),
+	// so a returning account does not inherit a huge accumulated weight.
+	live := make(map[string]struct{}, len(candidates))
+	for _, acc := range candidates {
+		live[acc.ID] = struct{}{}
+	}
+	for id := range state {
+		if _, ok := live[id]; !ok {
+			delete(state, id)
+		}
+	}
+
+	best := candidates[0]
+	bestWeight := 0
+	for _, acc := range candidates {
+		w := store.AccountWeight(acc)
+		state[acc.ID] += w
+		if state[acc.ID] > bestWeight {
+			best, bestWeight = acc, state[acc.ID]
+		}
+	}
+	state[best.ID] -= total
+	r.cursor[routeKey] = best.ID
+	return best, true
 }
 
 func (r *router) inFlight(acc store.Account) int {

@@ -15,34 +15,32 @@
             <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
             <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
-            <span class="muted-xs">请求按负载均衡策略分散到各账号；「默认」账号用于面板展示与手动切换</span>
+            <span class="muted-xs">请求按负载均衡策略（含权重）分散到各账号；「请求数」为本次运行以来的累计次数</span>
           </div>
           <div class="table-wrap" x-show="accounts.length">
             <table>
-              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>在途</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
+              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>权重</th><th>请求数</th><th>在途</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
               <tbody>
                 <template x-for="acc in accounts" :key="acc.id">
                   <tr>
                     <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
-                        <span class="badge badge-ok" x-show="acc.active">默认</span>
-                      </div>
+                      <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
                     </td>
                     <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
                     <td x-text="accountQuota(acc)"></td>
+                    <td class="muted-xs mono" x-text="acc.weight||1"></td>
+                    <td class="muted-xs mono" x-text="fmt(acc.requests||0)"></td>
                     <td class="muted-xs mono" x-text="acc.in_flight||0"></td>
                     <td><span class="badge" :class="accountStatusClass(acc)" x-text="accountStatus(acc)"></span></td>
                     <td class="muted-xs" x-text="acc.snapshot && acc.snapshot.checked_at ? ts(acc.snapshot.checked_at) : '—'"></td>
                     <td>
                       <div class="row" style="gap:2px;flex-wrap:nowrap;justify-content:flex-end">
-                        <button class="btn btn-ghost btn-sm" x-show="!acc.active" @click="switchAccount(acc)">切换</button>
                         <button class="btn btn-ghost btn-sm" @click="checkAccount(acc)" :disabled="checkingId===acc.id">
                           <span class="spin" x-show="checkingId===acc.id"></span>
                           <span x-show="checkingId!==acc.id">检测</span>
                         </button>
-                        <button class="btn btn-ghost btn-sm" @click="editAccountNote(acc)">备注</button>
+                        <button class="btn btn-ghost btn-sm" @click="editAccountNote(acc)">编辑</button>
                         <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteAccount(acc)">删除</button>
                       </div>
                     </td>
@@ -61,7 +59,7 @@
           <div class="card-head">
             <h3>负载均衡 / 自动切换</h3>
             <div class="spacer"></div>
-            <span class="muted-xs">多账号时请求按策略分散，避免都打在一个账号上</span>
+            <span class="muted-xs">多账号时请求按策略分散（可按账号权重倾斜），避免都打在一个账号上</span>
           </div>
           <div class="switch-row">
             <span class="sw-label">启用（低于阈值的账号停止接新请求）</span>
@@ -129,12 +127,17 @@
   </form>
 </template>
 
-<!-- ═══ 备注弹窗 ═══ -->
+<!-- ═══ 编辑账号弹窗（备注 + 权重） ═══ -->
 <template x-if="noteModal">
   <div class="overlay" @click.self="noteModal=false">
     <form class="modal" @submit.prevent="saveAccountNote()">
-      <div class="modal-title">修改备注</div>
+      <div class="modal-title">编辑账号</div>
       <div class="form-row"><label class="label">备注</label><input class="input" x-model="noteForm.note" placeholder="可选描述" autocomplete="off"></div>
+      <div class="form-row">
+        <label class="label">权重（1-100，越大分到越多请求）</label>
+        <input class="input" type="number" min="1" max="100" step="1" x-model.number="noteForm.weight">
+        <p class="field-hint">各账号权重相同时平均分配；权重越大，分配到的请求比例越高。仅在负载均衡的轮询/粘性策略下生效。</p>
+      </div>
       <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="noteModal=false">取消</button>
         <button type="submit" class="btn btn-sm" :disabled="loading">保存</button>
