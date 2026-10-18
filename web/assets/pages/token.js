@@ -7,16 +7,18 @@ PAGE('token', {
     try{ const r = await this.api('/admin/api/accounts'); this.accounts = r.accounts||[]; }
     catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadKeys 一致：加载失败必须有提示
   },
-  /* 添加：服务端对相同 PAT 幂等（视为切换），此处不做本地去重判断 */
+  /* 添加：服务端对相同 PAT 幂等（视为切换），此处不做本地去重判断。
+   * region 决定该令牌走国内（qoder.cn）还是国际（qoder.com）上游，两者令牌互不通用 */
   async createAccount(){
     const pat = (this.accountForm.pat||'').trim();
     if(!pat){ this.toast('令牌不能为空','err'); return; }
+    const region = this.accountForm.region === 'global' ? 'global' : 'cn';
     this.busy(async()=>{
       await this.api('/admin/api/accounts',{method:'POST',body:JSON.stringify({
-        pat, note:(this.accountForm.note||'').trim() })});
+        pat, note:(this.accountForm.note||'').trim(), region })});
       this.toast('账号已添加','ok');
       this.accountModal = false;
-      this.accountForm = {pat:'',note:''};
+      this.accountForm = {pat:'',note:'',region:'cn'};
       this.loadAccounts(); this.loadPAT();
     })();
   },
@@ -47,6 +49,20 @@ PAGE('token', {
         id:this.noteForm.id, note:(this.noteForm.note||'').trim() })});
       this.toast('备注已保存','ok');
       this.noteModal = false;
+      this.loadAccounts();
+    })();
+  },
+  /* 改区域：令牌不变，仅切换上游部署；激活中的账号在下次请求时自动重建桥接 */
+  editAccountRegion(acc){
+    this.regionForm = {id:acc.id, region:acc.region==='global'?'global':'cn'};
+    this.regionModal = true;
+  },
+  async saveAccountRegion(){
+    this.busy(async()=>{
+      await this.api('/admin/api/accounts/region',{method:'POST',body:JSON.stringify({
+        id:this.regionForm.id, region:this.regionForm.region })});
+      this.toast('区域已更新，激活中的账号将在下次请求时切换网关','ok');
+      this.regionModal = false;
       this.loadAccounts();
     })();
   },

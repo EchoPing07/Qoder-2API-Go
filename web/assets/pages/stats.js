@@ -174,9 +174,26 @@ PAGE('stats', {
     return (acct && acct.tag) ? acct.tag : '';
   },
 
+  /* ── 账号范围选择：默认跟随当前使用中的账号，可切换查看全部或指定账号 ── */
+  get statsAccountOptions(){
+    const opts = [{value:'active', label:'当前账号'}, {value:'all', label:'全部账号'}];
+    (this.accounts||[]).forEach(a=>{
+      const label = (a.note || a.pat_masked || a.id) + (a.active ? '（使用中）' : '');
+      opts.push({value:a.id, label});
+    });
+    return opts;
+  },
+  setStatsAccount(v){
+    this.statsAccount = v;
+    this.loadStats();
+  },
+
   async loadStats(){
     try{
-      this.stats = await this.api('/admin/api/stats');
+      // 统计默认按账号归属展示：面板轮询带 account 参数，切换账号后视图自动跟随；
+      // 选择「全部账号」时服务端返回全局汇总。
+      const q = this.statsAccount === 'all' ? '?account=all' : '?account=' + encodeURIComponent(this.statsAccount);
+      this.stats = await this.api('/admin/api/stats' + q);
       this.$nextTick(()=>requestAnimationFrame(()=>this.renderHourly()));
     }catch(e){ this.toast(e.message,'err'); }
   },
@@ -286,5 +303,5 @@ PAGE('stats', {
   },
 
   /* ── 进场：本页所需数据 ── */
-  load(){ this.loadStats(); this.loadModels(); },
+  load(){ if(!(this.accounts||[]).length) this.loadAccounts(); this.loadStats(); this.loadModels(); },
 });

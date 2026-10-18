@@ -518,14 +518,14 @@ func TestLegacyPATMigration(t *testing.T) {
 // 已有激活账号时，新账号不改变激活状态。
 func TestAddAccountActivatesFirst(t *testing.T) {
 	s := tempStore(t)
-	first, err := s.AddAccount("pt-first", "一号")
+	first, err := s.AddAccount("pt-first", "一号", "cn")
 	if err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
 	if s.GetActiveAccountID() != first.ID || s.GetPAT() != "pt-first" {
 		t.Error("first account must activate and mirror PAT")
 	}
-	second, err := s.AddAccount("pt-second", "二号")
+	second, err := s.AddAccount("pt-second", "二号", "cn")
 	if err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
@@ -539,22 +539,52 @@ func TestAddAccountActivatesFirst(t *testing.T) {
 
 func TestAddAccountDuplicate(t *testing.T) {
 	s := tempStore(t)
-	if _, err := s.AddAccount("pt-dup", ""); err != nil {
+	if _, err := s.AddAccount("pt-dup", "", "cn"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AddAccount("pt-dup", ""); !errors.Is(err, ErrDuplicateAccount) {
+	if _, err := s.AddAccount("pt-dup", "", "cn"); !errors.Is(err, ErrDuplicateAccount) {
 		t.Errorf("expected ErrDuplicateAccount, got %v", err)
 	}
-	if _, err := s.AddAccount("", ""); err == nil {
+	if _, err := s.AddAccount("", "", "cn"); err == nil {
 		t.Error("empty PAT must be rejected")
+	}
+}
+
+// TestUpdateAccountRegion 区域编辑：值落库、持久化生效；未知账号报错。
+func TestUpdateAccountRegion(t *testing.T) {
+	path := t.TempDir() + "/data.json"
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := s.AddAccount("pt-region", "", "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateAccountRegion(acc.ID, "global"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListAccounts()[0].Region; got != "global" {
+		t.Errorf("region = %q, want global", got)
+	}
+	if err := s.UpdateAccountRegion("nope", "cn"); err == nil {
+		t.Error("unknown id must fail")
+	}
+	// 重开文件确认持久化。
+	s2, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.ListAccounts()[0].Region; got != "global" {
+		t.Errorf("after reload region = %q, want global", got)
 	}
 }
 
 // TestActivateAccountSwitch 切换同时更新激活指针与 PAT 镜像，且持久化生效。
 func TestActivateAccountSwitch(t *testing.T) {
 	s := tempStore(t)
-	first, _ := s.AddAccount("pt-a", "")
-	second, _ := s.AddAccount("pt-b", "")
+	first, _ := s.AddAccount("pt-a", "", "cn")
+	second, _ := s.AddAccount("pt-b", "", "cn")
 	if err := s.ActivateAccount(second.ID); err != nil {
 		t.Fatalf("ActivateAccount: %v", err)
 	}
@@ -576,8 +606,8 @@ func TestActivateAccountSwitch(t *testing.T) {
 // 激活状态不受影响。
 func TestDeleteAccountGuard(t *testing.T) {
 	s := tempStore(t)
-	first, _ := s.AddAccount("pt-a", "")
-	second, _ := s.AddAccount("pt-b", "")
+	first, _ := s.AddAccount("pt-a", "", "cn")
+	second, _ := s.AddAccount("pt-b", "", "cn")
 	if err := s.DeleteAccount(first.ID); !errors.Is(err, ErrActiveAccount) {
 		t.Errorf("deleting active must fail with ErrActiveAccount, got %v", err)
 	}
@@ -599,7 +629,7 @@ func TestAccountSnapshotAndNote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acc, _ := s.AddAccount("pt-snap", "")
+	acc, _ := s.AddAccount("pt-snap", "", "cn")
 	snap := &AccountSnapshot{Remaining: 42.5, Total: 100, Plan: "Teams", CheckedAt: 1700000000}
 	if err := s.SetAccountSnapshot(acc.ID, snap); err != nil {
 		t.Fatalf("SetAccountSnapshot: %v", err)
@@ -651,7 +681,7 @@ func TestHandEditedPatImported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acc, _ := s.AddAccount("pt-old", "")
+	acc, _ := s.AddAccount("pt-old", "", "cn")
 	if err := s.SetPAT("pt-hand-edited"); err != nil {
 		t.Fatal(err)
 	}
@@ -676,8 +706,8 @@ func TestSnapshotCooldownRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a1, _ := s.AddAccount("pt-c1", "")
-	a2, _ := s.AddAccount("pt-c2", "")
+	a1, _ := s.AddAccount("pt-c1", "", "cn")
+	a2, _ := s.AddAccount("pt-c2", "", "cn")
 	if err := s.SaveSnapshots(map[string]*AccountSnapshot{
 		a1.ID: {Remaining: 5, Total: 100, CooldownUntil: 1900000000, CheckedAt: 1700000000},
 		a2.ID: {Remaining: 90, Total: 100, CheckedAt: 1700000000},

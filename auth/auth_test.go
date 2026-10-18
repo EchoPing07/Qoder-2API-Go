@@ -16,6 +16,33 @@ import (
 	"unicode/utf8"
 )
 
+// TestIsQuotaExhausted 额度耗尽分类：HTTP 402、quota/额度 措辞命中；普通
+// 参数错（400）、纯 401、普通错误不命中。
+func TestIsQuotaExhausted(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"http402", &UpstreamError{StatusCode: 402, Body: "payment required"}, true},
+		{"body-quota", &UpstreamError{StatusCode: 429, Body: `{"message":"quota exceeded"}`}, true},
+		{"body-额度", &UpstreamError{StatusCode: 500, Body: `{"message":"积分额度已用尽"}`}, true},
+		{"plain-400", &UpstreamError{StatusCode: 400, Body: `{"message":"max_tokens too large"}`}, false},
+		{"plain-500", &UpstreamError{StatusCode: 500, Body: `{"message":"internal error"}`}, false},
+		{"in-stream-quota", &InStreamError{Status: 200, Detail: `{"message":"insufficient quota"}`}, true},
+		{"in-stream-other", &InStreamError{Status: 200, Detail: `{"message":"upstream timeout"}`}, false},
+		{"auth-quota-wording", &AuthError{StatusCode: 403, Detail: `{"message":"quota exhausted for this account"}`}, true},
+		{"auth-plain", &AuthError{StatusCode: 401, Detail: `{"message":"invalid session"}`}, false},
+		{"busy", &BusyError{RetryAfter: time.Second}, false},
+	}
+	for _, tc := range cases {
+		if got := IsQuotaExhausted(tc.err); got != tc.want {
+			t.Errorf("%s: IsQuotaExhausted = %v, want %v (err=%v)", tc.name, got, tc.want, tc.err)
+		}
+	}
+}
+
 func TestEncodeDecodeRoundTrip(t *testing.T) {
 	tests := []string{
 		"hello world",

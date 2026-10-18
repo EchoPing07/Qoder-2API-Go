@@ -106,6 +106,35 @@ type OrgResourcePackage struct {
 	Unit       string  `json:"unit"`
 }
 
+// AccountStat attributes the service-observed traffic to one Qoder account in
+// the pool. It mirrors the global counters with the same semantics (ModelStat /
+// HourStat rows, credits counted only for billable frames); the subscription
+// card and cycle boundaries stay global — they describe the active account's
+// subscription as reported by /user/status, while these counters answer "what
+// did this account serve through this bridge".
+type AccountStat struct {
+	Total            int64                 `json:"total"`
+	Success          int64                 `json:"success"`
+	Failed           int64                 `json:"failed"`
+	PromptTokens     int64                 `json:"prompt_tokens"`
+	CompletionTokens int64                 `json:"completion_tokens"`
+	CachedTokens     int64                 `json:"cached_tokens"`
+	Credits          float64               `json:"credits"`
+	BilledRequests   int64                 `json:"billed_requests,omitempty"`
+	// CycleCredits is this account's spend in the current billing cycle. It is
+	// zeroed by the same cycle rollovers that zero the global total.
+	CycleCredits float64               `json:"cycle_credits,omitempty"`
+	ByModel      map[string]*ModelStat `json:"by_model,omitempty"`
+	Hourly       map[string]*HourStat  `json:"hourly,omitempty"`
+}
+
+func newAccountStat() *AccountStat {
+	return &AccountStat{
+		ByModel: map[string]*ModelStat{},
+		Hourly:  map[string]*HourStat{},
+	}
+}
+
 // Data is the persisted stats snapshot.
 type Data struct {
 	Total   int64 `json:"total"`
@@ -136,6 +165,9 @@ type Data struct {
 	Account      *Account              `json:"account,omitempty"`
 	ByModel      map[string]*ModelStat `json:"by_model,omitempty"`
 	Hourly       map[string]*HourStat  `json:"hourly,omitempty"`
+	// ByAccount attributes the traffic to pool accounts, keyed by account ID
+	// (absent entries mean that account served nothing yet).
+	ByAccount map[string]*AccountStat `json:"by_account,omitempty"`
 }
 
 // ModelRow is a per-model report row served to the admin UI.
@@ -226,8 +258,9 @@ func NewRecorder(p Persister) *Recorder {
 
 func newData() *Data {
 	return &Data{
-		ByModel: map[string]*ModelStat{},
-		Hourly:  map[string]*HourStat{},
+		ByModel:   map[string]*ModelStat{},
+		Hourly:    map[string]*HourStat{},
+		ByAccount: map[string]*AccountStat{},
 	}
 }
 
@@ -237,6 +270,17 @@ func normalize(d *Data) *Data {
 	}
 	if d.Hourly == nil {
 		d.Hourly = map[string]*HourStat{}
+	}
+	if d.ByAccount == nil {
+		d.ByAccount = map[string]*AccountStat{}
+	}
+	for _, a := range d.ByAccount {
+		if a.ByModel == nil {
+			a.ByModel = map[string]*ModelStat{}
+		}
+		if a.Hourly == nil {
+			a.Hourly = map[string]*HourStat{}
+		}
 	}
 	return d
 }
@@ -258,6 +302,7 @@ func (d *Data) Clone() *Data {
 		CycleCredits:     d.CycleCredits,
 		ByModel:          make(map[string]*ModelStat, len(d.ByModel)),
 		Hourly:           make(map[string]*HourStat, len(d.Hourly)),
+		ByAccount:        make(map[string]*AccountStat, len(d.ByAccount)),
 	}
 	cp.Account = cloneAccount(d.Account)
 	for k, v := range d.ByModel {
@@ -272,11 +317,35 @@ func (d *Data) Clone() *Data {
 			Billed: v.Billed, Credits: v.Credits,
 		}
 	}
+	for id, a := range d.ByAccount {
+		ca := &AccountStat{
+			Total: a.Total, Success: a.Success, Failed: a.Failed,
+			PromptTokens: a.PromptTokens, CompletionTokens: a.CompletionTokens,
+			CachedTokens: a.CachedTokens, Credits: a.Credits,
+			BilledRequests: a.BilledRequests, CycleCredits: a.CycleCredits,
+			ByModel: make(map[string]*ModelStat, len(a.ByModel)),
+			Hourly:  make(map[string]*HourStat, len(a.Hourly)),
+		}
+		for mk, mv := range a.ByModel {
+			ca.ByModel[mk] = &ModelStat{
+				Model: mv.Model, Total: mv.Total, Success: mv.Success, Failed: mv.Failed,
+				Billed: mv.Billed, Credits: mv.Credits,
+			}
+		}
+		for hk, hv := range a.Hourly {
+			ca.Hourly[hk] = &HourStat{
+				Hour: hv.Hour, Total: hv.Total, Success: hv.Success, Failed: hv.Failed,
+				Billed: hv.Billed, Credits: hv.Credits,
+			}
+		}
+		cp.ByAccount[id] = ca
+	}
 	return cp
 }
 
-// Record counts one completed request.
-func (r *Recorder) Record(model string, ok bool) {
+// Record counts one completed request. accountID attributes the request to a
+// pool account ("" counts globally only — single-account deployments and tests).
+func (r *Recorder) Record(accountID, model string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -312,6 +381,50 @@ func (r *Recorder) Record(model string, ok bool) {
 	} else {
 		h.Failed++
 	}
+
+	if accountID == "" {
+		return
+	}
+	a := r.accountLocked(accountID)
+	a.Total++
+	if ok {
+		a.Success++
+	} else {
+		a.Failed++
+	}
+	am := a.ByModel[model]
+	if am == nil {
+		am = &ModelStat{Model: model}
+		a.ByModel[model] = am
+	}
+	am.Total++
+	if ok {
+		am.Success++
+	} else {
+		am.Failed++
+	}
+	ah := a.Hourly[key]
+	if ah == nil {
+		ah = &HourStat{Hour: key}
+		a.Hourly[key] = ah
+	}
+	ah.Total++
+	if ok {
+		ah.Success++
+	} else {
+		ah.Failed++
+	}
+}
+
+// accountLocked returns (creating if needed) the attribution entry for an
+// account. Caller must hold the mutex.
+func (r *Recorder) accountLocked(accountID string) *AccountStat {
+	a := r.data.ByAccount[accountID]
+	if a == nil {
+		a = newAccountStat()
+		r.data.ByAccount[accountID] = a
+	}
+	return a
 }
 
 // RecordUsage adds token/billing totals extracted from a gateway usage frame.
@@ -325,7 +438,8 @@ func (r *Recorder) Record(model string, ok bool) {
 // model labels the per-model and hourly rows, as in Record. It is passed in
 // rather than looked up from the request counter because the sink fires before
 // the handler's Record call, so the model's row may not exist yet.
-func (r *Recorder) RecordUsage(model string, u *Usage) {
+// accountID attributes the frame to a pool account ("" counts globally only).
+func (r *Recorder) RecordUsage(accountID, model string, u *Usage) {
 	if u == nil {
 		return
 	}
@@ -335,6 +449,12 @@ func (r *Recorder) RecordUsage(model string, u *Usage) {
 	r.data.PromptTokens += int64(u.PromptTokens)
 	r.data.CompletionTokens += int64(u.CompletionTokens)
 	r.data.CachedTokens += int64(u.CachedTokens)
+	if accountID != "" {
+		a := r.accountLocked(accountID)
+		a.PromptTokens += int64(u.PromptTokens)
+		a.CompletionTokens += int64(u.CompletionTokens)
+		a.CachedTokens += int64(u.CachedTokens)
+	}
 	if u.NonBillable {
 		return
 	}
@@ -343,6 +463,12 @@ func (r *Recorder) RecordUsage(model string, u *Usage) {
 	nowMs := time.Now().UnixMilli()
 	r.rollCycleLocked(nowMs)
 	r.data.CycleCredits += u.Credits
+	if accountID != "" {
+		a := r.accountLocked(accountID)
+		a.Credits += u.Credits
+		a.BilledRequests++
+		a.CycleCredits += u.Credits
+	}
 
 	// Attribute credits to the model and hour; the token totals above stay
 	// account-wide, because credits are what the panel weighs against an
@@ -365,6 +491,24 @@ func (r *Recorder) RecordUsage(model string, u *Usage) {
 	}
 	h.Billed++
 	h.Credits += u.Credits
+
+	if accountID != "" {
+		a := r.accountLocked(accountID)
+		am := a.ByModel[model]
+		if am == nil {
+			am = &ModelStat{Model: model}
+			a.ByModel[model] = am
+		}
+		am.Billed++
+		am.Credits += u.Credits
+		ah := a.Hourly[key]
+		if ah == nil {
+			ah = &HourStat{Hour: key}
+			a.Hourly[key] = ah
+		}
+		ah.Billed++
+		ah.Credits += u.Credits
+	}
 }
 
 // SetBillingCycle records the subscription boundary reported by /user/status.
@@ -435,8 +579,11 @@ func (r *Recorder) setBillingCycleAt(nextResetMs, nowMs int64) {
 	}
 	if r.data.NextResetMs != 0 && nextResetMs-r.data.NextResetMs >= cycleDriftToleranceMs {
 		// A genuinely different cycle: the allowance has been refreshed, so
-		// the previous cycle's credits are stale.
+		// the previous cycle's credits are stale — globally and per account.
 		r.data.CycleCredits = 0
+		for _, a := range r.data.ByAccount {
+			a.CycleCredits = 0
+		}
 	}
 	r.data.NextResetMs = nextResetMs
 	r.data.CycleStartMs = addMonthsMs(nextResetMs, -1)
@@ -597,6 +744,9 @@ func (r *Recorder) rollCycleLocked(nowMs int64) bool {
 		current := r.data.NextResetMs
 		r.data.CycleStartMs = current
 		r.data.CycleCredits = 0
+		for _, a := range r.data.ByAccount {
+			a.CycleCredits = 0
+		}
 		rolled = true
 		adv := nextCycleBoundary(current)
 		if adv == 0 {
@@ -667,19 +817,37 @@ func (r *Recorder) pruneLocked() {
 			delete(r.data.Hourly, k)
 		}
 	}
+	for _, a := range r.data.ByAccount {
+		for k := range a.Hourly {
+			if k < cutoff {
+				delete(a.Hourly, k)
+			}
+		}
+	}
 }
 
 // Report returns a snapshot for the admin UI: totals, per-model rows sorted by
 // total (descending), and the last 24 hourly buckets in ascending order.
 func (r *Recorder) Report() *Report {
-	return r.reportAt(time.Now().UnixMilli())
+	return r.reportAt(time.Now().UnixMilli(), "")
+}
+
+// AccountReport is Report scoped to one pool account: the counters (requests,
+// tokens, credits, model rows, hourly buckets) come from that account's
+// attribution entry — zero-valued when it served nothing yet — while the
+// subscription card and cycle boundaries stay global (they describe the
+// active account's subscription as reported by /user/status).
+func (r *Recorder) AccountReport(accountID string) *Report {
+	return r.reportAt(time.Now().UnixMilli(), accountID)
 }
 
 // reportAt is Report with the billing-cycle projection evaluated at nowMs
 // instead of the wall clock, so tests can pin fixed calendar instants (month-end
 // anchors, leap years) rather than depend on the day the suite runs. Only the
 // cycle view is pinned; the hourly buckets still follow the wall clock.
-func (r *Recorder) reportAt(nowMs int64) *Report {
+// An empty accountID reports the global counters; a non-empty one reports the
+// account's attribution entry instead.
+func (r *Recorder) reportAt(nowMs int64, accountID string) *Report {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -690,30 +858,63 @@ func (r *Recorder) reportAt(nowMs int64) *Report {
 	// (RecordUsage) is what advances the tracked boundary.
 	cycleCredits, cycleStartMs, nextResetMs := r.projectCycleLocked(nowMs)
 
+	totals := r.data
+	if accountID != "" {
+		// The read path never rolls, so a projected boundary that has already
+		// passed means the account's cycle credits are stale for display
+		// purposes too (the next write persists the rollover).
+		cycleRolled := (nextResetMs == 0 && r.data.NextResetMs > 0) ||
+			(nextResetMs > 0 && nowMs >= r.data.NextResetMs)
+		if a := r.data.ByAccount[accountID]; a != nil {
+			cycleCredits = a.CycleCredits
+			if cycleRolled {
+				cycleCredits = 0
+			}
+			totals = &Data{
+				Total:            a.Total,
+				Success:          a.Success,
+				Failed:           a.Failed,
+				PromptTokens:     a.PromptTokens,
+				CompletionTokens: a.CompletionTokens,
+				CachedTokens:     a.CachedTokens,
+				Credits:          a.Credits,
+				BilledRequests:   a.BilledRequests,
+				ByModel:          a.ByModel,
+				Hourly:           a.Hourly,
+			}
+		} else {
+			cycleCredits = 0
+			totals = &Data{
+				ByModel: map[string]*ModelStat{},
+				Hourly:  map[string]*HourStat{},
+			}
+		}
+	}
+
 	rep := &Report{
-		Total:            r.data.Total,
-		Success:          r.data.Success,
-		Failed:           r.data.Failed,
-		PromptTokens:     r.data.PromptTokens,
-		CompletionTokens: r.data.CompletionTokens,
-		CachedTokens:     r.data.CachedTokens,
-		Credits:          r.data.Credits,
-		BilledRequests:   r.data.BilledRequests,
+		Total:            totals.Total,
+		Success:          totals.Success,
+		Failed:           totals.Failed,
+		PromptTokens:     totals.PromptTokens,
+		CompletionTokens: totals.CompletionTokens,
+		CachedTokens:     totals.CachedTokens,
+		Credits:          totals.Credits,
+		BilledRequests:   totals.BilledRequests,
 		CycleCredits:     cycleCredits,
 		CycleStartMs:     cycleStartMs,
 		NextResetMs:      nextResetMs,
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
 	}
-	if r.data.BilledRequests > 0 {
-		rep.AvgCredits = r.data.Credits / float64(r.data.BilledRequests)
+	if totals.BilledRequests > 0 {
+		rep.AvgCredits = totals.Credits / float64(totals.BilledRequests)
 	}
 	rep.Account = cloneAccount(r.data.Account)
-	if r.data.Total > 0 {
-		rep.SuccessRate = float64(r.data.Success) / float64(r.data.Total)
+	if totals.Total > 0 {
+		rep.SuccessRate = float64(totals.Success) / float64(totals.Total)
 	}
 
-	for _, m := range r.data.ByModel {
+	for _, m := range totals.ByModel {
 		rate := 0.0
 		if m.Total > 0 {
 			rate = float64(m.Success) / float64(m.Total)

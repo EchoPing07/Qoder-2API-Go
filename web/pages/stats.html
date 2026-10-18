@@ -2,7 +2,12 @@
         <header class="page-head">
           <h1>统计</h1>
           <div class="page-actions">
-            <span class="muted-xs">统计自服务启动以来记录的请求，每 30 秒持久化一次 · 每 15 秒自动刷新</span>
+            <span class="muted-xs">每 30 秒持久化一次 · 每 15 秒自动刷新</span>
+            <select class="input input-sm" style="width:auto" x-model="statsAccount" @change="setStatsAccount(statsAccount)">
+              <template x-for="opt in statsAccountOptions" :key="opt.value">
+                <option :value="opt.value" x-text="opt.label"></option>
+              </template>
+            </select>
             <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
               <span class="ic" x-html="ic('refresh')"></span>刷新统计
             </button>

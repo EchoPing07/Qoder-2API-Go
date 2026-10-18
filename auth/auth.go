@@ -47,8 +47,26 @@ var CN = &RegionConfig{
 	OpenAPIBase: "https://openapi.qoder.com.cn",
 }
 
-func Resolve(pat string) (string, *RegionConfig) {
-	return pat, CN
+// Global is the international (qoder.com) deployment. The inference gateway
+// is region-sharded (api1 US / api2 default / api3 JP); api2 is the neutral
+// default. Endpoints verified live: both gateways answer 403 unauthenticated
+// and openapi.qoder.sh answers 401 on /api/v2/quota/usage — the same cosy
+// protocol and quota paths as CN, only the hosts differ.
+var Global = &RegionConfig{
+	Name:        "global",
+	AuthBase:    "https://api2.qoder.sh",
+	ChatBase:    "https://api2.qoder.sh",
+	OpenAPIBase: "https://openapi.qoder.sh",
+}
+
+// RegionByName maps a region identifier to its config. Empty and unknown
+// names fall back to CN: every account created before regions existed is a
+// CN account.
+func RegionByName(name string) *RegionConfig {
+	if name == Global.Name {
+		return Global
+	}
+	return CN
 }
 
 func AuthURL(region *RegionConfig, path string) string {
@@ -410,6 +428,48 @@ type UpstreamError struct {
 
 func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("gateway HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// quotaMarkers reports whether an upstream rejection looks like account quota
+// exhaustion rather than a request or session fault: the gateway signals it
+// with HTTP 402, or with quota wording in the rejection body (observed on
+// both deployments, over HTTP envelopes and in-stream frames alike). Matching
+// text instead of a fixed business code is deliberate: the quota code is not
+// documented and varies between gateway versions, while the wording is stable.
+func quotaMarkers(status int, body string) bool {
+	if status == http.StatusPaymentRequired {
+		return true
+	}
+	low := strings.ToLower(body)
+	return strings.Contains(low, "quota") || strings.Contains(body, "额度")
+}
+
+// IsQuotaExhausted reports whether err is an upstream rejection caused by the
+// account running out of credits. The chat failover path uses it to cool the
+// account down to its next reset and retry on another account — the same
+// treatment the threshold switcher applies to hard exhaustion (IsQuotaExceeded
+// reported by user/status). Non-upstream errors (busy, param, model) never
+// classify as quota exhaustion.
+func IsQuotaExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upErr *UpstreamError
+	if errors.As(err, &upErr) {
+		return quotaMarkers(upErr.StatusCode, upErr.Body)
+	}
+	var inErr *InStreamError
+	if errors.As(err, &inErr) {
+		return quotaMarkers(inErr.Status, inErr.Detail)
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		// A 401/403 envelope is an auth failure first and foremost, but the
+		// gateway has been observed burying quota exhaustion in the same
+		// envelope shape — the body wording decides.
+		return quotaMarkers(authErr.StatusCode, authErr.Detail)
+	}
+	return false
 }
 
 // retryAfterHeader parses a numeric Retry-After response header into a

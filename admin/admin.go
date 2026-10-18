@@ -32,7 +32,8 @@ const adminMaxBody = 1 << 16 // 64 KiB
 // AccountChecker probes one PAT's real allowance through a throwaway bridge
 // (full session bootstrap) and returns the quota snapshot. Implemented by the
 // caller (main package) — the admin package stays free of bridge wiring.
-type AccountChecker func(ctx context.Context, pat string) (*store.AccountSnapshot, error)
+// Region selects the upstream deployment ("cn" / "global"; "" means cn).
+type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
 
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
@@ -84,6 +85,7 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts", a.requireAuth(a.handleAccounts))
 	mux.HandleFunc("/admin/api/accounts/switch", a.requireAuth(a.handleAccountSwitch))
 	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
+	mux.HandleFunc("/admin/api/accounts/region", a.requireAuth(a.handleAccountRegion))
 	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
 	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
@@ -649,6 +651,7 @@ func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
 type accountView struct {
 	ID        string                 `json:"id"`
 	PATMasked string                 `json:"pat_masked"`
+	Region    string                 `json:"region"`
 	Note      string                 `json:"note"`
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
@@ -656,13 +659,20 @@ type accountView struct {
 }
 
 // accountViews maps the pool to its wire form, marking the active entry.
+// Region is normalized to "cn" for pre-region entries so the UI can rely on
+// the field always naming a real deployment.
 func accountViews(accounts []store.Account, activeID string) []accountView {
 	out := make([]accountView, 0, len(accounts))
 	for i := range accounts {
 		acc := accounts[i]
+		region := acc.Region
+		if region == "" {
+			region = "cn"
+		}
 		out = append(out, accountView{
 			ID:        acc.ID,
 			PATMasked: maskPAT(acc.PAT),
+			Region:    region,
 			Note:      acc.Note,
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
@@ -682,18 +692,25 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID())})
 	case http.MethodPost:
 		var body struct {
-			PAT  string `json:"pat"`
-			Note string `json:"note"`
+			PAT    string `json:"pat"`
+			Note   string `json:"note"`
+			Region string `json:"region"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		// Region is optional ("" = cn). Anything besides the known deployment
+		// names is rejected up front so it can never reach the pool.
+		if body.Region != "" && auth.RegionByName(body.Region).Name != body.Region {
+			writeJSONError(w, 400, "无效区域，可选 cn（国内版）/ global（国际版）")
 			return
 		}
 		if a.activateExisting(body.PAT) {
 			writeJSON(w, 200, map[string]string{"status": "switched"})
 			return
 		}
-		entry, err := a.store.AddAccount(body.PAT, body.Note)
+		entry, err := a.store.AddAccount(body.PAT, body.Note, body.Region)
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return
@@ -742,7 +759,7 @@ func (a *Admin) ensureAccount(pat string) {
 	if a.activateExisting(pat) {
 		return
 	}
-	_, _ = a.store.AddAccount(pat, "")
+	_, _ = a.store.AddAccount(pat, "", "")
 }
 
 // handleAccountSwitch serves POST /admin/api/accounts/switch {id}: explicit
@@ -788,6 +805,37 @@ func (a *Admin) handleAccountNote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// handleAccountRegion serves POST /admin/api/accounts/region {id, region}:
+// moves an existing account between deployments (cn ↔ global). The PAT is
+// untouched; when the edited account is the active one, the bridge rebuilds on
+// the next request — the provider tracks the active region and rebuilds on a
+// region-only change.
+func (a *Admin) handleAccountRegion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID     string `json:"id"`
+		Region string `json:"region"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	// Unlike the add flow ("" = cn), an explicit edit must name a real
+	// deployment — the UI sends one, and a blank/unknown value is a bug.
+	if auth.RegionByName(body.Region).Name != body.Region {
+		writeJSONError(w, 400, "无效区域，可选 cn（国内版）/ global（国际版）")
+		return
+	}
+	if err := a.store.UpdateAccountRegion(body.ID, body.Region); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
 // handleAccountCheck serves POST /admin/api/accounts/check {id?}: probes one
 // account (default: the active one) through a throwaway bridge and stores the
 // returned quota snapshot. This is the only account-side upstream call —
@@ -820,7 +868,7 @@ func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 503, "检测功能不可用")
 		return
 	}
-	snap, err := a.accountChecker(r.Context(), target.PAT)
+	snap, err := a.accountChecker(r.Context(), target.PAT, target.Region)
 	if err != nil {
 		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
 		writeJSONError(w, 502, "检测失败: "+err.Error())
@@ -879,6 +927,10 @@ func (a *Admin) handleModels(w http.ResponseWriter, r *http.Request) {
 
 // --- Stats endpoint ---
 
+// handleStats serves GET /admin/api/stats: the aggregated request statistics.
+// Query param account selects the scope: "" / "active" → the active pool
+// account (so the panel's default view follows account switches), "all" → the
+// whole service, otherwise an explicit account ID from the pool.
 func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, 405, "方法不允许")
@@ -888,7 +940,19 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, stats.Report{})
 		return
 	}
-	writeJSON(w, 200, a.stats.Report())
+	scope := r.URL.Query().Get("account")
+	switch scope {
+	case "", "active":
+		if id := a.store.GetActiveAccountID(); id != "" {
+			writeJSON(w, 200, a.stats.AccountReport(id))
+			return
+		}
+		writeJSON(w, 200, a.stats.Report())
+	case "all":
+		writeJSON(w, 200, a.stats.Report())
+	default:
+		writeJSON(w, 200, a.stats.AccountReport(scope))
+	}
 }
 
 // --- Logs endpoint ---

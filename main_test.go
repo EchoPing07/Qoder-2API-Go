@@ -104,6 +104,42 @@ func TestBridgeProviderFiresPatChangeHook(t *testing.T) {
 	}
 }
 
+// Region-only change (admin edits cn ↔ global on the active account): the PAT
+// is untouched, so the bridge must still rebuild on next access — the gateway
+// host changed — while the PAT-change hook stays quiet (same account, the
+// cached quota snapshot remains valid).
+func TestBridgeProviderRebuildsOnRegionChange(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	acc, err := s.AddAccount("pt-region", "", "cn")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	p := newBridgeProvider(s)
+	calls := 0
+	p.setOnPatChange(func() { calls++ })
+
+	b1 := p.currentBridge()
+	if b1 == nil {
+		t.Fatal("expected a bridge after the first fetch")
+	}
+	if err := s.UpdateAccountRegion(acc.ID, "global"); err != nil {
+		t.Fatalf("UpdateAccountRegion: %v", err)
+	}
+	b2 := p.currentBridge()
+	if b2 == nil || b2 == b1 {
+		t.Fatal("the bridge must rebuild after a region-only change")
+	}
+	if calls != 0 {
+		t.Errorf("a region-only change must not fire the PAT-change hook, got %d calls", calls)
+	}
+	if b3 := p.currentBridge(); b3 != b2 {
+		t.Error("an unchanged region must not rebuild the bridge again")
+	}
+}
+
 // Shutdown must join the account refresher before triggering the stats loop's
 // final flush: the account loop may still be mid-fetch, and a
 // SetAccount/SetBillingCycle landing after that flush would be lost on exit.
@@ -365,8 +401,8 @@ func newSwitchTestPool(t *testing.T) (*bridgeProvider, *store.Store, string, str
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	acc1, _ := s.AddAccount("pt-a", "一号")
-	acc2, _ := s.AddAccount("pt-b", "二号")
+	acc1, _ := s.AddAccount("pt-a", "一号", "cn")
+	acc2, _ := s.AddAccount("pt-b", "二号", "cn")
 	s.SetAccountSnapshot(acc1.ID, &store.AccountSnapshot{Remaining: 10, Total: 100, CheckedAt: time.Now().Unix()})
 	s.SetAccountSnapshot(acc2.ID, &store.AccountSnapshot{Remaining: 80, Total: 100, CheckedAt: time.Now().Unix()})
 	s.SetAutoSwitch(true, 20)
@@ -443,7 +479,7 @@ func TestAutoSwitchDisabled(t *testing.T) {
 func TestFailoverSwitchesAndCools(t *testing.T) {
 	p, s, acc1, acc2 := newSwitchTestPool(t)
 
-	next := p.handleChatFailover(acc1)
+	next := p.handleChatFailover(acc1, false)
 	if next == nil {
 		t.Fatal("failover should return a replacement bridge")
 	}
@@ -461,7 +497,7 @@ func TestFailoverSwitchesAndCools(t *testing.T) {
 		t.Errorf("replacement AccountID = %q, want %q", next.AccountID, acc2)
 	}
 	// 二号也失败：无候选 → nil，激活不移动
-	next = p.handleChatFailover(acc2)
+	next = p.handleChatFailover(acc2, false)
 	if next != nil {
 		t.Error("no candidate must give up (nil)")
 	}
@@ -476,15 +512,46 @@ func TestFailoverSwitchesAndCools(t *testing.T) {
 func TestFailoverDedupesConcurrent(t *testing.T) {
 	p, s, acc1, _ := newSwitchTestPool(t)
 	// 首切成功
-	p.handleChatFailover(acc1)
+	p.handleChatFailover(acc1, false)
 	active := s.GetActiveAccountID()
 	// 同一失败号再来：activeID 已变，直接返回（不再切，也不再冷却别人）
-	next := p.handleChatFailover(acc1)
+	next := p.handleChatFailover(acc1, false)
 	if next != nil {
 		t.Error("stale failure report must return nil")
 	}
 	if s.GetActiveAccountID() != active {
 		t.Error("dedupe must keep the current active account")
+	}
+}
+
+// TestFailoverQuotaExhaustedMarksAndSwitches 实时额度耗尽的 failover：失败号被
+// 标记 IsExceeded 并进冷却（无已知重置点时用通用失败窗口）、切换候选号并返回
+// 替换 bridge；内存镜像与持久化快照一致，供候选筛选与周期刷新使用。
+func TestFailoverQuotaExhaustedMarksAndSwitches(t *testing.T) {
+	p, s, acc1, acc2 := newSwitchTestPool(t)
+
+	next := p.handleChatFailover(acc1, true)
+	if next == nil {
+		t.Fatal("quota failover should return a replacement bridge")
+	}
+	if next.AccountID != acc2 || s.GetActiveAccountID() != acc2 {
+		t.Fatalf("failover should switch to %q, got active %q / replacement %q", acc2, s.GetActiveAccountID(), next.AccountID)
+	}
+	// 失败号标记硬耗尽 + 冷却
+	for _, acc := range s.ListAccounts() {
+		if acc.ID != acc1 {
+			continue
+		}
+		if acc.Snapshot == nil || !acc.Snapshot.IsExceeded {
+			t.Fatalf("quota-failed account must be marked IsExceeded: %+v", acc.Snapshot)
+		}
+		if acc.Snapshot.CooldownUntil < time.Now().Unix() {
+			t.Errorf("quota-failed account must be cooling down: %+v", acc.Snapshot)
+		}
+	}
+	// 内存镜像同步（防止周期 flush 用旧镜像覆盖标记）
+	if p.snapshots[acc1] == nil || !p.snapshots[acc1].IsExceeded {
+		t.Error("in-memory mirror must carry the IsExceeded mark")
 	}
 }
 
@@ -497,7 +564,7 @@ func TestMaybeSwitchRespectsResidence(t *testing.T) {
 		t.Fatal("precondition: fresh account must resist threshold switch")
 	}
 	// 失败路径无视驻留
-	if next := p.handleChatFailover(acc1); next == nil {
+	if next := p.handleChatFailover(acc1, false); next == nil {
 		t.Error("failure switch must ignore min residence")
 	}
 	if s.GetActiveAccountID() != acc2 {
@@ -641,7 +708,7 @@ func TestDeductCreditsWithoutBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acc, _ := s.AddAccount("pt-x", "")
+	acc, _ := s.AddAccount("pt-x", "", "cn")
 	s.SetAutoSwitch(true, 20)
 	p := newBridgeProvider(s)
 	p.switcher = newAutoSwitcher(s)

@@ -36,6 +36,7 @@ type bridgeProvider struct {
 	mu     sync.Mutex
 	bridge *bridge.OpenAiBridge
 	pat    string
+	region string // region name the current bridge was built for
 	store  *store.Store
 	switcher *autoSwitcher // nil in tests that build a provider directly
 	// snapshots are the in-memory quota snapshots maintained by passive
@@ -99,11 +100,21 @@ func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
 			// The old PAT/session must not linger once it is cleared.
 			p.bridge = nil
 			p.pat = ""
+			p.region = ""
 		}
 	} else if p.bridge == nil || p.pat != pat {
-		realPAT, region := auth.Resolve(pat)
-		p.bridge = bridge.NewOpenAiBridge(realPAT, region)
+		name := p.store.AccountRegionByPAT(pat)
+		p.bridge = bridge.NewOpenAiBridge(pat, auth.RegionByName(name))
 		p.pat = pat
+		p.region = name
+		b = p.bridge
+	} else if name := p.store.AccountRegionByPAT(pat); name != p.region {
+		// Region-only change (admin edited cn ↔ global on the active account):
+		// same PAT, new upstream. Rebuild so the next request dials the right
+		// gateway. The quota snapshot stays valid — same account — so
+		// onPatChange deliberately does not fire.
+		p.bridge = bridge.NewOpenAiBridge(pat, auth.RegionByName(name))
+		p.region = name
 		b = p.bridge
 	} else {
 		b = p.bridge
@@ -260,7 +271,8 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 	}
 	if reason == "failure" && failedID != "" {
 		// Cool the failed account down first so the candidate pick below skips
-		// it (failures are rare; one save is fine).
+		// it (failures are rare; one save is fine). An already-longer cooldown
+		// (quota exhaustion cooling to the next reset) must not be shortened.
 		for _, acc := range s.store.ListAccounts() {
 			if acc.ID != failedID {
 				continue
@@ -269,7 +281,9 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 			if acc.Snapshot != nil {
 				cp := *acc.Snapshot
 				snap = &cp
-				snap.CooldownUntil = time.Now().Add(failureCooldown).Unix()
+			}
+			if until := time.Now().Add(failureCooldown).Unix(); until > snap.CooldownUntil {
+				snap.CooldownUntil = until
 			}
 			_ = s.store.SetAccountSnapshot(failedID, snap)
 			break
@@ -307,10 +321,16 @@ func (s *autoSwitcher) maybeSwitch(reason, failedID string) {
 	}
 }
 
-// handleChatFailover implements bridge.FailoverFunc: report the auth failure
-// of failedAccountID, cool it down, switch to a candidate, and hand back the
-// replacement bridge — or nil to give up and surface the original error.
-func (p *bridgeProvider) handleChatFailover(failedAccountID string) *bridge.ResolvedBridge {
+// handleChatFailover implements bridge.FailoverFunc: report the failure of
+// failedAccountID, cool it down, switch to a candidate, and hand back the
+// replacement bridge — or nil to give up and surface the original error. A
+// quota exhaustion additionally marks the account IsExceeded with a cooldown
+// running to its next reset (the hard-exhaustion policy), so the candidate
+// picker skips it exactly as the threshold path would.
+func (p *bridgeProvider) handleChatFailover(failedAccountID string, quotaExhausted bool) *bridge.ResolvedBridge {
+	if quotaExhausted {
+		p.markQuotaExhausted(failedAccountID)
+	}
 	activeID := p.store.GetActiveAccountID()
 	p.switcher.maybeSwitch("failure", failedAccountID)
 	if p.store.GetActiveAccountID() == activeID {
@@ -322,6 +342,54 @@ func (p *bridgeProvider) handleChatFailover(failedAccountID string) *bridge.Reso
 		return nil
 	}
 	return &bridge.ResolvedBridge{Bridge: b, AccountID: p.store.GetActiveAccountID()}
+}
+
+// markQuotaExhausted records a real-time upstream quota exhaustion on the
+// account: IsExceeded plus a cooldown running to the next subscription reset
+// when one is known (same policy as applyQuotaToSnapshot's hard-exhaustion
+// branch), otherwise the generic failure window. The store snapshot is the
+// candidate picker's source of truth; the in-memory mirror is updated too so
+// the periodic flush cannot undo the marking before the next authoritative
+// refresh.
+func (p *bridgeProvider) markQuotaExhausted(accountID string) {
+	if accountID == "" {
+		return
+	}
+	now := time.Now()
+	var snap *store.AccountSnapshot
+	for _, acc := range p.store.ListAccounts() {
+		if acc.ID != accountID {
+			continue
+		}
+		cp := store.AccountSnapshot{}
+		if acc.Snapshot != nil {
+			cp = *acc.Snapshot
+		}
+		snap = &cp
+		break
+	}
+	if snap == nil {
+		return // not a pool account; nothing to mark
+	}
+	if snap.NextResetAtMs > now.UnixMilli() {
+		snap.CooldownUntil = snap.NextResetAtMs / 1000
+	} else if until := now.Add(failureCooldown).Unix(); until > snap.CooldownUntil {
+		snap.CooldownUntil = until
+	}
+	snap.IsExceeded = true
+	snap.CheckedAt = now.Unix()
+	_ = p.store.SetAccountSnapshot(accountID, snap)
+	p.snapMu.Lock()
+	if cur := p.snapshots[accountID]; cur != nil {
+		cur.IsExceeded = true
+		if snap.CooldownUntil > cur.CooldownUntil {
+			cur.CooldownUntil = snap.CooldownUntil
+		}
+	} else {
+		cp := *snap
+		p.snapshots[accountID] = &cp
+	}
+	p.snapMu.Unlock()
 }
 
 // deductCredits passively applies one usage frame to the current account's
@@ -675,9 +743,8 @@ func main() {
 	// and returns the authoritative quota snapshot; the admin layer only owns
 	// the endpoint. On-demand only — every check costs a session round-trip.
 	// The result also seeds the auto-switch snapshot for that account.
-	adminInst.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
-		realPAT, region := auth.Resolve(pat)
-		b := bridge.NewOpenAiBridge(realPAT, region)
+	adminInst.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
+		b := bridge.NewOpenAiBridge(pat, auth.RegionByName(region))
 		acct := b.EnsureAccountStatus(ctx)
 		if acct == nil {
 			return nil, fmt.Errorf("无法获取账号状态（会话建立失败）")
@@ -711,10 +778,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	// failover hands a chat-path auth failure to the auto-switcher and, when
-	// the active account moved, returns the rebuilt bridge for a single retry.
-	failover := func(failedAccountID string) *bridge.ResolvedBridge {
-		return provider.handleChatFailover(failedAccountID)
+	// failover hands a chat-path auth failure or quota exhaustion to the
+	// auto-switcher and, when the active account moved, returns the rebuilt
+	// bridge for a single retry.
+	failover := func(failedAccountID string, quotaExhausted bool) *bridge.ResolvedBridge {
+		return provider.handleChatFailover(failedAccountID, quotaExhausted)
 	}
 	// usageHook feeds the usage sink with the account context: billed credits
 	// passively deduct the current account's snapshot (signal 3) and a

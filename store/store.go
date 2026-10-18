@@ -62,10 +62,13 @@ type Config struct {
 
 // Account is one Qoder PAT in the multi-account pool. Snapshot is nil until
 // the first successful check (admin「检测」or, later, the background loops);
-// a stale snapshot is still shown, labelled by CheckedAt.
+// a stale snapshot is still shown, labelled by CheckedAt. Region selects the
+// upstream deployment ("cn" domestic / "global" international); empty means
+// cn — every account created before regions existed is a CN account.
 type Account struct {
 	ID        string           `json:"id"`
 	PAT       string           `json:"pat"`
+	Region    string           `json:"region,omitempty"`
 	Note      string           `json:"note"`
 	CreatedAt int64            `json:"created_at"`
 	Snapshot  *AccountSnapshot `json:"snapshot,omitempty"`
@@ -474,6 +477,18 @@ func (s *Store) GetActiveAccountID() string {
 	return s.config.ActiveAccountID
 }
 
+// AccountRegionByPAT returns the region of the pool entry holding pat
+// ("" when absent — the mirrored PAT is always pooled, but a hand-edited
+// file mid-migration may briefly fall outside; the bridge then uses cn).
+func (s *Store) AccountRegionByPAT(pat string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if i := findAccountByPAT(s.config.Accounts, pat); i >= 0 {
+		return s.config.Accounts[i].Region
+	}
+	return ""
+}
+
 // ClearActiveAccount unsets the active account marker while keeping the pool
 // entries. Used when the admin explicitly clears the PAT with an empty pool
 // mirror: the bridge is torn down, but the accounts remain for re-activation.
@@ -487,8 +502,9 @@ func (s *Store) ClearActiveAccount() {
 // AddAccount appends a new account. When no account is active yet (fresh
 // install) it becomes the active one and its PAT is written to the mirrored
 // PAT field; otherwise the caller decides activation explicitly via
-// ActivateAccount, so adding never silently moves a running bridge.
-func (s *Store) AddAccount(pat, note string) (*Account, error) {
+// ActivateAccount, so adding never silently moves a running bridge. Region
+// is stored verbatim ("" / "cn" both mean the domestic deployment).
+func (s *Store) AddAccount(pat, note, region string) (*Account, error) {
 	if pat == "" {
 		return nil, fmt.Errorf("令牌不能为空")
 	}
@@ -498,7 +514,7 @@ func (s *Store) AddAccount(pat, note string) (*Account, error) {
 		s.mu.Unlock()
 		return nil, ErrDuplicateAccount
 	}
-	entry := Account{ID: id, PAT: pat, Note: note, CreatedAt: time.Now().Unix()}
+	entry := Account{ID: id, PAT: pat, Region: region, Note: note, CreatedAt: time.Now().Unix()}
 	s.config.Accounts = append(s.config.Accounts, entry)
 	if s.config.ActiveAccountID == "" {
 		s.config.ActiveAccountID = id
@@ -568,6 +584,28 @@ func (s *Store) UpdateAccountNote(id, note string) error {
 	for i := range s.config.Accounts {
 		if s.config.Accounts[i].ID == id {
 			s.config.Accounts[i].Note = note
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	return s.save()
+}
+
+// UpdateAccountRegion moves an existing account between deployments
+// ("cn" / "global"). The PAT is untouched, so the bridge rebuild (needed when
+// the edited account is the active one) is driven by the provider noticing the
+// region change, not by the PAT mirror. The value is stored verbatim — the
+// admin layer rejects unknown names before calling this.
+func (s *Store) UpdateAccountRegion(id, region string) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Accounts {
+		if s.config.Accounts[i].ID == id {
+			s.config.Accounts[i].Region = region
 			found = true
 			break
 		}

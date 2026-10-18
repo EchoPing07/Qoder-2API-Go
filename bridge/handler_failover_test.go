@@ -16,6 +16,12 @@ import (
 // retry path can be observed end to end.
 type failoverGateway struct {
 	unauthorizedFirstN int
+	// quotaFirstN 402s the first N requests with a quota-exhaustion body
+	// (real-time quota failover classification).
+	quotaFirstN int
+	// badRequestFirstN 400s the first N requests with a non-quota body —
+	// a parameter rejection must NOT trigger the failover path.
+	badRequestFirstN int
 	// authFrameAfterContent delivers an in-stream auth failure (top-level
 	// statusCodeValue) after the content frame, so handleStream wraps the
 	// AuthError in StreamReportedError (response already committed).
@@ -40,6 +46,16 @@ func newFailoverBridge(t *testing.T, gw *failoverGateway) *OpenAiBridge {
 		if gw.chatHits <= gw.unauthorizedFirstN {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`401 {"code":"40x","message":"session invalid"}`))
+			return
+		}
+		if gw.chatHits <= gw.quotaFirstN {
+			w.WriteHeader(http.StatusPaymentRequired)
+			w.Write([]byte(`{"message":"quota exceeded, waiting for reset"}`))
+			return
+		}
+		if gw.chatHits <= gw.badRequestFirstN {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"message":"max_tokens out of range"}`))
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -81,8 +97,11 @@ func TestChatHandlerFailoverRetriesOnAuthError(t *testing.T) {
 	good := newFailoverBridge(t, gwGood)
 
 	calls := 0
-	failover := func(failedAccountID string) *ResolvedBridge {
+	failover := func(failedAccountID string, quotaExhausted bool) *ResolvedBridge {
 		calls++
+		if quotaExhausted {
+			t.Error("an auth failure must not be classified as quota exhaustion")
+		}
 		return &ResolvedBridge{Bridge: good, AccountID: "acc2"}
 	}
 	handler := MakeChatHandler(
@@ -117,7 +136,7 @@ func TestChatHandlerFailoverGivesUpSurfaces502(t *testing.T) {
 	gw := &failoverGateway{unauthorizedFirstN: 99}
 	bad := newFailoverBridge(t, gw)
 
-	failover := func(string) *ResolvedBridge { return nil }
+	failover := func(string, bool) *ResolvedBridge { return nil }
 	handler := MakeChatHandler(
 		func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: bad, AccountID: "acc1"} },
 		nil, nil, failover, nil)
@@ -135,6 +154,72 @@ func TestChatHandlerFailoverGivesUpSurfaces502(t *testing.T) {
 	}
 }
 
+// Real-time quota failover: the first bridge gets an HTTP 402 quota-exhaustion
+// rejection before any byte is delivered; the callback is invoked with
+// quotaExhausted=true and, on a healthy replacement, the client sees the
+// successful completion — one request, no error surfaced.
+func TestChatHandlerFailoverRetriesOnQuotaExhausted(t *testing.T) {
+	gwBad := &failoverGateway{quotaFirstN: 99}
+	bad := newFailoverBridge(t, gwBad)
+	gwGood := &failoverGateway{}
+	good := newFailoverBridge(t, gwGood)
+
+	calls := 0
+	failover := func(failedAccountID string, quotaExhausted bool) *ResolvedBridge {
+		calls++
+		if !quotaExhausted {
+			t.Error("a quota rejection must be classified as quota exhaustion")
+		}
+		return &ResolvedBridge{Bridge: good, AccountID: "acc2"}
+	}
+	handler := MakeChatHandler(
+		func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: bad, AccountID: "acc1"} },
+		nil, nil, failover, nil)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(failoverChatReq(true)))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after quota failover retry\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"content":"ok"`) {
+		t.Errorf("body should carry the retried success:\n%s", w.Body.String())
+	}
+	if calls != 1 || gwGood.chatHits != 1 {
+		t.Errorf("failover calls = %d, good hits = %d, want 1/1", calls, gwGood.chatHits)
+	}
+}
+
+// A parameter rejection (HTTP 400, non-quota body) is a request fault, not an
+// account fault: no failover, and the legacy 400 mapping is preserved.
+func TestChatHandlerNoFailoverOnBadRequest(t *testing.T) {
+	gw := &failoverGateway{badRequestFirstN: 99}
+	bad := newFailoverBridge(t, gw)
+
+	calls := 0
+	failover := func(string, bool) *ResolvedBridge {
+		calls++
+		return nil
+	}
+	handler := MakeChatHandler(
+		func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: bad, AccountID: "acc1"} },
+		nil, nil, failover, nil)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(failoverChatReq(true)))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400\n%s", w.Code, w.Body.String())
+	}
+	if calls != 0 {
+		t.Errorf("failover fired %d time(s) on a parameter rejection, want 0", calls)
+	}
+}
+
 // A stream auth failure AFTER content was delivered arrives wrapped in
 // StreamReportedError: the response is committed, so failover must not fire
 // and the retry must not append a second copy of the stream.
@@ -144,7 +229,7 @@ func TestChatHandlerFailoverSkipsCommittedStream(t *testing.T) {
 	good := newFailoverBridge(t, &failoverGateway{})
 
 	calls := 0
-	failover := func(string) *ResolvedBridge {
+	failover := func(string, bool) *ResolvedBridge {
 		calls++
 		return &ResolvedBridge{Bridge: good, AccountID: "acc2"}
 	}

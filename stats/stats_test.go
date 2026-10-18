@@ -9,10 +9,10 @@ import (
 
 func TestRecordAndReport(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("Qwen3.7-Max", true)
-	r.Record("Qwen3.7-Max", true)
-	r.Record("Qwen3.7-Max", false)
-	r.Record("DeepSeek-V4-Pro", true)
+	r.Record("", "Qwen3.7-Max", true)
+	r.Record("", "Qwen3.7-Max", true)
+	r.Record("", "Qwen3.7-Max", false)
+	r.Record("", "DeepSeek-V4-Pro", true)
 
 	rep := r.Report()
 	if rep.Total != 4 {
@@ -59,7 +59,7 @@ func TestFlushPersists(t *testing.T) {
 		},
 	}
 	r := NewRecorder(p)
-	r.Record("GLM-5.2", false)
+	r.Record("", "GLM-5.2", false)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestPruneRemovesOldBuckets(t *testing.T) {
 	r := NewRecorder(nil)
 	r.data.Hourly["2020-01-01T00"] = &HourStat{Hour: "2020-01-01T00", Total: 1}
 	r.data.Hourly[time.Now().Format(HourKeyFormat)] = &HourStat{Hour: "now", Total: 2}
-	r.Record("Kimi-K2.7-Code", true)
+	r.Record("", "Kimi-K2.7-Code", true)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPruneRemovesOldBuckets(t *testing.T) {
 
 func TestNilPersisterSafe(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("x", true)
+	r.Record("", "x", true)
 	if err := r.Flush(); err != nil {
 		t.Errorf("Flush with nil persister should not fail, got %v", err)
 	}
@@ -127,9 +127,9 @@ func TestNilPersisterSafe(t *testing.T) {
 
 func TestRecordUsageAggregates(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("M", &Usage{PromptTokens: 17, CompletionTokens: 70, CachedTokens: 3, Credits: 0.005279472})
-	r.RecordUsage("M", &Usage{PromptTokens: 14, CompletionTokens: 341, CachedTokens: 0, Credits: 0.02449533})
-	r.RecordUsage("M", nil) // no-op guard
+	r.RecordUsage("", "M", &Usage{PromptTokens: 17, CompletionTokens: 70, CachedTokens: 3, Credits: 0.005279472})
+	r.RecordUsage("", "M", &Usage{PromptTokens: 14, CompletionTokens: 341, CachedTokens: 0, Credits: 0.02449533})
+	r.RecordUsage("", "M", nil) // no-op guard
 
 	rep := r.Report()
 	if rep.PromptTokens != 31 {
@@ -150,7 +150,7 @@ func TestRecordUsageAggregates(t *testing.T) {
 	// data carries prior usage forward.
 	r2 := NewRecorder(nil)
 	r2.data.PromptTokens = 5 // restored data carries prior usage
-	r2.RecordUsage("M", &Usage{PromptTokens: 1, CompletionTokens: 2, CachedTokens: 0, Credits: 0.5})
+	r2.RecordUsage("", "M", &Usage{PromptTokens: 1, CompletionTokens: 2, CachedTokens: 0, Credits: 0.5})
 	if r2.Report().PromptTokens != 6 {
 		t.Errorf("expected restored+new prompt tokens 6, got %d", r2.Report().PromptTokens)
 	}
@@ -160,9 +160,9 @@ func TestRecordUsageAggregates(t *testing.T) {
 // so the panel can name who drives the cycle spend, not just show a total.
 func TestRecordUsageAttributesCreditsToModel(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("GLM-5.3", &Usage{Credits: 0.5})
-	r.RecordUsage("GLM-5.3", &Usage{Credits: 0.25})
-	r.RecordUsage("Qwen3.8-Max", &Usage{Credits: 2})
+	r.RecordUsage("", "GLM-5.3", &Usage{Credits: 0.5})
+	r.RecordUsage("", "GLM-5.3", &Usage{Credits: 0.25})
+	r.RecordUsage("", "Qwen3.8-Max", &Usage{Credits: 2})
 
 	rep := r.Report()
 	rows := map[string]ModelRow{}
@@ -210,10 +210,10 @@ func TestRecordUsageAttributesCreditsToModel(t *testing.T) {
 // non-billable frame or a stream without usage must not move the average.
 func TestRecordUsageBilledCountIsNotRequestCount(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("M", true)  // succeeded but its usage frame never arrived
-	r.Record("M", false) // failed
-	r.RecordUsage("M", &Usage{Credits: 4, NonBillable: true})
-	r.RecordUsage("M", &Usage{Credits: 2})
+	r.Record("", "M", true)  // succeeded but its usage frame never arrived
+	r.Record("", "M", false) // failed
+	r.RecordUsage("", "M", &Usage{Credits: 4, NonBillable: true})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
 
 	rep := r.Report()
 	if rep.Total != 2 {
@@ -234,7 +234,7 @@ func TestRecordUsageBilledCountIsNotRequestCount(t *testing.T) {
 // panel shows a dash for it, and NaN would render literally.
 func TestRecordUsageAverageIsZeroWithoutBilledFrames(t *testing.T) {
 	r := NewRecorder(nil)
-	r.Record("M", true)
+	r.Record("", "M", true)
 	rep := r.Report()
 	if rep.BilledRequests != 0 {
 		t.Errorf("expected no billed requests, got %d", rep.BilledRequests)
@@ -248,8 +248,8 @@ func TestRecordUsageAverageIsZeroWithoutBilledFrames(t *testing.T) {
 // can report what each hour cost.
 func TestRecordUsageAttributesCreditsToHour(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("M", &Usage{Credits: 1.5})
-	r.RecordUsage("M", &Usage{Credits: 0.5})
+	r.RecordUsage("", "M", &Usage{Credits: 1.5})
+	r.RecordUsage("", "M", &Usage{Credits: 0.5})
 
 	rep := r.Report()
 	key := time.Now().Format(HourKeyFormat)
@@ -283,7 +283,7 @@ func TestRecordUsageCreditsSurviveRoundTrip(t *testing.T) {
 		},
 	}
 	r := NewRecorder(p)
-	r.RecordUsage("M", &Usage{Credits: 1.25})
+	r.RecordUsage("", "M", &Usage{Credits: 1.25})
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
@@ -319,12 +319,12 @@ func TestFlushPersistsSnapshotCopy(t *testing.T) {
 		},
 	}
 	r := NewRecorder(p)
-	r.Record("A", true)
+	r.Record("", "A", true)
 	if err := r.Flush(); err != nil {
 		t.Fatalf("Flush failed: %v", err)
 	}
-	r.Record("A", true)
-	r.Record("B", false)
+	r.Record("", "A", true)
+	r.Record("", "B", false)
 	if saved.Total != 1 {
 		t.Errorf("saved snapshot mutated by later records: total=%d", saved.Total)
 	}
@@ -344,7 +344,7 @@ func TestRestoreIsCloned(t *testing.T) {
 	orig.ByModel["M"] = &ModelStat{Model: "M", Total: 3}
 	p := &fakePersister{loadFn: func() *Data { return orig }}
 	r := NewRecorder(p)
-	r.Record("M", true)
+	r.Record("", "M", true)
 	if orig.Total != 3 {
 		t.Errorf("recorder mutated persisted data: total=%d", orig.Total)
 	}
@@ -364,7 +364,7 @@ func TestConcurrentRecordFlushReport(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				r.Record("Model-"+strconv.Itoa(g), i%3 != 0)
+				r.Record("", "Model-"+strconv.Itoa(g), i%3 != 0)
 			}
 		}(g)
 	}
@@ -424,8 +424,8 @@ func (f *fakePersister) SaveStats(d *Data) error {
 // credits (nothing was charged to the subscription allowance).
 func TestRecordUsageNonBillableSkipsCreditsOnly(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("M", &Usage{PromptTokens: 10, CompletionTokens: 20, Credits: 0.5, NonBillable: true})
-	r.RecordUsage("M", &Usage{PromptTokens: 1, CompletionTokens: 2, Credits: 0.25})
+	r.RecordUsage("", "M", &Usage{PromptTokens: 10, CompletionTokens: 20, Credits: 0.5, NonBillable: true})
+	r.RecordUsage("", "M", &Usage{PromptTokens: 1, CompletionTokens: 2, Credits: 0.25})
 
 	rep := r.Report()
 	if rep.PromptTokens != 11 || rep.CompletionTokens != 22 {
@@ -452,7 +452,7 @@ func TestRecordUsageNonBillableSkipsCreditsOnly(t *testing.T) {
 // should over-count credits rather than silently lose all of them.
 func TestRecordUsageDefaultsToBillable(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("M", &Usage{Credits: 1.5})
+	r.RecordUsage("", "M", &Usage{Credits: 1.5})
 	if got := r.Report().CycleCredits; got < 1.5-1e-9 || got > 1.5+1e-9 {
 		t.Errorf("expected 1.5 credits with the flag unset, got %v", got)
 	}
@@ -526,7 +526,7 @@ func TestSetBillingCycleIdempotent(t *testing.T) {
 	r := NewRecorder(nil)
 	reset := time.Now().Add(72 * time.Hour).UnixMilli()
 	r.SetBillingCycle(reset)
-	r.RecordUsage("M", &Usage{Credits: 2})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
 	r.SetBillingCycle(reset) // a redundant refresh from the account loop
 
 	if got := r.Report().CycleCredits; got < 2-1e-9 || got > 2+1e-9 {
@@ -557,7 +557,7 @@ func TestSetBillingCycleKeepsCreditsOnBoundaryDrift(t *testing.T) {
 			drifted := base.Add(drift)
 			r.setBillingCycleAt(drifted.UnixMilli(), now)
 
-			rep := r.reportAt(now)
+			rep := r.reportAt(now, "")
 			// The drift moves both end points, so the new interval is neither
 			// equal nor contained in the old one, yet it names the same period.
 			if r.data.CycleStartMs == oldStart {
@@ -621,7 +621,7 @@ func TestSetBillingCycleNextCycleZeroesCredits(t *testing.T) {
 
 			// Pin the report clock: the stored boundary sits in the past half of
 			// the table, which a bare Report would roll once real time passes it.
-			rep := r.reportAt(now)
+			rep := r.reportAt(now, "")
 			if rep.CycleCredits != 0 {
 				t.Errorf("expected a genuine refresh to zero the old credits, got %v", rep.CycleCredits)
 			}
@@ -642,8 +642,8 @@ func TestSetBillingCycleNextCycleZeroesCredits(t *testing.T) {
 // boot.
 func TestSetBillingCycleKeepsPreSyncCredits(t *testing.T) {
 	r := NewRecorder(nil)
-	r.RecordUsage("M", &Usage{Credits: 2})
-	r.RecordUsage("M", &Usage{Credits: 2})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
 	if got := r.Report().CycleCredits; got != 4 {
 		t.Fatalf("expected the pre-sync credits to accumulate, got %v", got)
 	}
@@ -652,7 +652,7 @@ func TestSetBillingCycleKeepsPreSyncCredits(t *testing.T) {
 	now := reset.Add(-72 * time.Hour).UnixMilli()
 	r.setBillingCycleAt(reset.UnixMilli(), now)
 
-	rep := r.reportAt(now)
+	rep := r.reportAt(now, "")
 	if rep.CycleCredits != 4 {
 		t.Errorf("the first boundary observation discarded pre-sync credits: %v", rep.CycleCredits)
 	}
@@ -672,7 +672,7 @@ func TestSetBillingCycleIgnoresStaleBoundary(t *testing.T) {
 	stale := time.Now().Add(-time.Hour).UnixMilli()
 	r.setBillingCycleAt(stale, stale)
 	// A request after the boundary rolls into the new cycle and bills against it.
-	r.RecordUsage("M", &Usage{Credits: 2})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
 	if got := r.Report().CycleCredits; got != 2 {
 		t.Fatalf("expected 2 credits in the rolled cycle, got %v", got)
 	}
@@ -705,7 +705,7 @@ func TestSetBillingCycleRecoversFromPersistedSentinel(t *testing.T) {
 	const sentinel = int64(253402214400000) // 9999-12-31, written by the old build
 	r := NewRecorder(nil)
 	r.setBillingCycleAt(sentinel, 1000)
-	r.RecordUsage("M", &Usage{Credits: 10})
+	r.RecordUsage("", "M", &Usage{Credits: 10})
 	if got := r.Report().CycleCredits; got != 10 {
 		t.Fatalf("expected the sentinel cycle to accumulate, got %v", got)
 	}
@@ -714,7 +714,7 @@ func TestSetBillingCycleRecoversFromPersistedSentinel(t *testing.T) {
 	now := real.Add(-24 * time.Hour).UnixMilli()
 	r.setBillingCycleAt(real.UnixMilli(), now)
 
-	rep := r.reportAt(now)
+	rep := r.reportAt(now, "")
 	if rep.NextResetMs != real.UnixMilli() {
 		t.Errorf("the sentinel still masks the real boundary: got %d, want %d",
 			rep.NextResetMs, real.UnixMilli())
@@ -728,8 +728,8 @@ func TestSetBillingCycleRecoversFromPersistedSentinel(t *testing.T) {
 
 	// The rollover must work again: a request past the real boundary moves the
 	// tracked boundary forward instead of being zeroed forever.
-	r.RecordUsage("M", &Usage{Credits: 1})
-	after := r.reportAt(real.Add(time.Hour).UnixMilli())
+	r.RecordUsage("", "M", &Usage{Credits: 1})
+	after := r.reportAt(real.Add(time.Hour).UnixMilli(), "")
 	if after.CycleCredits != 1 {
 		t.Errorf("expected the rollover to resume after recovery, got %v", after.CycleCredits)
 	}
@@ -813,7 +813,7 @@ func TestCycleRollTerminatesOnUnadvanceableBoundary(t *testing.T) {
 		// The write path must terminate too, and the credits of the new cycle
 		// must survive instead of being wiped by the stale boundary on every
 		// request.
-		r.RecordUsage("M", &Usage{Credits: 3})
+		r.RecordUsage("", "M", &Usage{Credits: 3})
 		if r.data.NextResetMs != 0 {
 			t.Errorf("expected the write path to drop the boundary, got %d", r.data.NextResetMs)
 		}
@@ -915,7 +915,7 @@ func TestSetBillingCycleIgnoresZero(t *testing.T) {
 	r := NewRecorder(nil)
 	reset := time.Now().Add(72 * time.Hour).UnixMilli()
 	r.SetBillingCycle(reset)
-	r.RecordUsage("M", &Usage{Credits: 3})
+	r.RecordUsage("", "M", &Usage{Credits: 3})
 	r.SetBillingCycle(0)
 
 	rep := r.Report()
@@ -936,9 +936,9 @@ func TestCycleRolloverHappensOnce(t *testing.T) {
 	past := time.Now().Add(-time.Hour).UnixMilli()
 	r.SetBillingCycle(past)
 
-	r.RecordUsage("M", &Usage{Credits: 1})
-	r.RecordUsage("M", &Usage{Credits: 2})
-	r.RecordUsage("M", &Usage{Credits: 4})
+	r.RecordUsage("", "M", &Usage{Credits: 1})
+	r.RecordUsage("", "M", &Usage{Credits: 2})
+	r.RecordUsage("", "M", &Usage{Credits: 4})
 
 	rep := r.Report()
 	if rep.CycleCredits < 7-1e-9 || rep.CycleCredits > 7+1e-9 {
@@ -1153,5 +1153,91 @@ func TestPersistedAccountSurvivesRestartUntilCleared(t *testing.T) {
 	again := NewRecorder(p)
 	if got := again.Report().Account; got != nil {
 		t.Errorf("the cleared snapshot came back after a second restart: %+v", got)
+	}
+}
+
+// TestAccountAttribution 按账号归属：Record/RecordUsage 写入对应账号桶，
+// AccountReport 只含该账号的计数（无流量账号为零值报表），Report 汇总全局。
+func TestAccountAttribution(t *testing.T) {
+	r := NewRecorder(nil)
+	r.Record("acc1", "M1", true)
+	r.Record("acc1", "M2", false)
+	r.Record("acc2", "M1", true)
+	r.RecordUsage("acc1", "M1", &Usage{PromptTokens: 10, CompletionTokens: 20, CachedTokens: 2, Credits: 1.5})
+	r.RecordUsage("acc2", "M1", &Usage{PromptTokens: 1, CompletionTokens: 2, Credits: 0.5})
+	r.RecordUsage("acc2", "M1", &Usage{Credits: 2, NonBillable: true}) // 不计费帧不进 credits
+
+	rep1 := r.AccountReport("acc1")
+	if rep1.Total != 2 || rep1.Success != 1 || rep1.Failed != 1 {
+		t.Errorf("acc1 total/success/failed = %d/%d/%d, want 2/1/1", rep1.Total, rep1.Success, rep1.Failed)
+	}
+	if rep1.Credits != 1.5 || rep1.BilledRequests != 1 {
+		t.Errorf("acc1 credits/billed = %v/%d, want 1.5/1", rep1.Credits, rep1.BilledRequests)
+	}
+	if rep1.PromptTokens != 10 || rep1.CachedTokens != 2 {
+		t.Errorf("acc1 tokens = %d/%d, want 10/2", rep1.PromptTokens, rep1.CachedTokens)
+	}
+
+	rep2 := r.AccountReport("acc2")
+	if rep2.Total != 1 || rep2.Credits != 0.5 {
+		t.Errorf("acc2 total/credits = %d/%v, want 1/0.5（不计费帧不计 credits）", rep2.Total, rep2.Credits)
+	}
+	if rep2.AvgCredits != 0.5 {
+		t.Errorf("acc2 avg = %v, want 0.5", rep2.AvgCredits)
+	}
+
+	empty := r.AccountReport("accX")
+	if empty.Total != 0 || empty.Credits != 0 || empty.ByModel == nil || len(empty.ByModel) != 0 {
+		t.Errorf("unknown account must yield an empty report, got %+v", empty)
+	}
+
+	all := r.Report()
+	if all.Total != 3 || all.Credits != 2 {
+		t.Errorf("global total/credits = %d/%v, want 3/2", all.Total, all.Credits)
+	}
+	// 按模型行按账号隔离：acc1 有 M1+M2 两行
+	models := map[string]bool{}
+	for _, m := range rep1.ByModel {
+		models[m.Model] = true
+	}
+	if !models["M1"] || !models["M2"] {
+		t.Errorf("acc1 model rows = %v, want M1+M2", models)
+	}
+}
+
+// TestAccountCycleZeroingOnRefresh 订阅边界真正刷新时，各账号的本周期消耗一并清零。
+func TestAccountCycleZeroingOnRefresh(t *testing.T) {
+	r := NewRecorder(nil)
+	// 边界放在未来（20 天后），这样 RecordUsage 的墙钟滚动不会先于刷新触发；
+	// 刷新边界前移一整个周期（≥ 漂移容忍度）→ 真正的周期更替 → 清零。
+	reset := time.Now().AddDate(0, 0, 20).UTC()
+	reset = time.Date(reset.Year(), reset.Month(), reset.Day(), 0, 0, 0, 0, time.UTC)
+	r.SetBillingCycle(reset.UnixMilli())
+	r.RecordUsage("acc1", "M", &Usage{Credits: 2})
+	r.RecordUsage("acc2", "M", &Usage{Credits: 3})
+	if got := r.AccountReport("acc1").CycleCredits; got != 2 {
+		t.Fatalf("acc1 cycle = %v, want 2", got)
+	}
+	r.SetBillingCycle(addMonthsMs(reset.UnixMilli(), 1))
+	if got := r.AccountReport("acc1").CycleCredits; got != 0 {
+		t.Errorf("acc1 cycle after refresh = %v, want 0", got)
+	}
+	if got := r.AccountReport("acc2").CycleCredits; got != 0 {
+		t.Errorf("acc2 cycle after refresh = %v, want 0", got)
+	}
+}
+
+// TestAccountAttributionPersists 账号桶随 Flush 持久化并在重启后恢复。
+func TestAccountAttributionPersists(t *testing.T) {
+	p := &memoryPersister{}
+	r := NewRecorder(p)
+	r.Record("acc1", "M", true)
+	r.RecordUsage("acc1", "M", &Usage{Credits: 1.25})
+	if err := r.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	r2 := NewRecorder(p)
+	if got := r2.AccountReport("acc1"); got.Total != 1 || got.Credits != 1.25 {
+		t.Errorf("after reload acc1 total/credits = %d/%v, want 1/1.25", got.Total, got.Credits)
 	}
 }

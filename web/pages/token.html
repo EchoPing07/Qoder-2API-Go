@@ -3,7 +3,10 @@
           <h1>账号</h1>
           <div class="page-actions">
             <a class="btn btn-secondary btn-sm" href="https://qoder.cn/account/integrations" target="_blank" rel="noreferrer">
-              <span class="ic" x-html="ic('external')"></span>创建令牌
+              <span class="ic" x-html="ic('external')"></span>创建令牌（国内）
+            </a>
+            <a class="btn btn-secondary btn-sm" href="https://qoder.com/account/integrations" target="_blank" rel="noreferrer">
+              <span class="ic" x-html="ic('external')"></span>创建令牌（国际）
             </a>
             <button class="btn btn-sm" @click="accountModal=true"><span class="ic" x-html="ic('plus')"></span>添加账号</button>
           </div>
@@ -26,6 +29,7 @@
                     <td>
                       <div class="row" style="gap:6px;flex-wrap:nowrap">
                         <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
+                        <span class="badge" :class="acc.region==='global' ? 'badge-warn' : 'badge-muted'" x-text="acc.region==='global' ? '国际' : '国内'"></span>
                         <span class="badge badge-ok" x-show="acc.active">使用中</span>
                       </div>
                     </td>
@@ -41,6 +45,7 @@
                           <span x-show="checkingId!==acc.id">检测</span>
                         </button>
                         <button class="btn btn-ghost btn-sm" @click="editAccountNote(acc)">备注</button>
+                        <button class="btn btn-ghost btn-sm" @click="editAccountRegion(acc)">区域</button>
                         <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteAccount(acc)">删除</button>
                       </div>
                     </td>
@@ -87,6 +92,14 @@
       <form @submit.prevent="createAccount()">
         <div class="modal-title">添加账号</div>
         <p class="modal-msg">填入 Qoder 个人访问令牌（PAT）。令牌相同时视为切换到已有账号。</p>
+        <div class="form-row">
+          <label class="label">区域</label>
+          <select class="input" x-model="accountForm.region">
+            <option value="cn">国内版（qoder.cn）</option>
+            <option value="global">国际版（qoder.com）</option>
+          </select>
+          <p class="field-hint">国内令牌在 qoder.cn 创建、国际令牌在 qoder.com 创建，两者互不通用；国际版网关为 api2.qoder.sh（美区 api1 / 日区 api3 不在此切换）。</p>
+        </div>
         <div class="form-row"><label class="label">令牌</label><input class="input mono" x-model="accountForm.pat" placeholder="pt-..." autocomplete="off"></div>
         <div class="form-row"><label class="label">备注</label><input class="input" x-model="accountForm.note" placeholder="可选描述" autocomplete="off"></div>
         <div class="modal-foot">
@@ -109,6 +122,28 @@
       <div class="form-row"><label class="label">备注</label><input class="input" x-model="noteForm.note" placeholder="可选描述" autocomplete="off"></div>
       <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="noteModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">保存</button>
+      </div>
+    </form>
+  </div>
+</template>
+
+<!-- ═══ 改区域弹窗 ═══ -->
+<template x-if="regionModal">
+  <div class="overlay" @click.self="regionModal=false">
+    <form class="modal" @submit.prevent="saveAccountRegion()">
+      <div class="modal-title">修改区域</div>
+      <p class="modal-msg">令牌保持不变，仅切换上游部署。若修改的是激活中的账号，桥接会话将在下次请求时自动重建。</p>
+      <div class="form-row">
+        <label class="label">区域</label>
+        <select class="input" x-model="regionForm.region">
+          <option value="cn">国内版（qoder.cn）</option>
+          <option value="global">国际版（qoder.com）</option>
+        </select>
+        <p class="field-hint">请确认令牌确实来自所选区域：国内令牌在 qoder.cn 创建、国际令牌在 qoder.com 创建，两者互不通用，选错区域会导致上游鉴权失败。</p>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="regionModal=false">取消</button>
         <button type="submit" class="btn btn-sm" :disabled="loading">保存</button>
       </div>
     </form>

@@ -221,9 +221,9 @@ func TestStatsEndpoint(t *testing.T) {
 		return models.DefaultCatalog().Keys()
 	}
 	rec := stats.NewRecorder(nil)
-	rec.Record("Qwen3.7-Max", true)
-	rec.Record("Qwen3.7-Max", false)
-	rec.Record("DeepSeek-V4-Pro", true)
+	rec.Record("", "Qwen3.7-Max", true)
+	rec.Record("", "Qwen3.7-Max", false)
+	rec.Record("", "DeepSeek-V4-Pro", true)
 	a := New(s, mf, rec, nil)
 
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
@@ -516,7 +516,7 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 		UserQuota:            &stats.Quota{Total: 3000, Used: 2939, Remaining: 61, Percentage: 0.98, Unit: "credits"},
 		OrgResourcePackage:   &stats.OrgResourcePackage{Cap: 4000, Available: false, Unit: "credits"},
 	})
-	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{PromptTokens: 5, Credits: 1.25})
+	rec.RecordUsage("", "Qwen3.7-Max", &stats.Usage{PromptTokens: 5, Credits: 1.25})
 
 	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
@@ -570,10 +570,10 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 // stats endpoint; the UI renders it directly and has no other channel for it.
 func TestStatsEndpointExposesCreditBreakdown(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 1.5})
-	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 0.5})
-	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 3})
-	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 9, NonBillable: true})
+	rec.RecordUsage("", "Qwen3.7-Max", &stats.Usage{Credits: 1.5})
+	rec.RecordUsage("", "Qwen3.7-Max", &stats.Usage{Credits: 0.5})
+	rec.RecordUsage("", "Kimi-K2.7-Code", &stats.Usage{Credits: 3})
+	rec.RecordUsage("", "Kimi-K2.7-Code", &stats.Usage{Credits: 9, NonBillable: true})
 
 	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
@@ -647,7 +647,7 @@ func TestStatsEndpointExposesCreditBreakdown(t *testing.T) {
 // total instead of rendering a bogus "resetting soon".
 func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 2})
+	rec.RecordUsage("", "Qwen3.7-Max", &stats.Usage{Credits: 2})
 
 	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
@@ -994,7 +994,7 @@ func TestAccountSwitchUnknown(t *testing.T) {
 // TestAccountNoteEndpoint 备注更新端点。
 func TestAccountNoteEndpoint(t *testing.T) {
 	a, s := newAdmin(t)
-	acc, _ := s.AddAccount("pt-note", "")
+	acc, _ := s.AddAccount("pt-note", "", "cn")
 	w := doRequest(t, a.handleAccountNote, "POST", "/admin/api/accounts/note", map[string]string{"id": acc.ID, "note": "测试备注"})
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -1008,12 +1008,38 @@ func TestAccountNoteEndpoint(t *testing.T) {
 	}
 }
 
+// TestAccountRegionEndpoint 区域编辑端点：合法值落库；未知区域 400（编辑必须
+// 指名真实部署，与添加流的 ""=cn 不同）；未知账号 404。
+func TestAccountRegionEndpoint(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-region", "", "cn")
+	w := doRequest(t, a.handleAccountRegion, "POST", "/admin/api/accounts/region", map[string]string{"id": acc.ID, "region": "global"})
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.ListAccounts()[0].Region != "global" {
+		t.Errorf("region = %q", s.ListAccounts()[0].Region)
+	}
+	w = doRequest(t, a.handleAccountRegion, "POST", "/admin/api/accounts/region", map[string]string{"id": acc.ID, "region": "eu"})
+	if w.Code != 400 {
+		t.Errorf("unknown region should 400, got %d", w.Code)
+	}
+	w = doRequest(t, a.handleAccountRegion, "POST", "/admin/api/accounts/region", map[string]string{"id": acc.ID, "region": ""})
+	if w.Code != 400 {
+		t.Errorf("empty region should 400, got %d", w.Code)
+	}
+	w = doRequest(t, a.handleAccountRegion, "POST", "/admin/api/accounts/region", map[string]string{"id": "nope", "region": "cn"})
+	if w.Code != 404 {
+		t.Errorf("unknown id should 404, got %d", w.Code)
+	}
+}
+
 // TestAccountCheckEndpoint 检测端点：成功时快照落库回传；失败时错误进快照（LastError）。
 func TestAccountCheckEndpoint(t *testing.T) {
 	a, s := newAdmin(t)
-	acc, _ := s.AddAccount("pt-check", "")
+	acc, _ := s.AddAccount("pt-check", "", "cn")
 	calls := 0
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		calls++
 		if pat != "pt-check" {
 			t.Errorf("checker pat = %q", pat)
@@ -1032,7 +1058,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 		t.Errorf("snapshot not persisted: %+v", snap)
 	}
 	// checker 失败：502 且 LastError 记入快照
-	a.SetAccountChecker(func(ctx context.Context, pat string) (*store.AccountSnapshot, error) {
+	a.SetAccountChecker(func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error) {
 		return nil, errors.New("会话失败")
 	})
 	w = doRequest(t, a.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc.ID})
@@ -1050,7 +1076,7 @@ func TestAccountCheckEndpoint(t *testing.T) {
 	}
 	// 未装 checker → 503
 	a2, s2 := newAdmin(t)
-	acc2, _ := s2.AddAccount("pt-x", "")
+	acc2, _ := s2.AddAccount("pt-x", "", "cn")
 	w = doRequest(t, a2.handleAccountCheck, "POST", "/admin/api/accounts/check", map[string]string{"id": acc2.ID})
 	if w.Code != 503 {
 		t.Errorf("nil checker should 503, got %d", w.Code)

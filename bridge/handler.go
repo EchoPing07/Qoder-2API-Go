@@ -34,11 +34,14 @@ type ResolvedBridge struct {
 	AccountID string
 }
 
-// FailoverFunc reports an upstream auth failure on the given account and lets
-// the caller switch to another one. It returns the replacement bridge (nil =
-// give up, surface the original error). Implemented by the caller (main
-// package); nil keeps the legacy behaviour (no failover).
-type FailoverFunc func(failedAccountID string) *ResolvedBridge
+// FailoverFunc reports an upstream auth failure or quota exhaustion on the
+// given account and lets the caller switch to another account's bridge for a
+// single retry (wired by the main package to the auto-switcher). It returns
+// the replacement bridge (nil = give up, surface the original error).
+// quotaExhausted distinguishes the two failure kinds so the caller can apply
+// the matching cooldown (short failure window vs until the account's next
+// reset). nil keeps the legacy behaviour (no failover).
+type FailoverFunc func(failedAccountID string, quotaExhausted bool) *ResolvedBridge
 
 // UsageHook receives every usage frame together with the account that served
 // the request (empty when unknown), enabling passive credit deduction for
@@ -132,14 +135,14 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		entry.Stream, _ = reqBody["stream"].(bool)
 		record := func(ok bool) {
 			if rec != nil {
-				rec.Record(model, ok)
+				rec.Record(rb.AccountID, model, ok)
 			}
 		}
 		var usageSink UsageSink
 		if rec != nil || lr != nil || usageHook != nil {
 			usageSink = func(u *transform.Usage) {
 				if rec != nil {
-					rec.RecordUsage(model, &stats.Usage{
+					rec.RecordUsage(rb.AccountID, model, &stats.Usage{
 						PromptTokens:     u.PromptTokens,
 						CompletionTokens: u.CompletionTokens,
 						CachedTokens:     u.CachedPromptTokens(),
@@ -163,12 +166,13 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		}
 
 		// One failover attempt is made when the upstream rejects the session
-		// credentials before any byte reached the client: the response is still
-		// uncommitted there (headers may have been set but WriteHeader not
-		// called), so swapping to another account's bridge and retrying is
-		// invisible to the client. A StreamReportedError (content already
-		// delivered, failure wrapped by handleStream) or a client disconnect
-		// (context.Canceled) rules the response committed and skips the retry.
+		// credentials or reports the account out of quota, before any byte
+		// reached the client: the response is still uncommitted there (headers
+		// may have been set but WriteHeader not called), so swapping to another
+		// account's bridge and retrying is invisible to the client. A
+		// StreamReportedError (content already delivered, failure wrapped by
+		// handleStream) or a client disconnect (context.Canceled) rules the
+		// response committed and skips the retry.
 		for attempt := 0; ; attempt++ {
 			err := b.HandleChat(r.Context(), w, reqBody, usageSink)
 			if err == nil {
@@ -176,13 +180,19 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			}
 			var authErr *auth.AuthError
 			var repErr *StreamReportedError
-			if attempt == 0 && failover != nil && errors.As(err, &authErr) &&
+			quota := auth.IsQuotaExhausted(err)
+			if attempt == 0 && failover != nil &&
+				(errors.As(err, &authErr) || quota) &&
 				!errors.As(err, &repErr) && !errors.Is(err, context.Canceled) {
 				// Ask the caller for a replacement bridge on another account;
 				// nil means no candidate (or switching disabled) — fall
 				// through to the original 502 mapping.
-				if next := failover(rb.AccountID); next != nil && next.Bridge != nil {
-					log.Printf("[bridge] upstream auth failure on account %s; retrying once on the switched account", rb.AccountID)
+				if next := failover(rb.AccountID, quota); next != nil && next.Bridge != nil {
+					if quota {
+						log.Printf("[bridge] upstream quota exhausted on account %s; retrying once on the switched account", rb.AccountID)
+					} else {
+						log.Printf("[bridge] upstream auth failure on account %s; retrying once on the switched account", rb.AccountID)
+					}
 					rb, b = next, next.Bridge
 					entry.KeyID, entry.KeyNote = next.KeyID, next.KeyNote
 					continue
