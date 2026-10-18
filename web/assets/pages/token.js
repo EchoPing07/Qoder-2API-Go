@@ -72,20 +72,23 @@ PAGE('token', {
   accountRegion(acc){
     return acc.region === 'global' ? '国际版' : '国内版';
   },
+  /* 状态：按实时在途判断账号是否正在服务请求（而非“默认账号”标记）。
+   * 多个对话并发时，会有多个账号同时显示「使用中」。 */
   accountStatus(acc){
     const s = acc.snapshot;
     if(!s || !s.checked_at) return '未检测';
     if(s.last_error) return '检测失败';
     if(s.is_exceeded) return '已耗尽';
-    if(acc.active) return '使用中';
-    return '正常';
+    if((acc.in_flight||0) > 0) return '使用中';
+    return '空闲';
   },
   accountStatusClass(acc){
     const s = acc.snapshot;
     if(!s || !s.checked_at) return 'badge-muted';
     if(s.last_error) return 'badge-err';
     if(s.is_exceeded) return 'badge-warn';
-    return 'badge-ok';
+    if((acc.in_flight||0) > 0) return 'badge-ok';
+    return 'badge-muted';
   },
 
   /* ── PAT（旧字段保留：面板底部不再单独展示，数据仍由激活账号镜像） ── */
