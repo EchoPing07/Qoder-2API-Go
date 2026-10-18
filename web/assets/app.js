@@ -218,15 +218,32 @@ function appShell(){
       };
     },
     copy(text){
-      // navigator.clipboard 仅在安全上下文（HTTPS / localhost）存在：非安全部署下
-      // 访问它会同步抛 TypeError，须判空 + catch，否则复制按钮静默失败。
+      // navigator.clipboard 仅在安全上下文（HTTPS / localhost）存在：明文 HTTP +
+      // 公网 IP 的部署下它是 undefined。此时降级 document.execCommand('copy')
+      // （老 API，非安全上下文可用），复制按钮在两种环境下都能一键复制。
+      const fallback = ()=>{
+        try{
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+          document.body.appendChild(ta);
+          ta.focus(); ta.select();
+          let ok = false;
+          try{ ok = document.execCommand('copy'); }catch(e){ ok = false; }
+          ta.remove();
+          this.toast(ok ? '已复制到剪贴板' : '复制失败，请手动选择文本复制', ok ? 'ok' : 'err');
+        }catch(e){
+          this.toast('复制失败，请手动选择文本复制','err');
+        }
+      };
       if(!navigator.clipboard || !navigator.clipboard.writeText){
-        this.toast('当前环境不支持剪贴板复制','err');
+        fallback();
         return;
       }
-      navigator.clipboard.writeText(text)
-        .then(()=>this.toast('已复制到剪贴板','ok'))
-        .catch(()=>this.toast('复制失败','err'));
+      navigator.clipboard.writeText(text).then(
+        ()=>this.toast('已复制到剪贴板','ok'),
+        ()=>fallback(),
+      );
     },
     fmt(n){ return (n||0).toLocaleString(); },
     compact(n){
