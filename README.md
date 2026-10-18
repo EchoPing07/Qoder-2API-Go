@@ -14,7 +14,7 @@
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
 - **多账号池 + 请求负载均衡** —— 支持多个 Qoder PAT 池化管理（国内版 / 国际版可按账号分别指定区域）：请求按策略（粘性轮换 / 纯轮询 / 最少在途）分散到不同账号，避免全部压在一个账号上；剩余积分低于阈值（默认 20，面板可调）的账号自动停止接新请求，硬耗尽的账号冷却到下次重置点；请求撞上游 401/403 时冷却失败号并自动改投其它账号重试（客户端无感）；模型名可用 `cn/`、`gl/`、`auto/` 前缀指定区域；旧版单 PAT 配置自动迁移为池中的「默认账号」
-- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、多账号池（多 PAT 添加 / 一键切换 / 额度检测 / 自动切换设置）、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、多账号池（多 PAT 添加 / 额度检测 / 权重 / 每日签到 / 负载均衡设置）、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
 - **请求日志** —— 记录每次调用的元信息（时间、模型、密钥、流式与否、token 用量、扣费额度、耗时、状态码与错误摘要，不保存对话内容），面板「日志」页支持按模型 / 密钥 / 状态筛选与分页，保留天数与条数上限可配置、自动清理最旧条目
 - **订阅周期感知** —— 从网关 `/algo/api/v3/user/status` 读取真实订阅信息（套餐、组织、`nextResetAt` 重置时间、`isQuotaExceeded` 超额标记），使面板额度按计费周期统计而非终身累计
 - **单文件部署** —— 编译为单一二进制文件，零外部依赖
@@ -86,6 +86,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 | `QODER_MAX_CONCURRENCY` | `1` | 单 PAT 同时发往上游的聊天请求数上限；超出部分本地排队等待。调大会提升吞吐，但超过 Qoder 账号的并发窗口时网关会拒绝请求（业务码 10605） |
 | `QODER_LOG_RETENTION_DAYS` | `90` | 请求日志保留天数，范围 1-3650；超期条目自动删除。设置后管理面板中不可修改 |
 | `QODER_LOG_MAX_ENTRIES` | `2000` | 请求日志条数上限，范围 100-100000；超限时自动删除最旧条目，与保留天数同时生效。设置后管理面板中不可修改 |
+| `QODER_RUNTIME_INFO` | 空 | 覆盖签到用设备指纹 helper 的路径（标准输出 `machineToken/machineType/machineCode`）。未安装 Qoder 桌面 App 时用于提供真实指纹 |
 
 > 两个超时也可在管理面板「设置 → 超时配置」中修改，保存后即时生效（无需重启）。响应超时只约束上游「开始响应」，不会截断已经建立的流。
 
@@ -133,7 +134,7 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 
 ### 1. 配置 PAT
 
-启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号一键切换；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。添加时需选择令牌所属**区域**：国内版（`qoder.com.cn`）或国际版（`qoder.sh`），区域与令牌不匹配时上游会返回 `personal token is invalid`。
+启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。添加时需选择令牌所属**区域**：国内版（`qoder.com.cn`）或国际版（`qoder.sh`），区域与令牌不匹配时上游会返回 `personal token is invalid`。重复提交相同 PAT 视为把该账号设为激活账号。
 
 > 🌍 **国际版支持**：国际版账号的聊天/状态走 `api1.qoder.sh`，额度查询走 `openapi.qoder.sh`。国际版额度接口不接受 COSY 会话令牌，程序会用 PAT 单独换取 OpenAPI 令牌（并自动刷新）后再查询余额；国内版账号则沿用原链路，无需额外配置。
 
@@ -195,6 +196,19 @@ curl http://localhost:10081/v1/chat/completions \
 ```
 
 > 前缀只用于路由，不会传给上游；统计与日志按裸模型名聚合。
+
+### 4.2 每日签到
+
+账号页（「账号 → 每日签到」卡片）可为每个账号打开**自动签到**并设置签到时间；设置页的「签到配置」给出全局默认时间（默认 `10:15`，服务器本地时间）。也可在卡片上点「签到」立即执行一次。
+
+- **结果三态**：`success`（本次领到积分）/ `already`（今日已签）/ `skipped`（今天没有可签到活动）。真正的失败单独记为 `error`，并把原因写入 `last_checkin_msg`（悬停在「最近结果」上可见）。
+- **调度**：后台每分钟检查一次，到点后按账号 ID 抖动几秒，避免整池同时打接口。同一天已成功 / 已签 / 无活动的不再重试（`skipped` 属于有意不重试：活动未开放时反复请求没有意义）；失败的在 30 分钟内不重试，之后每轮检查都会再试一次（仍在当天内）。
+- **区域**：国内版用 COSY 会话令牌作 Bearer，国际版用 OpenAPI 令牌（自动换取并刷新）；遇到 401 会强制刷新后重试一次。
+- **设备指纹**：签到接口只对携带**真实桌面客户端指纹**的请求返回「每天领 100 Credits」活动，程序因此会从已安装的 Qoder 桌面 App 里读取 `umid/runtime-info` 生成的指纹（Windows：`%LOCALAPPDATA%\Programs\Qoder[ CN]\resources\umid\runtime-info.exe`；macOS：`/Applications/Qoder[ CN].app/Contents/Resources/umid/runtime-info`）。
+
+> 🕒 **时区**：签到时间按**服务器本地时间**解释，Docker 镜像默认 `TZ=Asia/Shanghai`。国际版账号若希望按本地「新的一天」签到，请把容器的 `TZ` 改成自己的时区。
+
+> ⚠️ **已知限制**：未安装 Qoder 桌面 App 的机器（典型是 Docker / Linux 服务器，目前没有 Linux 候选路径）拿不到真实指纹，退化为 PAT 派生指纹后，上游会把签到请求当作非官方客户端，活动被静默丢弃，结果通常恒为 `already` / `skipped`。此时可用 `QODER_RUNTIME_INFO` 指向一个可执行 helper，其标准输出为 `{"machineToken":"…","machineType":"…","machineCode":"…"}`。
 
 ### 5. 思考强度与参数透传（verbatim 原则）
 
@@ -281,9 +295,12 @@ curl http://localhost:10081/v1/chat/completions \
 | `/admin/api/login` | POST | 管理面板登录 |
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
 | `/admin/api/pat` | GET/POST | PAT 令牌管理（写入自动同步账号池） |
-| `/admin/api/accounts` | GET/POST/DELETE | 账号池管理（相同 PAT 重复提交视为切换；删除激活中的账号返回 `400`） |
+| `/admin/api/accounts` | GET/POST/DELETE | 账号池管理（相同 PAT 重复提交视为切到该账号；删除激活中的账号会把激活顺延到第一个剩余账号，账号不存在才返回 `404`） |
 | `/admin/api/accounts/switch` | POST | 手动切换激活账号 |
 | `/admin/api/accounts/note` | POST | 修改账号备注 |
+| `/admin/api/accounts/weight` | POST | 设置账号权重（1..100，按权重分配请求） |
+| `/admin/api/accounts/checkin` | POST | 立即执行一次该账号的每日签到 |
+| `/admin/api/accounts/checkin-setting` | POST | 账号的自动签到开关与签到时间（`""` = 用全局默认） |
 | `/admin/api/accounts/check` | POST | 检测账号真实额度（临时会话查询一次并落快照） |
 | `/admin/api/accounts/auto` | GET/POST | 负载均衡 / 自动切换设置（开关 + 策略 + 粘性次数 + 最大重试账号数 + 剩余积分阈值） |
 | `/admin/api/models` | GET | 获取模型列表 |

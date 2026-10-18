@@ -711,8 +711,9 @@ type accountView struct {
 	LastCheckinAt     int64  `json:"last_checkin_at"`
 	LastCheckinStatus string `json:"last_checkin_status"`
 	LastCheckinMsg    string `json:"last_checkin_msg"`
-	// CheckinSupported is false for regions where daily check-in is unavailable
-	// (currently global/qoder.sh); the panel hides the controls there.
+	// CheckinSupported is always true today: both CN and global support daily
+	// check-in. Kept as an explicit field rather than dropped from the wire
+	// format.
 	CheckinSupported bool `json:"checkin_supported"`
 }
 
@@ -993,8 +994,7 @@ func (a *Admin) handleAccountCheckinSetting(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, 404, "账号不存在")
 		return
 	}
-	_ = acc // both regions support check-in
-	if err := a.store.UpdateAccountCheckin(body.ID, body.AutoCheckin, body.CheckinTime); err != nil {
+	if err := a.store.UpdateAccountCheckin(acc.ID, body.AutoCheckin, body.CheckinTime); err != nil {
 		writeJSONError(w, 400, err.Error())
 		return
 	}

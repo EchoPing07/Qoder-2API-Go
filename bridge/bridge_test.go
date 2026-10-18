@@ -2184,3 +2184,71 @@ func TestChatHandlerFailoverRetriesOnAnotherAccount(t *testing.T) {
 		t.Errorf("failover calls = %d, want 1", calls)
 	}
 }
+
+// TestInvalidateOpenAPIBearer 401 重试路径：缓存的 OpenAPI bearer 被清掉后，
+// quotaBearer 必须重新签发一个（refresh 优先），而不是复用那个被拒的 token。
+// forceRefresh 只轮换 COSY 会话，不动 OpenAPI bearer —— 这正是要显式失效它的
+// 原因。
+func TestInvalidateOpenAPIBearer(t *testing.T) {
+	var exchangeHits, refreshHits, quotaHits atomic.Int32
+	var quotaAuth atomic.Value
+	b := newGlobalAccountBridge(t, &exchangeHits, &refreshHits, &quotaHits, &quotaAuth)
+
+	first, err := b.quotaBearer(context.Background())
+	if err != nil {
+		t.Fatalf("quotaBearer: %v", err)
+	}
+	if _, err := b.quotaBearer(context.Background()); err != nil {
+		t.Fatalf("second quotaBearer: %v", err)
+	}
+	if refreshed := b.openAPIRefresh; refreshed == "" {
+		t.Fatal("expected a cached refresh token")
+	}
+
+	b.invalidateOpenAPIBearer()
+	b.openAPIMu.Lock()
+	cached := b.openAPIToken
+	b.openAPIMu.Unlock()
+	if cached != "" {
+		t.Errorf("invalidate must drop the cached bearer, still %q", cached)
+	}
+
+	again, err := b.quotaBearer(context.Background())
+	if err != nil {
+		t.Fatalf("quotaBearer after invalidate: %v", err)
+	}
+	if again == first {
+		t.Errorf("retry reuses the rejected bearer %q", first)
+	}
+	if refreshHits.Load() != 1 {
+		t.Errorf("refresh hits = %d, want 1 (a fresh bearer via refresh)", refreshHits.Load())
+	}
+}
+
+// Checkin 取不到 bearer 时必须直接失败，而不是静默退回 COSY 令牌（global 只
+// 会拒绝那个令牌，退回只会掩盖真实原因并多打一次必然失败的请求）。
+func TestCheckinFailsWhenBearerUnavailable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name":"global","id":"gid","userType":"personal_standard","refreshToken":"rt","securityOauthToken":"cosy-sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/algo/api/v3/user/status", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"id":"gid","userType":"personal_standard"}`)
+	})
+	mux.HandleFunc("/api/v1/jobToken/exchange", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":"boom"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	region := &auth.RegionConfig{Name: "global", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL, NeedsOpenAPIToken: true}
+	b := NewOpenAiBridge("pt-global", region)
+
+	_, err := b.Checkin(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when the OpenAPI bearer cannot be minted")
+	}
+	if !strings.Contains(err.Error(), "bearer") {
+		t.Errorf("error = %v, want it to name the bearer step", err)
+	}
+}

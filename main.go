@@ -139,13 +139,16 @@ func (p *bridgeProvider) setOnPatChange(fn func()) {
 }
 
 // bridgeForAccount returns the bridge for one account, building it on first use
-// or rebuilding it when the account's PAT or region changed. Safe for
-// concurrent use; never holds the lock across upstream work.
+// or rebuilding it when the account's PAT or region changed. The note is not
+// part of the signature: it is display-only, and a label edit must not reset a
+// warmed-up session and machine fingerprint. Safe for concurrent use; never
+// holds the lock across upstream work.
 func (p *bridgeProvider) bridgeForAccount(acc store.Account) *bridge.OpenAiBridge {
-	sig := acc.PAT + "|" + acc.Region + "|" + acc.Note
+	sig := acc.PAT + "|" + acc.Region
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if b, ok := p.bridges[acc.ID]; ok && p.bridgeSig[acc.ID] == sig {
+		b.SetLabel(accountLabel(acc))
 		return b
 	}
 	b := bridge.NewOpenAiBridge(acc.PAT, auth.RegionByName(acc.Region))
@@ -259,7 +262,8 @@ func (p *bridgeProvider) releaseCheckin(accountID string) {
 
 // CheckinAccount runs one manual or scheduled check-in for an account, records
 // the outcome on the account, and returns it. Failures are recorded with status
-// "error" so the panel shows the reason.
+// "error" and the reason in LastCheckinMsg (shown in the panel's recent-result
+// tooltip).
 //
 // Both regions are supported: CN uses the COSY securityOauthToken as the Bearer
 // and global uses the OpenAPI token (the bridge picks the right one). Both rely
@@ -292,7 +296,9 @@ func CheckinRegionSupported(region string) bool {
 
 // checkinDue reports whether an account is due for its daily automatic
 // check-in at now. Accounts that already succeeded/already/skipped today are
-// not re-run; a previous "error" is retried after a 30-minute gap.
+// not re-run (a "skipped" day is deliberately not retried, to avoid hammering
+// the endpoint while no campaign is open); a previous "error" is retried after
+// a 30-minute gap.
 func checkinDue(acc store.Account, configuredTime string, now time.Time) bool {
 	if !acc.AutoCheckin || acc.PAT == "" {
 		return false

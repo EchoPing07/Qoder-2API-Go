@@ -810,3 +810,17 @@ func TestSetAccountWeight(t *testing.T) {
 		t.Error("unknown id must error")
 	}
 }
+
+// ValidateCheckinTime 只接受补零的 HH:MM，与面板输入框产出的值域一致。
+func TestValidateCheckinTimeStrict(t *testing.T) {
+	for _, ok := range []string{"00:00", "09:04", "10:15", "23:59"} {
+		if err := ValidateCheckinTime(ok); err != nil {
+			t.Errorf("ValidateCheckinTime(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"9:04", "24:00", "9:4", "10:15:00", "", "ab:cd"} {
+		if err := ValidateCheckinTime(bad); err == nil {
+			t.Errorf("ValidateCheckinTime(%q) = nil, want an error", bad)
+		}
+	}
+}

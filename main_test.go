@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -850,5 +851,35 @@ func TestCheckinDueIncludesGlobal(t *testing.T) {
 	acc := store.Account{ID: "g1", PAT: "p", Region: "global", AutoCheckin: true}
 	if !checkinDue(acc, "09:00", now) {
 		t.Error("global account with auto check-in must be due after its slot")
+	}
+}
+
+// 修改备注不应重建 bridge：备注只是展示用的标签，重建会丢掉已预热的会话与
+// 机器指纹。PAT / 区域变化仍然重建。
+func TestBridgeForAccountIgnoresNote(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	acc, err := s.AddAccount("pt-note", "旧备注")
+	if err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	p := newBridgeProvider(s)
+
+	b1 := p.bridgeForAccount(*acc)
+	snap := *acc
+	snap.Note = "新备注"
+	b2 := p.bridgeForAccount(snap)
+	if b1 != b2 {
+		t.Error("a note change must reuse the existing bridge")
+	}
+	if got := b2.Label(); !strings.Contains(got, "新备注") {
+		t.Errorf("reused bridge label = %q, want the new note", got)
+	}
+
+	snap.Region = "global"
+	if b3 := p.bridgeForAccount(snap); b3 == b1 {
+		t.Error("a region change must rebuild the bridge")
 	}
 }

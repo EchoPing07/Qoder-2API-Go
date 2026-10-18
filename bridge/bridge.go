@@ -44,8 +44,9 @@ type OpenAiBridge struct {
 	pat    string
 
 	// label identifies the owning pooled account for log lines ("备注(区域)" or
-	// a masked PAT). Set once at construction; read-only afterwards.
-	label string
+	// a masked PAT). Stored atomically because SetLabel may run again when the
+	// account is renamed while chat goroutines are reading it.
+	label atomic.Value // string
 
 	machineID    string
 	machineToken string
@@ -120,27 +121,25 @@ func NewOpenAiBridge(pat string, region *auth.RegionConfig) *OpenAiBridge {
 	if len(machineType) > 18 {
 		machineType = machineType[:18]
 	}
-	return &OpenAiBridge{
+	b := &OpenAiBridge{
 		Region:       region,
 		pat:          pat,
-		label:        "pt-****(" + region.Name + ")",
 		machineID:    machineID,
 		machineToken: machineToken,
 		machineType:  machineType,
 		chatSlots:    make(chan struct{}, maxUpstreamConcurrency()),
 	}
+	b.label.Store("pt-****(" + region.Name + ")")
+	return b
 }
 
-// SetLabel sets the human-facing account label used in log lines. Callers set
-// it once, right after construction (before the bridge serves requests).
+// SetLabel sets the human-facing account label used in log lines. Safe to call
+// after the bridge started serving (a note edit re-labels it in place).
 func (b *OpenAiBridge) SetLabel(label string) {
-	if b == nil {
+	if b == nil || label == "" {
 		return
 	}
-	if label == "" {
-		return
-	}
-	b.label = label
+	b.label.Store(label)
 }
 
 // Label returns the account label for logging.
@@ -148,8 +147,8 @@ func (b *OpenAiBridge) Label() string {
 	if b == nil {
 		return ""
 	}
-	if b.label != "" {
-		return b.label
+	if s, _ := b.label.Load().(string); s != "" {
+		return s
 	}
 	return "pt-****(" + b.Region.Name + ")"
 }

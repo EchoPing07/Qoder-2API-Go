@@ -390,6 +390,16 @@ func (b *OpenAiBridge) quotaBearer(ctx context.Context) (string, error) {
 	return b.openAPIToken, nil
 }
 
+// invalidateOpenAPIBearer drops the cached OpenAPI bearer so the next
+// quotaBearer call mints a fresh one. forceRefresh only rotates the COSY
+// session, so a 401 from an OpenAPI endpoint needs this to make a retry useful.
+func (b *OpenAiBridge) invalidateOpenAPIBearer() {
+	b.openAPIMu.Lock()
+	b.openAPIToken = ""
+	b.openAPIExpMs = 0
+	b.openAPIMu.Unlock()
+}
+
 // doRenew renews the session token via refreshToken.
 func (b *OpenAiBridge) doRenew(ctx context.Context, force bool) error {
 	b.mu.Lock()

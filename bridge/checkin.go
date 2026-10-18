@@ -1,5 +1,5 @@
-// Daily check-in entry point on the bridge. It reuses the per-account session
-// (securityOauthToken) and machine identity, and force-refreshes once on a 401.
+// Daily check-in entry point on the bridge. It reuses the per-account session,
+// picks the region's campaign bearer, and force-refreshes once on a 401.
 package bridge
 
 import (
@@ -26,9 +26,11 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 	// CN accepts the COSY securityOauthToken on the campaign endpoint; global
 	// rejects it (401 TOKEN_EXPIRE) and requires the OpenAPI bearer. quotaBearer
 	// returns the right one per region (CN: securityOauth; global: OpenAPI token).
+	// A failure is surfaced instead of falling back to the COSY token: global
+	// only rejects that one, so the fallback would just mask the real cause.
 	bearer, err := b.quotaBearer(ctx)
-	if err != nil || bearer == "" {
-		bearer = b.currentSecurityOauth()
+	if err != nil {
+		return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", err)
 	}
 
 	result, err := auth.CheckinWithBearer(ctx, b.currentSess(), b.pat, b.Region, bearer, risk)
@@ -43,12 +45,14 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 		if refreshErr := b.forceRefresh(ctx); refreshErr != nil {
 			return auth.CheckinResult{}, fmt.Errorf("qoder check-in: refresh failed: %w", refreshErr)
 		}
-		if retryBearer, berr := b.quotaBearer(ctx); berr == nil && retryBearer != "" {
-			bearer = retryBearer
-		} else {
-			bearer = b.currentSecurityOauth()
+		// forceRefresh only rotates the COSY session, not the OpenAPI bearer; drop
+		// the cached one so the retry actually presents a newly minted token.
+		b.invalidateOpenAPIBearer()
+		retryBearer, berr := b.quotaBearer(ctx)
+		if berr != nil {
+			return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", berr)
 		}
-		return auth.CheckinWithBearer(ctx, b.currentSess(), b.pat, b.Region, bearer, risk)
+		return auth.CheckinWithBearer(ctx, b.currentSess(), b.pat, b.Region, retryBearer, risk)
 	}
 	return auth.CheckinResult{}, err
 }

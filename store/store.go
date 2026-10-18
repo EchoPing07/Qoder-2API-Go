@@ -104,9 +104,15 @@ const MaxAccountWeight = 100
 // DefaultCheckinTime is the default daily check-in time (local server time).
 const DefaultCheckinTime = "10:15"
 
-// ValidateCheckinTime checks that s is a valid "HH:MM" wall-clock time.
+// ValidateCheckinTime checks that s is a valid "HH:MM" wall-clock time. The
+// zero-padded form is required so the API accepts exactly the value set the
+// panel's input produces (time.Parse alone would also accept "9:04").
 func ValidateCheckinTime(s string) error {
-	if _, err := time.Parse("15:04", strings.TrimSpace(s)); err != nil {
+	s = strings.TrimSpace(s)
+	if len(s) != 5 || s[2] != ':' {
+		return fmt.Errorf("签到时间格式应为 HH:MM")
+	}
+	if _, err := time.Parse("15:04", s); err != nil {
 		return fmt.Errorf("签到时间格式应为 HH:MM")
 	}
 	return nil
@@ -148,10 +154,10 @@ type AccountSnapshot struct {
 	LastError string `json:"last_error,omitempty"`
 }
 
-// AutoSwitch configures multi-account routing. Enabled/Threshold still exclude
-// low-credit accounts from receiving new requests (and drive the legacy
-// switch-to-richest behaviour); the remaining fields tune how requests are
-// spread across the healthy pool.
+// AutoSwitch configures multi-account routing. Enabled/Threshold exclude
+// low-credit accounts from receiving new requests (unless every remaining
+// account is below it, in which case the pool keeps serving); the remaining
+// fields tune how requests are spread across the healthy pool.
 type AutoSwitch struct {
 	Enabled   bool    `json:"enabled"`
 	Threshold float64 `json:"threshold"`
@@ -162,8 +168,8 @@ type AutoSwitch struct {
 	//   "least-inflight" — prefer the account with the fewest in-flight requests.
 	Strategy string `json:"strategy"`
 	// StickyLimit is how many requests one conversation may stay on a single
-	// account before it is rotated to the next one. 0 disables rotation (the
-	// binding is kept until it expires).
+	// account before it is rotated to the next one. It is a positive count:
+	// 0 is normalized to the default (there is no "never rotate" mode).
 	StickyLimit int `json:"sticky_limit"`
 	// MaxRetryAccounts caps how many accounts one chat request may try when it
 	// hits an upstream auth failure (1..16).
@@ -532,10 +538,6 @@ func (s *Store) SetPAT(pat string) error {
 // in the pool.
 var ErrDuplicateAccount = errors.New("该令牌已存在")
 
-// ErrActiveAccount is returned when an operation would leave the pool without
-// an active account or would delete the one currently in use.
-var ErrActiveAccount = errors.New("不能删除当前激活的账号，请先切换到其他账号")
-
 // findAccountByPAT returns the index of the account holding pat, or -1.
 // Caller must hold the lock.
 func findAccountByPAT(accounts []Account, pat string) int {
@@ -897,8 +899,9 @@ func (s *Store) SetAutoSwitch(enabled bool, threshold float64) error {
 }
 
 // SetAutoSwitchConfig validates and persists the full routing configuration.
-// Threshold is absolute credits (>= 1) with no upper bound: a pool where every
-// balance sits below the threshold simply stops serving new requests.
+// Threshold is absolute credits (>= 1) with no upper bound: accounts at or
+// below it stop receiving new requests, and only a pool where every remaining
+// account is below it keeps serving (the router then relaxes the threshold).
 func (s *Store) SetAutoSwitchConfig(cfg AutoSwitch) error {
 	if cfg.Threshold < 1 {
 		return fmt.Errorf("阈值需不小于 1 积分")

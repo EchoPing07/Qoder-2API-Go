@@ -9,10 +9,11 @@ package auth
 //
 // A campaign is claimable when actionType == "CLAIM_BENEFIT" and
 // claimStatus == "CLAIMABLE"; an already-CLAIMED campaign means "今日已签到".
-// The request authenticates with the session's securityOauthToken as a Bearer
+// The request authenticates with the session's `securityOauthToken` as a Bearer
 // token (not the COSY-signed bearer used by the chat path) plus the machine
-// identity headers, so the device fingerprint matches the one used to bootstrap
-// the session.
+// identity headers. Cosy-MachineToken/Type/Code come from the genuine desktop
+// fingerprint when available; Cosy-MachineId stays the session's own random
+// uuid, so the header set is NOT byte-identical to the desktop client's.
 
 import (
 	"context"
@@ -103,9 +104,9 @@ func checkinEndpoint(region *RegionConfig) (base, origin string) {
 // caller is responsible for ensuring the session is fresh; a 401 returned here
 // is surfaced as *CheckinHTTPError so the bridge can force-refresh and retry.
 //
-// This variant sends the PAT-derived device fingerprint. Use CheckinWithRisk to
-// send the genuine desktop fingerprint, which the campaign service requires to
-// expose the daily credit activity.
+// This variant sends the PAT-derived device fingerprint. The bridge uses
+// CheckinWithBearer to send the genuine desktop fingerprint, which the campaign
+// service requires to expose the daily credit activity.
 func Checkin(ctx context.Context, sess *SessionContext, pat string, region *RegionConfig) (CheckinResult, error) {
 	return CheckinWithRisk(ctx, sess, pat, region, nil)
 }
