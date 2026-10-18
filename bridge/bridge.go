@@ -43,6 +43,10 @@ type OpenAiBridge struct {
 	Region *auth.RegionConfig
 	pat    string
 
+	// label identifies the owning pooled account for log lines ("备注(区域)" or
+	// a masked PAT). Set once at construction; read-only afterwards.
+	label string
+
 	machineID    string
 	machineToken string
 	machineType  string
@@ -119,11 +123,35 @@ func NewOpenAiBridge(pat string, region *auth.RegionConfig) *OpenAiBridge {
 	return &OpenAiBridge{
 		Region:       region,
 		pat:          pat,
+		label:        "pt-****(" + region.Name + ")",
 		machineID:    machineID,
 		machineToken: machineToken,
 		machineType:  machineType,
 		chatSlots:    make(chan struct{}, maxUpstreamConcurrency()),
 	}
+}
+
+// SetLabel sets the human-facing account label used in log lines. Callers set
+// it once, right after construction (before the bridge serves requests).
+func (b *OpenAiBridge) SetLabel(label string) {
+	if b == nil {
+		return
+	}
+	if label == "" {
+		return
+	}
+	b.label = label
+}
+
+// Label returns the account label for logging.
+func (b *OpenAiBridge) Label() string {
+	if b == nil {
+		return ""
+	}
+	if b.label != "" {
+		return b.label
+	}
+	return "pt-****(" + b.Region.Name + ")"
 }
 
 // maxUpstreamConcurrency returns the per-PAT limit on concurrent upstream

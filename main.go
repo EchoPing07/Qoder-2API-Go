@@ -128,16 +128,37 @@ func (p *bridgeProvider) setOnPatChange(fn func()) {
 // or rebuilding it when the account's PAT or region changed. Safe for
 // concurrent use; never holds the lock across upstream work.
 func (p *bridgeProvider) bridgeForAccount(acc store.Account) *bridge.OpenAiBridge {
-	sig := acc.PAT + "|" + acc.Region
+	sig := acc.PAT + "|" + acc.Region + "|" + acc.Note
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if b, ok := p.bridges[acc.ID]; ok && p.bridgeSig[acc.ID] == sig {
 		return b
 	}
 	b := bridge.NewOpenAiBridge(acc.PAT, auth.RegionByName(acc.Region))
+	b.SetLabel(accountLabel(acc))
 	p.bridges[acc.ID] = b
 	p.bridgeSig[acc.ID] = sig
 	return b
+}
+
+// accountLabel renders the account's log label: its note when set, otherwise a
+// masked PAT, always tagged with the region.
+func accountLabel(acc store.Account) string {
+	name := acc.Note
+	if name == "" {
+		if len(acc.PAT) > 8 {
+			name = acc.PAT[:4] + "****" + acc.PAT[len(acc.PAT)-4:]
+		} else if acc.PAT != "" {
+			name = "pt-****"
+		} else {
+			name = "账号"
+		}
+	}
+	region := "cn"
+	if acc.Region == "global" {
+		region = "global"
+	}
+	return name + "(" + region + ")"
 }
 
 // pruneBridges drops bridges for accounts that no longer exist (or whose
@@ -173,7 +194,8 @@ func (p *bridgeProvider) resolveBridge(req bridge.ResolveRequest) *bridge.Resolv
 	if b == nil {
 		return nil
 	}
-	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: acc.ID}
+	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
+		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
 	if stickyKey != "" {
 		accountID := acc.ID
 		rb.OnSuccess = func() { p.router.bind(stickyKey, accountID) }
@@ -280,13 +302,16 @@ func (p *bridgeProvider) handleChatFailover(failedAccountID string, req bridge.R
 	if b == nil {
 		return nil
 	}
-	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note, AccountID: acc.ID}
+	rb := &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note,
+		AccountID: acc.ID, AccountNote: acc.Note, Region: auth.RegionByName(acc.Region).Name}
 	if stickyKey != "" {
 		accountID := acc.ID
 		rb.OnSuccess = func() { p.router.bind(stickyKey, accountID) }
 	}
 	return rb
 }
+
+// currentBridge returns the bridge for the active account
 
 // modelsUnion merges the model names from every account's catalog so the admin
 // panel (and /v1/models via the default account) reflects models available in
@@ -704,13 +729,13 @@ func main() {
 	adminInst := admin.New(st, modelFetcher, rec, logRec)
 	// Per-account in-flight count for the panel: shows how the router spreads
 	// load. Reads only the in-memory bridge counters.
-	adminInst.SetInFlight(func(accountID string) int {
+	adminInst.SetAccountRuntime(func(accountID string) (int, int) {
 		if acc, ok := st.GetAccount(accountID); ok {
 			if b := provider.bridgeForAccount(acc); b != nil {
-				return b.InFlight()
+				return b.InFlight(), b.Capacity()
 			}
 		}
-		return 0
+		return 0, 0
 	})
 	// Account「检测」runs a throwaway bridge through a full session bootstrap
 	// and returns the authoritative quota snapshot; the admin layer only owns

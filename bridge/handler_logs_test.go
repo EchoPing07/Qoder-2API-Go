@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -178,5 +179,62 @@ func TestChatHandlerLogsBridgeBootstrapFailure(t *testing.T) {
 	}
 	if e.CreatedAt < time.Now().Unix()-60 {
 		t.Errorf("CreatedAt not set: %d", e.CreatedAt)
+	}
+}
+
+// 请求日志必须记录服务该请求的账号与区域。
+func TestChatHandlerLogsAccountAndRegion(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	lr := logs.NewRecorder(nil, 90, 2000)
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge {
+		return &ResolvedBridge{Bridge: b, KeyID: "k", AccountID: "acc-1", AccountNote: "账号A", Region: "global"}
+	}, nil, lr, nil, nil)
+	handler(httptest.NewRecorder(), mkChatReq(`{"model":"M","messages":[{"role":"user","content":"hi"}]}`))
+
+	e := lr.Query(logs.Filter{PageSize: 1}).Logs[0]
+	if e.AccountID != "acc-1" || e.AccountNote != "账号A" || e.Region != "global" {
+		t.Errorf("log account = %q/%q/%q", e.AccountID, e.AccountNote, e.Region)
+	}
+}
+
+// conversationSeed：同一对话的不同轮次 seed 相同；不同首句/模型/系统前缀/图片不同。
+func TestConversationSeed(t *testing.T) {
+	base := `{"model":"M","messages":[{"role":"system","content":"sys"},{"role":"user","content":"你好"}]}`
+	dec := func(s string) map[string]interface{} {
+		var m map[string]interface{}
+		_ = json.Unmarshal([]byte(s), &m)
+		return m
+	}
+	seed := func(s string) string {
+		m := dec(s)
+		model, _ := m["model"].(string)
+		return conversationSeed(m, model)
+	}
+
+	a := seed(base)
+	// 追加后续轮次，seed 不变。
+	turn2 := `{"model":"M","messages":[{"role":"system","content":"sys"},{"role":"user","content":"你好"},{"role":"assistant","content":"在"},{"role":"user","content":"再说点"}]}`
+	if seed(turn2) != a {
+		t.Error("appending turns must not change the seed")
+	}
+	// 不同首句 -> 不同 seed。
+	if seed(`{"model":"M","messages":[{"role":"user","content":"再见"}]}`) == a {
+		t.Error("different first user text must differ")
+	}
+	// 相同首句、不同 system 前缀 -> 不同 seed（避免不同对话误判同一会话）。
+	if seed(`{"model":"M","messages":[{"role":"system","content":"别的系统提示"},{"role":"user","content":"你好"}]}`) == a {
+		t.Error("different system prefix must differ")
+	}
+	// 不同模型 -> 不同 seed。
+	if seed(`{"model":"M2","messages":[{"role":"system","content":"sys"},{"role":"user","content":"你好"}]}`) == a {
+		t.Error("different model must differ")
+	}
+	// 没有 user 消息 -> 空 seed。
+	if seed(`{"model":"M","messages":[{"role":"system","content":"sys"}]}`) != "" {
+		t.Error("no user message must yield empty seed")
 	}
 }

@@ -5,6 +5,8 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
@@ -32,6 +34,10 @@ type ResolvedBridge struct {
 	// gives the failover callback the identity of the account that failed so
 	// the router can exclude it from the retry.
 	AccountID string
+	// AccountNote/Region label the serving account for the request log
+	// (note is the user-facing label, region is "cn"/"global").
+	AccountNote string
+	Region      string
 	// OnSuccess, when set, runs after the request completes without error. The
 	// router uses it to bind the sticky session to the account only after a
 	// real success (a failed account must never be pinned).
@@ -144,7 +150,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			APIKey:     token,
 			Model:      bareModel,
 			Region:     regionFilter,
-			StickySeed: firstUserContent(reqBody),
+			StickySeed: conversationSeed(reqBody, bareModel),
 			Exclude:    map[string]bool{},
 		}
 		var rb *ResolvedBridge
@@ -160,7 +166,13 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		// One log entry per authenticated request; auth failures are rejected
 		// above and never logged. Fields are filled in below and the entry is
 		// recorded by the deferred flush, the single exit point.
-		entry := &logs.LogEntry{KeyID: rb.KeyID, KeyNote: rb.KeyNote}
+		entry := &logs.LogEntry{
+			KeyID:       rb.KeyID,
+			KeyNote:     rb.KeyNote,
+			AccountID:   rb.AccountID,
+			AccountNote: rb.AccountNote,
+			Region:      rb.Region,
+		}
 		defer func() {
 			entry.DurationMs = time.Since(start).Milliseconds()
 			if lr != nil {
@@ -229,6 +241,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 					log.Printf("[bridge] upstream auth failure on account %s; retrying on another account", rb.AccountID)
 					rb, b = next, next.Bridge
 					entry.KeyID, entry.KeyNote = next.KeyID, next.KeyNote
+					entry.AccountID, entry.AccountNote, entry.Region = next.AccountID, next.AccountNote, next.Region
 					continue
 				}
 			}
@@ -240,35 +253,81 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 	}
 }
 
-// firstUserContent returns the first user message's text, used as the sticky
-// routing seed so a conversation keeps hitting the same account. Empty when no
-// textual user message exists (routing then keys on the API key alone).
-func firstUserContent(reqBody map[string]interface{}) string {
+// conversationSeed builds a stable fingerprint for sticky routing from the
+// fields that stay constant across the turns of one conversation: the model,
+// the leading system/developer prefix, the tool definitions, and the first user
+// message (text + image identifiers). Later turns only append messages, so they
+// must not change the seed or affinity would break.
+//
+// Including the system prefix / tools / images (not just the first user text)
+// prevents two different conversations that happen to share an opening line
+// ("你好", or an image-only prompt) from being treated as the same session.
+// Returns "" when there is no user anchor; callers then route by API key alone.
+func conversationSeed(reqBody map[string]interface{}, bareModel string) string {
 	msgs, _ := reqBody["messages"].([]interface{})
+	var prefix []string
+	systemOpen := true
+	sawUser := false
+	firstUser := ""
 	for _, m := range msgs {
 		mm, ok := m.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if role, _ := mm["role"].(string); role != "user" {
-			continue
+		role, _ := mm["role"].(string)
+		switch role {
+		case "system", "developer":
+			if !systemOpen {
+				continue
+			}
+			if txt := messageText(mm); txt != "" {
+				prefix = append(prefix, role+":"+txt)
+			}
+		case "user":
+			systemOpen = false
+			if sawUser {
+				continue
+			}
+			sawUser = true
+			firstUser = messageText(mm) + "\x00img:" + strings.Join(transform.ExtractMessageImages(mm), ",")
+		default:
+			systemOpen = false
 		}
-		switch c := mm["content"].(type) {
-		case string:
-			return truncateRunes(c, 256)
-		case []interface{}:
-			for _, part := range c {
-				pm, ok := part.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if t, _ := pm["type"].(string); t == "text" {
-					if txt, _ := pm["text"].(string); txt != "" {
-						return truncateRunes(txt, 256)
-					}
+	}
+	if !sawUser {
+		return ""
+	}
+	tools := ""
+	if t, ok := reqBody["tools"]; ok && t != nil {
+		if b, err := marshalNoEscape(t); err == nil {
+			tools = string(b)
+		}
+	}
+	raw := bareModel + "\x00tools:" + tools + "\x00prefix:" + strings.Join(prefix, "\x01") + "\x00first:" + firstUser
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+// messageText extracts a message's textual content (string or multimodal
+// parts), trimmed and capped.
+func messageText(mm map[string]interface{}) string {
+	switch c := mm["content"].(type) {
+	case string:
+		return truncateRunes(strings.TrimSpace(c), 512)
+	case []interface{}:
+		var sb strings.Builder
+		for _, part := range c {
+			pm, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := pm["type"].(string); t == "text" {
+				if txt, _ := pm["text"].(string); txt != "" {
+					sb.WriteString(txt)
 				}
 			}
 		}
+		return truncateRunes(strings.TrimSpace(sb.String()), 512)
 	}
 	return ""
 }

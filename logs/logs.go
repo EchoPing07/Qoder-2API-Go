@@ -15,11 +15,17 @@ import (
 // LogEntry is one completed request's audit record. Only metadata is stored:
 // no prompts, no completions, no key material.
 type LogEntry struct {
-	ID               int64   `json:"id"`
-	KeyID            string  `json:"key_id,omitempty"`
-	KeyNote          string  `json:"key_note,omitempty"`
-	Model            string  `json:"model,omitempty"`
-	Stream           bool    `json:"stream,omitempty"`
+	ID      int64  `json:"id"`
+	KeyID   string `json:"key_id,omitempty"`
+	KeyNote string `json:"key_note,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Stream  bool   `json:"stream,omitempty"`
+	// AccountID/AccountNote/Region identify which pooled Qoder account served
+	// the request and its region (cn/global), so the audit log shows how
+	// requests were spread across the pool.
+	AccountID        string  `json:"account_id,omitempty"`
+	AccountNote      string  `json:"account_note,omitempty"`
+	Region           string  `json:"region,omitempty"`
 	PromptTokens     int     `json:"prompt_tokens,omitempty"`
 	CompletionTokens int     `json:"completion_tokens,omitempty"`
 	TotalTokens      int     `json:"total_tokens,omitempty"`

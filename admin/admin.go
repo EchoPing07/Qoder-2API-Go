@@ -36,9 +36,10 @@ const adminMaxBody = 1 << 16 // 64 KiB
 // bridge wiring.
 type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
 
-// InFlightFunc reports the number of in-flight requests currently served by an
-// account, so the panel can show how requests are spread. May be nil.
-type InFlightFunc func(accountID string) int
+// AccountRuntime reports an account's live concurrency: in-flight requests and
+// the per-account capacity, so the panel can show "2 / 1" (queued) as well as
+// spread. May be nil.
+type AccountRuntime func(accountID string) (inFlight, capacity int)
 
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
@@ -47,7 +48,7 @@ type Admin struct {
 	stats          *stats.Recorder
 	logRec         *logs.Recorder
 	accountChecker AccountChecker
-	inFlight       InFlightFunc
+	accountRuntime AccountRuntime
 	sessions       map[string]time.Time
 	sessionMu      sync.Mutex
 	limiter        *loginLimiter
@@ -74,10 +75,10 @@ func (a *Admin) SetAccountChecker(fn AccountChecker) {
 	a.accountChecker = fn
 }
 
-// SetInFlight installs the per-account in-flight reporter used by the account
-// list. Wiring happens before the server starts serving.
-func (a *Admin) SetInFlight(fn InFlightFunc) {
-	a.inFlight = fn
+// SetAccountRuntime installs the per-account concurrency reporter used by the
+// account list. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountRuntime(fn AccountRuntime) {
+	a.accountRuntime = fn
 }
 
 // RegisterRoutes registers all admin API routes on the given mux.
@@ -667,11 +668,12 @@ type accountView struct {
 	CreatedAt int64                  `json:"created_at"`
 	Active    bool                   `json:"active"`
 	InFlight  int                    `json:"in_flight"`
+	Capacity  int                    `json:"capacity"`
 	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
 }
 
 // accountViews maps the pool to its wire form, marking the active entry.
-func accountViews(accounts []store.Account, activeID string, inFlight InFlightFunc) []accountView {
+func accountViews(accounts []store.Account, activeID string, runtime AccountRuntime) []accountView {
 	out := make([]accountView, 0, len(accounts))
 	for i := range accounts {
 		acc := accounts[i]
@@ -679,9 +681,9 @@ func accountViews(accounts []store.Account, activeID string, inFlight InFlightFu
 		if region == "" {
 			region = "cn"
 		}
-		inflight := 0
-		if inFlight != nil {
-			inflight = inFlight(acc.ID)
+		inflight, capacity := 0, 0
+		if runtime != nil {
+			inflight, capacity = runtime(acc.ID)
 		}
 		out = append(out, accountView{
 			ID:        acc.ID,
@@ -691,6 +693,7 @@ func accountViews(accounts []store.Account, activeID string, inFlight InFlightFu
 			CreatedAt: acc.CreatedAt,
 			Active:    acc.ID == activeID,
 			InFlight:  inflight,
+			Capacity:  capacity,
 			Snapshot:  acc.Snapshot,
 		})
 	}
@@ -704,7 +707,7 @@ func accountViews(accounts []store.Account, activeID string, inFlight InFlightFu
 func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID(), a.inFlight)})
+		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID(), a.accountRuntime)})
 	case http.MethodPost:
 		var body struct {
 			PAT    string `json:"pat"`

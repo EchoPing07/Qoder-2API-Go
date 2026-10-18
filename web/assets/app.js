@@ -98,8 +98,11 @@ function appShell(){
       // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发；
       // 后台标签页跳过（visibilityState），回到前台时立即补一次，避免展示陈旧数据。
       setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible') this.loadStats(); }, 15000);
+      // 账号页驻留时每 5 秒刷新一次账号池（在途/额度是动态的），后台标签页跳过。
+      setInterval(()=>{ if(this.loggedIn && this.view==='token' && document.visibilityState==='visible') this.loadAccounts(); }, 5000);
       document.addEventListener('visibilitychange', ()=>{
         if(!document.hidden && this.loggedIn && this.view==='stats') this.loadStats();
+        if(!document.hidden && this.loggedIn && this.view==='token') this.loadAccounts();
       });
       try{
         const r = await this.api('/admin/api/auth');

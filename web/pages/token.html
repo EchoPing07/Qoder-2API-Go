@@ -15,11 +15,11 @@
             <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
             <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
-            <span class="muted-xs">API 桥接使用激活中的账号；切换后桥接会话在下次请求时自动重建</span>
+            <span class="muted-xs">请求按负载均衡策略分散到各账号；「默认」账号用于面板展示与手动切换</span>
           </div>
           <div class="table-wrap" x-show="accounts.length">
             <table>
-              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>在途</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
+              <thead><tr><th>令牌</th><th>区域</th><th>备注</th><th>剩余额度</th><th>在途 / 并发上限</th><th>状态</th><th>检测时间</th><th></th></tr></thead>
               <tbody>
                 <template x-for="acc in accounts" :key="acc.id">
                   <tr>
@@ -32,7 +32,7 @@
                     <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
                     <td x-text="accountQuota(acc)"></td>
-                    <td x-text="acc.in_flight || 0"></td>
+                    <td class="muted-xs mono" x-text="(acc.in_flight||0)+' / '+(acc.capacity||0)"></td>
                     <td><span class="badge" :class="accountStatusClass(acc)" x-text="accountStatus(acc)"></span></td>
                     <td class="muted-xs" x-text="acc.snapshot && acc.snapshot.checked_at ? ts(acc.snapshot.checked_at) : '—'"></td>
                     <td>
