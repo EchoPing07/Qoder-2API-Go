@@ -70,6 +70,40 @@ docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app
 
 前往 [Releases](https://github.com/EchoPing07/Qoder-2API-Go/releases) 下载对应平台的二进制文件，直接运行即可。
 
+### 方式四：macOS 后台服务（launchd，登录自启）
+
+仓库自带 `scripts/service.sh`，把服务注册为登录自启的 launchd 任务（`~/Library/LaunchAgents`），进程存活由 launchd 托管。
+
+```bash
+scripts/service.sh install    # 写入 plist；二进制不存在时自动从源码构建
+scripts/service.sh start      # 启动并等待 /health
+scripts/service.sh status     # 状态 + 健康检查
+scripts/service.sh restart    # 重启（重新加载 plist）
+scripts/service.sh stop       # 停止（下次登录仍会自启）
+scripts/service.sh off        # 停止并禁止登录自启；on 恢复
+scripts/service.sh logs       # 跟随 stderr 日志（应用的 log 输出都在这里）
+scripts/service.sh logs --out # 跟随 stdout 日志（正常时基本为空）
+scripts/service.sh update     # 重新构建二进制并重启
+```
+
+可用环境变量覆盖默认值：
+
+| 变量名 | 默认值 | 说明 |
+| ------- | -------- | ------ |
+| `QODER_BIN` | `~/.local/bin/qoder2api` | 安装的二进制路径 |
+| `QODER_DATA_DIR` | `~/.local/share/qoder2api` | 运行目录（`data.json` 与日志） |
+| `QODER_LABEL` | `com.qoder2api.service` | launchd label |
+
+> 仅支持 macOS（依赖 `launchctl` / `codesign`），其他系统会直接报错退出；Linux 请直接运行二进制或使用 Docker。
+>
+> 默认路径刻意避开 `~/Documents` 等受保护目录：launchd 启动的进程会被 macOS TCC 拦截，读不到这些目录里的文件。
+>
+> **端口归属**：脚本不把端口写进 plist，服务读取 `data.json` 里的端口，因此面板改端口后 `restart` 即生效。注意 `QODER_PORT` 环境变量优先级高于 `data.json`（见下方环境变量表），若在 launchd 之外又设了它，面板的端口配置会被覆盖。
+>
+> **日志**：应用的 `log.Printf` 全部写 stderr，所以 `logs` 默认跟随 stderr；`logs --out` 才看 stdout。
+>
+> **卸载**：`off` 只停服务并取消登录自启，不删除 plist 与二进制；彻底清理需手动删除 `~/Library/LaunchAgents/<label>.plist`、`$QODER_BIN` 与 `$QODER_DATA_DIR`（内含 `data.json`，含 PAT 等敏感数据）。
+
 ## 配置
 
 ### 环境变量
@@ -345,6 +379,7 @@ Qoder-2API-Go/
 ├── store/               # 数据持久化
 ├── transform/           # 数据转换
 ├── admin/               # Web 管理面板
+├── scripts/             # 运维脚本（macOS launchd 服务管理）
 ├── Dockerfile           # Docker 构建文件
 ├── docker-compose.yaml  # Docker Compose 配置
 └── .github/workflows/   # GitHub Actions 自动构建
