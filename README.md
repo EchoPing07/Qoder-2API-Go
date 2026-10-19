@@ -237,12 +237,12 @@ curl http://localhost:10081/v1/chat/completions \
 
 - **结果三态**：`success`（本次领到积分）/ `already`（今日已签）/ `skipped`（今天没有可签到活动）。真正的失败单独记为 `error`，并把原因写入 `last_checkin_msg`（悬停在「最近结果」上可见）。
 - **调度**：后台每分钟检查一次，到点后按账号 ID 抖动几秒，避免整池同时打接口。同一天已成功 / 已签 / 无活动的不再重试（`skipped` 属于有意不重试：活动未开放时反复请求没有意义）；失败的在 30 分钟内不重试，之后每轮检查都会再试一次（仍在当天内）。
-- **区域**：国内版用 COSY 会话令牌作 Bearer，国际版用 OpenAPI 令牌（自动换取并刷新）；遇到 401 会强制刷新后重试一次。
-- **设备指纹**：签到接口只对携带**真实桌面客户端指纹**的请求返回「每天领 100 Credits」活动，程序因此会从已安装的 Qoder 桌面 App 里读取 `umid/runtime-info` 生成的指纹（Windows：`%LOCALAPPDATA%\Programs\Qoder[ CN]\resources\umid\runtime-info.exe`；macOS：`/Applications/Qoder[ CN].app/Contents/Resources/umid/runtime-info`）。
+- **区域**：两区域的签到端点都使用 OpenAPI 令牌（`jt-`，自动换取并刷新）；遇到 401 会强制刷新后重试一次。
+- **设备指纹**：上游对机器头很敏感——携带一整套**派生**（非真实）机器头会被当作非官方客户端，「每天领 100 Credits」活动被静默过滤。因此程序只在能读到已安装 Qoder 桌面 App 的真实指纹时才发送六个机器头（Windows：`%LOCALAPPDATA%\Programs\Qoder[ CN]\resources\umid\runtime-info.exe`；macOS：`/Applications/Qoder[ CN].app/Contents/Resources/umid/runtime-info`）；读不到时一个机器头都不发，同样能领到每日积分。
 
 > 🕒 **时区**：签到时间按**服务器本地时间**解释，Docker 镜像默认 `TZ=Asia/Shanghai`。国际版账号若希望按本地「新的一天」签到，请把容器的 `TZ` 改成自己的时区。
 
-> ⚠️ **已知限制**：未安装 Qoder 桌面 App 的机器（典型是 Docker / Linux 服务器，目前没有 Linux 候选路径）拿不到真实指纹，退化为 PAT 派生指纹后，上游会把签到请求当作非官方客户端，活动被静默丢弃，结果通常恒为 `already` / `skipped`。此时可用 `QODER_RUNTIME_INFO` 指向一个可执行 helper，其标准输出为 `{"machineToken":"…","machineType":"…","machineCode":"…"}`。
+> ⚠️ **已知限制**：未安装 Qoder 桌面 App 的机器（典型是 Docker / Linux 服务器，目前没有 Linux 候选路径）拿不到真实指纹，此时签到不发送任何机器头，通用「每日领 100 Credits」活动可正常领取；仅设备定向活动是否受影响未验证。如需真实指纹，可用 `QODER_RUNTIME_INFO` 指向一个可执行 helper，其标准输出为 `{"machineToken":"…","machineType":"…","machineCode":"…"}`。
 
 ### 5. 思考强度与参数透传（verbatim 原则）
 

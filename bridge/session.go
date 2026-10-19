@@ -358,12 +358,20 @@ const quotaBearerTTLMargin = 5 * time.Minute
 
 // quotaBearer returns the bearer to use for the quota/usage endpoint. The CN
 // region accepts the COSY session token directly; the global region rejects it
-// (401 TOKEN_EXPIRE) and needs a separately-issued OpenAPI token, cached here
-// and refreshed via its refresh token.
+// (401 TOKEN_EXPIRE) and needs a separately-issued OpenAPI token.
 func (b *OpenAiBridge) quotaBearer(ctx context.Context) (string, error) {
 	if !b.Region.NeedsOpenAPIToken {
 		return b.currentSecurityOauth(), nil
 	}
+	return b.openAPIBearer(ctx)
+}
+
+// openAPIBearer returns a "jt-" bearer minted via /api/v1/jobToken/exchange.
+// The check-in campaigns endpoint requires it in BOTH regions — it rejects the
+// COSY securityOauthToken with 401 TOKEN_INVALID (CN) / TOKEN_EXPIRE (global)
+// — so unlike quota/usage there is no per-region short-circuit. Cached and
+// refreshed via its refresh token.
+func (b *OpenAiBridge) openAPIBearer(ctx context.Context) (string, error) {
 	b.openAPIMu.Lock()
 	defer b.openAPIMu.Unlock()
 	if b.openAPIToken != "" && (b.openAPIExpMs == 0 || time.Now().UnixMilli() < b.openAPIExpMs-quotaBearerTTLMargin.Milliseconds()) {
@@ -391,7 +399,7 @@ func (b *OpenAiBridge) quotaBearer(ctx context.Context) (string, error) {
 }
 
 // invalidateOpenAPIBearer drops the cached OpenAPI bearer so the next
-// quotaBearer call mints a fresh one. forceRefresh only rotates the COSY
+// openAPIBearer call mints a fresh one. forceRefresh only rotates the COSY
 // session, so a 401 from an OpenAPI endpoint needs this to make a retry useful.
 func (b *OpenAiBridge) invalidateOpenAPIBearer() {
 	b.openAPIMu.Lock()

@@ -20,6 +20,13 @@ func newCheckinTestSession() *SessionContext {
 	}
 }
 
+// machineHeaderNames is the full six-header set; without a genuine desktop
+// fingerprint none of them may be sent.
+var machineHeaderNames = []string{
+	"Cosy-MachineId", "Cosy-MachineToken", "Cosy-MachineType",
+	"Cosy-MachineCode", "Cosy-MachineOS", "Cosy-MachineHostname",
+}
+
 // withCheckinServer points the endpoint hook at srv for the test duration.
 func withCheckinServer(t *testing.T, srv *httptest.Server) {
 	t.Helper()
@@ -39,8 +46,12 @@ func TestCheckinSuccess(t *testing.T) {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			t.Errorf("missing bearer: %q", r.Header.Get("Authorization"))
 		}
-		if r.Header.Get("Cosy-MachineCode") == "" {
-			t.Error("missing Cosy-MachineCode")
+		// No genuine fingerprint (nil risk) => no machine headers at all: a
+		// full set of derived ones would filter the claimable activity.
+		for _, h := range machineHeaderNames {
+			if got := r.Header.Get(h); got != "" {
+				t.Errorf("%s = %q, want no machine headers without a desktop fingerprint", h, got)
+			}
 		}
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/campaigns"):
@@ -63,7 +74,7 @@ func TestCheckinSuccess(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	res, err := Checkin(context.Background(), newCheckinTestSession(), "pat-1", CN)
+	res, err := Checkin(context.Background(), newCheckinTestSession(), CN)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
@@ -85,7 +96,7 @@ func TestCheckinAlready(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	res, err := Checkin(context.Background(), newCheckinTestSession(), "pat-1", CN)
+	res, err := Checkin(context.Background(), newCheckinTestSession(), CN)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
@@ -101,7 +112,7 @@ func TestCheckinSkippedOn404(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	res, err := Checkin(context.Background(), newCheckinTestSession(), "pat-1", CN)
+	res, err := Checkin(context.Background(), newCheckinTestSession(), CN)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
@@ -123,7 +134,7 @@ func TestCheckinNonCreditClaimIsSkipped(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	res, err := Checkin(context.Background(), newCheckinTestSession(), "pat-1", CN)
+	res, err := Checkin(context.Background(), newCheckinTestSession(), CN)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
@@ -156,7 +167,7 @@ func TestCheckinClaimRecovered(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	res, err := Checkin(context.Background(), newCheckinTestSession(), "pat-1", CN)
+	res, err := Checkin(context.Background(), newCheckinTestSession(), CN)
 	if err != nil {
 		t.Fatalf("Checkin: %v", err)
 	}
@@ -166,10 +177,11 @@ func TestCheckinClaimRecovered(t *testing.T) {
 }
 
 // CheckinWithRisk must send the supplied genuine device fingerprint headers
-// instead of the PAT-derived ones.
+// (plus the session's MachineId) instead of any derived ones.
 func TestCheckinWithRiskSendsRiskHeaders(t *testing.T) {
-	var gotToken, gotType, gotCode string
+	var gotID, gotToken, gotType, gotCode string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID = r.Header.Get("Cosy-MachineId")
 		gotToken = r.Header.Get("Cosy-MachineToken")
 		gotType = r.Header.Get("Cosy-MachineType")
 		gotCode = r.Header.Get("Cosy-MachineCode")
@@ -182,16 +194,18 @@ func TestCheckinWithRiskSendsRiskHeaders(t *testing.T) {
 	withCheckinServer(t, srv)
 
 	risk := &RiskIdentity{MachineToken: "real-token-88", MachineType: "real-type", MachineCode: "real-code"}
-	if _, err := CheckinWithRisk(context.Background(), newCheckinTestSession(), "pat-1", CN, risk); err != nil {
+	if _, err := CheckinWithRisk(context.Background(), newCheckinTestSession(), CN, risk); err != nil {
 		t.Fatalf("CheckinWithRisk: %v", err)
 	}
-	if gotToken != "real-token-88" || gotType != "real-type" || gotCode != "real-code" {
-		t.Errorf("risk headers not sent: token=%q type=%q code=%q", gotToken, gotType, gotCode)
+	if gotID != "mid" || gotToken != "real-token-88" || gotType != "real-type" || gotCode != "real-code" {
+		t.Errorf("risk headers not sent: id=%q token=%q type=%q code=%q", gotID, gotToken, gotType, gotCode)
 	}
 }
 
-// A nil risk identity falls back to the derived headers (non-empty token).
-func TestCheckinWithRiskNilFallsBack(t *testing.T) {
+// A nil risk identity sends no machine headers: the derived fallback was
+// removed because a full set of derived headers marks the caller as an
+// unofficial client and the claimable activity is filtered out.
+func TestCheckinWithRiskNilSendsNoMachineHeaders(t *testing.T) {
 	var gotToken string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken = r.Header.Get("Cosy-MachineToken")
@@ -203,11 +217,11 @@ func TestCheckinWithRiskNilFallsBack(t *testing.T) {
 	defer srv.Close()
 	withCheckinServer(t, srv)
 
-	if _, err := CheckinWithRisk(context.Background(), newCheckinTestSession(), "pat-1", CN, nil); err != nil {
+	if _, err := CheckinWithRisk(context.Background(), newCheckinTestSession(), CN, nil); err != nil {
 		t.Fatalf("CheckinWithRisk: %v", err)
 	}
-	if gotToken != "mtok" { // newCheckinTestSession's MachineToken
-		t.Errorf("expected fallback to session machine token, got %q", gotToken)
+	if gotToken != "" {
+		t.Errorf("expected no machine headers without a fingerprint, got Cosy-MachineToken=%q", gotToken)
 	}
 }
 
@@ -226,7 +240,7 @@ func TestCheckinWithBearerUsesSuppliedToken(t *testing.T) {
 	withCheckinServer(t, srv)
 
 	sess := newCheckinTestSession() // securityOauthToken = "sot-token"
-	if _, err := CheckinWithBearer(context.Background(), sess, "pat-1", CN, "openapi-bearer-xyz", nil); err != nil {
+	if _, err := CheckinWithBearer(context.Background(), sess, CN, "openapi-bearer-xyz", nil); err != nil {
 		t.Fatalf("CheckinWithBearer: %v", err)
 	}
 	if gotAuth != "Bearer openapi-bearer-xyz" {
