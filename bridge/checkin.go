@@ -35,7 +35,7 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 		return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", err)
 	}
 
-	result, err := auth.CheckinWithBearer(ctx, b.currentSess(), b.pat, b.Region, bearer, risk)
+	result, err := auth.CheckinWithBearer(ctx, b.currentSess(), b.Region, bearer, risk)
 	if err == nil {
 		return result, nil
 	}
@@ -54,7 +54,7 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 		if berr != nil {
 			return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", berr)
 		}
-		return auth.CheckinWithBearer(ctx, b.currentSess(), b.pat, b.Region, retryBearer, risk)
+		return auth.CheckinWithBearer(ctx, b.currentSess(), b.Region, retryBearer, risk)
 	}
 	return auth.CheckinResult{}, err
 }

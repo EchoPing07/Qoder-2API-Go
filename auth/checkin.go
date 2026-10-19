@@ -9,15 +9,16 @@ package auth
 //
 // A campaign is claimable when actionType == "CLAIM_BENEFIT" and
 // claimStatus == "CLAIMABLE"; an already-CLAIMED campaign means "今日已签到".
-// The request authenticates with the session's `securityOauthToken` as a Bearer
-// token (not the COSY-signed bearer used by the chat path) plus the machine
-// identity headers. Cosy-MachineToken/Type/Code come from the genuine desktop
-// fingerprint when available; Cosy-MachineId stays the session's own random
-// uuid, so the header set is NOT byte-identical to the desktop client's.
+// The request authenticates with a "jt-" OpenAPI bearer (minted via
+// /api/v1/jobToken/exchange in both regions) — the COSY securityOauthToken is
+// rejected on this endpoint. The six Cosy-Machine* headers are sent only when
+// the genuine desktop fingerprint is available: a full set of derived
+// (non-native) values marks the caller as an unofficial client and the
+// claimable activity is filtered out, so without a fingerprint none of them
+// are sent.
 
 import (
 	"context"
-	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -104,34 +105,33 @@ func checkinEndpoint(region *RegionConfig) (base, origin string) {
 // caller is responsible for ensuring the session is fresh; a 401 returned here
 // is surfaced as *CheckinHTTPError so the bridge can force-refresh and retry.
 //
-// This variant sends the PAT-derived device fingerprint. The bridge uses
-// CheckinWithBearer to send the genuine desktop fingerprint, which the campaign
-// service requires to expose the daily credit activity.
-func Checkin(ctx context.Context, sess *SessionContext, pat string, region *RegionConfig) (CheckinResult, error) {
-	return CheckinWithRisk(ctx, sess, pat, region, nil)
+// This variant sends no machine headers (no genuine desktop fingerprint is
+// available). The bridge uses CheckinWithBearer with the desktop fingerprint
+// and the jt- OpenAPI bearer.
+func Checkin(ctx context.Context, sess *SessionContext, region *RegionConfig) (CheckinResult, error) {
+	return CheckinWithRisk(ctx, sess, region, nil)
 }
 
 // CheckinWithRisk is Checkin with an optional genuine device fingerprint. When
-// risk is valid, its machineToken/Type/Code replace the PAT-derived values, so
-// the campaign service treats the request as the official desktop client and
-// includes the claimable daily credit activity. When risk is nil or partial,
-// the derived identity is used instead.
+// risk is valid, the six machine headers carry its machineToken/Type/Code plus
+// the session's MachineId; when risk is nil or partial, no machine headers are
+// sent at all — a full set of derived values would be filtered as an
+// unofficial client.
 //
-// The Bearer token defaults to the session's securityOauthToken. Global
-// (qoder.sh) rejects that token on the campaign endpoint (401 TOKEN_EXPIRE) and
-// requires the OpenAPI bearer instead; callers there should use
-// CheckinWithBearer with the OpenAPI token.
-func CheckinWithRisk(ctx context.Context, sess *SessionContext, pat string, region *RegionConfig, risk *RiskIdentity) (CheckinResult, error) {
+// The Bearer token defaults to the session's securityOauthToken; the
+// campaigns endpoint rejects that in both regions, so production callers use
+// CheckinWithBearer with the jt- OpenAPI token.
+func CheckinWithRisk(ctx context.Context, sess *SessionContext, region *RegionConfig, risk *RiskIdentity) (CheckinResult, error) {
 	if sess == nil {
 		return CheckinResult{}, errors.New("qoder check-in: no session")
 	}
-	return CheckinWithBearer(ctx, sess, pat, region, sess.Identity.SecurityOauthToken, risk)
+	return CheckinWithBearer(ctx, sess, region, sess.Identity.SecurityOauthToken, risk)
 }
 
 // CheckinWithBearer is the low-level entry: it uses the supplied bearer token
-// (CN: securityOauthToken; global: OpenAPI token) plus the optional genuine
-// device fingerprint.
-func CheckinWithBearer(ctx context.Context, sess *SessionContext, pat string, region *RegionConfig, bearer string, risk *RiskIdentity) (CheckinResult, error) {
+// (both regions: the jt- OpenAPI token) plus the optional genuine device
+// fingerprint.
+func CheckinWithBearer(ctx context.Context, sess *SessionContext, region *RegionConfig, bearer string, risk *RiskIdentity) (CheckinResult, error) {
 	if sess == nil {
 		return CheckinResult{}, errors.New("qoder check-in: no session")
 	}
@@ -142,31 +142,14 @@ func CheckinWithBearer(ctx context.Context, sess *SessionContext, pat string, re
 
 	base, origin := checkinEndpoint(region)
 
-	// Prefer the genuine desktop fingerprint when available: the campaign
-	// service only exposes the claimable daily-credit activity to the official
-	// client's machine identity. Fall back to the PAT-derived identity otherwise.
-	// The campaign service filters CLAIMABLE entries out of the list when it
-	// sees a full set of derived (non-native) machine headers: sending all six
-	// machine* headers marks the caller as an unofficial client, while any one
-	// of them alone still shows the activity. Observed upstream behaviour, and
-	// the same fix upstream projects apply (qoder2api-hub issue #10).
-	//
-	// So: real desktop identity => send all six; no native identity (typical on
-	// Linux/Docker, where runtime-info is unavailable) => send none of them.
-	// UA / Cosy-ClientType / Cosy-Version must still be present or the endpoint
-	// returns an empty campaign list without any error.
+	// Machine headers: real desktop identity => send all six; no native
+	// identity (typical on Linux/Docker, where runtime-info is unavailable)
+	// => send none. A full set of derived (non-native) values marks the caller
+	// as an unofficial client and the claimable daily-credit activity is
+	// filtered out of the list. UA / Cosy-ClientType / Cosy-Version must still
+	// be present or the endpoint returns an empty campaign list without any
+	// error.
 	sendMachineHeaders := risk.Valid()
-	machineID := sess.MachineID
-	machineToken := sess.MachineToken
-	machineType := sess.MachineType
-	machineCode := deriveMachineCode(pat)
-	if sendMachineHeaders {
-		machineToken = risk.MachineToken
-		machineType = risk.MachineType
-		machineCode = risk.MachineCode
-	}
-	machineOS := machineOSString()
-	machineHostname := machineHostnameString()
 
 	doRequest := func(path, method string) (map[string]any, int, error) {
 		reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -182,15 +165,15 @@ func CheckinWithBearer(ctx context.Context, sess *SessionContext, pat string, re
 		req.Header.Set("Cosy-ClientType", "10")
 		req.Header.Set("Cosy-Version", "0.3.4")
 		if sendMachineHeaders {
-			req.Header.Set("Cosy-MachineId", machineID)
-			req.Header.Set("Cosy-MachineToken", machineToken)
-			req.Header.Set("Cosy-MachineType", machineType)
-			req.Header.Set("Cosy-MachineCode", machineCode)
-			if machineOS != "" {
+			req.Header.Set("Cosy-MachineId", sess.MachineID)
+			req.Header.Set("Cosy-MachineToken", risk.MachineToken)
+			req.Header.Set("Cosy-MachineType", risk.MachineType)
+			req.Header.Set("Cosy-MachineCode", risk.MachineCode)
+			if machineOS := machineOSString(); machineOS != "" {
 				req.Header.Set("Cosy-MachineOS", machineOS)
 			}
-			if machineHostname != "" {
-				req.Header.Set("Cosy-MachineHostname", machineHostname)
+			if host := machineHostnameString(); host != "" {
+				req.Header.Set("Cosy-MachineHostname", host)
 			}
 		}
 		req.Header.Set("Origin", origin)
@@ -408,17 +391,6 @@ func truncateOneLine(s string) string {
 		s = s[:200] + "…"
 	}
 	return s
-}
-
-// deriveMachineCode is the fourth machine-identity header the OpenAPI campaigns
-// endpoint expects (Cosy-MachineCode), alongside Id/Token/Type. The CLI computes
-// it from real hardware; we derive a stable value from the PAT instead, mirroring
-// the other derived identities. A partial identity (missing any of the four)
-// causes the campaigns endpoint to silently drop the claimable credit campaign,
-// so this MUST be non-empty.
-func deriveMachineCode(pat string) string {
-	sum := md5.Sum([]byte("machinecode:" + pat))
-	return hex.EncodeToString(sum[:])
 }
 
 // machineOSString mirrors the desktop client's machineOS(): "<arch>_<platform>"

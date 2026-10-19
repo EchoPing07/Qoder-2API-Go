@@ -265,10 +265,11 @@ func (p *bridgeProvider) releaseCheckin(accountID string) {
 // "error" and the reason in LastCheckinMsg (shown in the panel's recent-result
 // tooltip).
 //
-// Both regions are supported: CN uses the COSY securityOauthToken as the Bearer
-// and global uses the OpenAPI token (the bridge picks the right one). Both rely
-// on the genuine desktop fingerprint from the installed Qoder app, without which
-// the campaign service withholds the daily-credit activity.
+// Both regions are supported: the campaigns endpoint requires the jt- OpenAPI
+// bearer in either region (minted via jobToken/exchange; the bridge picks the
+// right bearer per endpoint). The genuine desktop fingerprint from the
+// installed Qoder app is optional — without it no machine headers are sent and
+// the generic daily-credit activity is still returned.
 func (p *bridgeProvider) CheckinAccount(ctx context.Context, accountID string) (auth.CheckinResult, error) {
 	acc, ok := p.store.GetAccount(accountID)
 	if !ok {

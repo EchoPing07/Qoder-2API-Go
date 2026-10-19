@@ -11,8 +11,10 @@ package auth
 // JSON object with machineToken/machineType/machineCode.
 //
 // We therefore locate that helper in the installed app and run it. When it is
-// unavailable (headless server, different OS, etc.) we fall back to the derived
-// identity so the call still works — it just may not see the daily campaign.
+// unavailable (headless server, different OS, etc.) no machine headers are sent
+// at all: a full set of DERIVED (non-native) values marks the caller as an
+// unofficial client and the daily-credit campaign is silently dropped, while
+// sending none keeps the generic daily activity visible.
 
 import (
 	"context"
