@@ -145,11 +145,22 @@ func CheckinWithBearer(ctx context.Context, sess *SessionContext, pat string, re
 	// Prefer the genuine desktop fingerprint when available: the campaign
 	// service only exposes the claimable daily-credit activity to the official
 	// client's machine identity. Fall back to the PAT-derived identity otherwise.
+	// The campaign service filters CLAIMABLE entries out of the list when it
+	// sees a full set of derived (non-native) machine headers: sending all six
+	// machine* headers marks the caller as an unofficial client, while any one
+	// of them alone still shows the activity. Observed upstream behaviour, and
+	// the same fix upstream projects apply (qoder2api-hub issue #10).
+	//
+	// So: real desktop identity => send all six; no native identity (typical on
+	// Linux/Docker, where runtime-info is unavailable) => send none of them.
+	// UA / Cosy-ClientType / Cosy-Version must still be present or the endpoint
+	// returns an empty campaign list without any error.
+	sendMachineHeaders := risk.Valid()
 	machineID := sess.MachineID
 	machineToken := sess.MachineToken
 	machineType := sess.MachineType
 	machineCode := deriveMachineCode(pat)
-	if risk.Valid() {
+	if sendMachineHeaders {
 		machineToken = risk.MachineToken
 		machineType = risk.MachineType
 		machineCode = risk.MachineCode
@@ -170,15 +181,17 @@ func CheckinWithBearer(ctx context.Context, sess *SessionContext, pat string, re
 		req.Header.Set("User-Agent", "Qoder")
 		req.Header.Set("Cosy-ClientType", "10")
 		req.Header.Set("Cosy-Version", "0.3.4")
-		req.Header.Set("Cosy-MachineId", machineID)
-		req.Header.Set("Cosy-MachineToken", machineToken)
-		req.Header.Set("Cosy-MachineType", machineType)
-		req.Header.Set("Cosy-MachineCode", machineCode)
-		if machineOS != "" {
-			req.Header.Set("Cosy-MachineOS", machineOS)
-		}
-		if machineHostname != "" {
-			req.Header.Set("Cosy-MachineHostname", machineHostname)
+		if sendMachineHeaders {
+			req.Header.Set("Cosy-MachineId", machineID)
+			req.Header.Set("Cosy-MachineToken", machineToken)
+			req.Header.Set("Cosy-MachineType", machineType)
+			req.Header.Set("Cosy-MachineCode", machineCode)
+			if machineOS != "" {
+				req.Header.Set("Cosy-MachineOS", machineOS)
+			}
+			if machineHostname != "" {
+				req.Header.Set("Cosy-MachineHostname", machineHostname)
+			}
 		}
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", base+"/growth-page/activity-iframe")
