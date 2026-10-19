@@ -1,5 +1,5 @@
 // Daily check-in entry point on the bridge. It reuses the per-account session,
-// picks the region's campaign bearer, and force-refreshes once on a 401.
+// mints the jt- campaigns bearer, and force-refreshes once on a 401.
 package bridge
 
 import (
@@ -18,17 +18,19 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 		return auth.CheckinResult{}, fmt.Errorf("qoder check-in: session: %w", err)
 	}
 
-	// The campaign service only returns the claimable daily-credit activity to
-	// the genuine desktop fingerprint; without it the activity is dropped and we
-	// would wrongly report "no campaign". Read it from the installed app helper.
+	// The genuine desktop fingerprint is optional: with it the six machine
+	// headers are sent; without it (Linux/Docker, no runtime-info helper) none
+	// are, and the daily activity is still returned. What gets the activity
+	// filtered as an unofficial client is a full set of DERIVED headers.
 	risk := auth.ReadRiskIdentity(ctx)
 
-	// CN accepts the COSY securityOauthToken on the campaign endpoint; global
-	// rejects it (401 TOKEN_EXPIRE) and requires the OpenAPI bearer. quotaBearer
-	// returns the right one per region (CN: securityOauth; global: OpenAPI token).
-	// A failure is surfaced instead of falling back to the COSY token: global
-	// only rejects that one, so the fallback would just mask the real cause.
-	bearer, err := b.quotaBearer(ctx)
+	// The campaigns endpoint rejects the COSY securityOauthToken in both
+	// regions (CN: 401 TOKEN_INVALID; global: 401 TOKEN_EXPIRE) and only
+	// accepts the jt- OpenAPI bearer, so check-in always exchanges — even on
+	// CN, where quota/usage still takes the COSY token. A failure is surfaced
+	// instead of falling back: the campaigns endpoint would reject the COSY
+	// token too, so a fallback would just mask the real cause.
+	bearer, err := b.openAPIBearer(ctx)
 	if err != nil {
 		return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", err)
 	}
@@ -48,7 +50,7 @@ func (b *OpenAiBridge) Checkin(ctx context.Context) (auth.CheckinResult, error) 
 		// forceRefresh only rotates the COSY session, not the OpenAPI bearer; drop
 		// the cached one so the retry actually presents a newly minted token.
 		b.invalidateOpenAPIBearer()
-		retryBearer, berr := b.quotaBearer(ctx)
+		retryBearer, berr := b.openAPIBearer(ctx)
 		if berr != nil {
 			return auth.CheckinResult{}, fmt.Errorf("qoder check-in: bearer: %w", berr)
 		}

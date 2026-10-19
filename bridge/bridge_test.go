@@ -2134,6 +2134,43 @@ func TestCNQuotaUsesCOSYToken(t *testing.T) {
 	}
 }
 
+// TestCNBearerSplit 国内版的两个 bearer 必须分开解析：额度用 COSY 令牌（不触发
+// exchange），而签到 campaigns 端点只认 jt- OpenAPI 令牌，必须走 exchange。
+func TestCNBearerSplit(t *testing.T) {
+	var exchangeHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name":"tester","id":"uid1","refreshToken":"rt","securityOauthToken":"sot","expireTime":%d}`, time.Now().Add(6*time.Hour).UnixMilli())
+	})
+	mux.HandleFunc("/api/v1/jobToken/exchange", func(w http.ResponseWriter, r *http.Request) {
+		exchangeHits.Add(1)
+		io.WriteString(w, `{"token":"jt-cn","refresh_token":"jrt","expires_at":"2099-01-01T00:00:00Z"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	b := NewOpenAiBridge("pt-test", &auth.RegionConfig{Name: "test", AuthBase: srv.URL, ChatBase: srv.URL, OpenAPIBase: srv.URL})
+	if err := b.EnsureFreshSession(context.Background()); err != nil {
+		t.Fatalf("EnsureFreshSession: %v", err)
+	}
+
+	// Quota keeps using the COSY session token; no exchange is triggered.
+	qtok, err := b.quotaBearer(context.Background())
+	if err != nil {
+		t.Fatalf("quotaBearer: %v", err)
+	}
+	if qtok != "sot" || exchangeHits.Load() != 0 {
+		t.Errorf("CN quota bearer = %q (exchange hits %d), want the COSY token without exchange", qtok, exchangeHits.Load())
+	}
+	// The campaigns bearer must be the exchanged jt- token in both regions.
+	ctok, err := b.openAPIBearer(context.Background())
+	if err != nil {
+		t.Fatalf("openAPIBearer: %v", err)
+	}
+	if ctok != "jt-cn" || exchangeHits.Load() != 1 {
+		t.Errorf("campaigns bearer = %q (exchange hits %d), want the exchanged jt- token", ctok, exchangeHits.Load())
+	}
+}
+
 // TestChatHandlerStripsRegionPrefix 模型名区域前缀在进入 bridge 前被剥离，
 // 统计标签用裸模型名；解析出的 region 传给 resolver。
 func TestChatHandlerStripsRegionPrefix(t *testing.T) {
@@ -2225,8 +2262,8 @@ func TestInvalidateOpenAPIBearer(t *testing.T) {
 	}
 }
 
-// Checkin 取不到 bearer 时必须直接失败，而不是静默退回 COSY 令牌（global 只
-// 会拒绝那个令牌，退回只会掩盖真实原因并多打一次必然失败的请求）。
+// Checkin 取不到 bearer 时必须直接失败，而不是静默退回 COSY 令牌（两区域的
+// campaigns 端点都会拒绝那个令牌，退回只会掩盖真实原因并多打一次必然失败的请求）。
 func TestCheckinFailsWhenBearerUnavailable(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/algo/api/v3/user/jobToken", func(w http.ResponseWriter, r *http.Request) {
