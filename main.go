@@ -999,9 +999,10 @@ func main() {
 	// Timeouts: ReadHeaderTimeout/IdleTimeout harden against slowloris-style
 	// resource exhaustion. WriteTimeout is intentionally unset so that
 	// long-lived SSE streaming responses are not prematurely cancelled.
+	// CORS is opt-in via QODER_CORS_ORIGINS and covers only /v1/* and /health.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           corsHandler(os.Getenv("QODER_CORS_ORIGINS"), mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
