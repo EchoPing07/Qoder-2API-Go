@@ -5,9 +5,10 @@ import (
 	"strings"
 )
 
-// corsPolicy is parsed from QODER_CORS_ORIGINS: either "*" or a comma-separated
-// list of full origins (scheme://host[:port]). An empty spec disables CORS
-// entirely, which keeps the previous behaviour for existing deployments.
+// corsPolicy is parsed from a spec of either "*" or a comma-separated list of
+// full origins (scheme://host[:port]). The spec is supplied by main from the
+// env override or the admin panel's saved settings; an empty spec disables
+// CORS entirely.
 //
 // Only the OpenAI-compatible API and /health are covered. The admin UI stays
 // same-origin on purpose: it authenticates with a session cookie, so allowing
@@ -50,20 +51,27 @@ func (p corsPolicy) allows(origin string) bool {
 
 // corsHandler adds CORS headers to the API surface and answers preflight
 // requests before they reach the handlers (which only accept GET/POST and would
-// otherwise reject OPTIONS). When the policy is empty the handler is untouched.
-func corsHandler(spec string, next http.Handler) http.Handler {
-	policy := parseCORSPolicy(spec)
-	if !policy.enabled() {
-		return next
-	}
+// otherwise reject OPTIONS). The spec is read per request so admin-panel
+// changes take effect without a restart; it should be cheap to compute.
+func corsHandler(spec func() string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isCORSPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
+		origin := r.Header.Get("Origin")
+		if origin == "" && r.Method != http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		policy := parseCORSPolicy(spec())
+		if !policy.enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
 		h := w.Header()
 		h.Add("Vary", "Origin")
-		if origin := r.Header.Get("Origin"); policy.allows(origin) {
+		if policy.allows(origin) {
 			if policy.allowAll {
 				h.Set("Access-Control-Allow-Origin", "*")
 			} else {

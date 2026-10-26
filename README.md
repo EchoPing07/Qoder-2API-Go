@@ -121,7 +121,7 @@ scripts/service.sh update     # 重新构建二进制并重启
 | `QODER_LOG_RETENTION_DAYS` | `90` | 请求日志保留天数，范围 1-3650；超期条目自动删除。设置后管理面板中不可修改 |
 | `QODER_LOG_MAX_ENTRIES` | `2000` | 请求日志条数上限，范围 100-100000；超限时自动删除最旧条目，与保留天数同时生效。设置后管理面板中不可修改 |
 | `QODER_RUNTIME_INFO` | 空 | 覆盖签到用设备指纹 helper 的路径（标准输出 `machineToken/machineType/machineCode`）。未安装 Qoder 桌面 App 时用于提供真实指纹 |
-| `QODER_CORS_ORIGINS` | 空（不启用） | 允许跨域访问 `/v1/*` 与 `/health` 的来源：`*` 表示任意来源，或逗号分隔的完整 Origin（如 `https://app.example.com`）。自动处理 `OPTIONS` 预检；管理后台不参与 CORS |
+| `QODER_CORS_ORIGINS` | 空（用面板配置） | 允许跨域访问 `/v1/*` 与 `/health` 的来源：`*` 表示任意来源，或逗号分隔的完整 Origin（如 `https://app.example.com`）。设置后覆盖管理面板「设置 → 跨域（CORS）」里的开关与来源，并锁定面板编辑；未设置时以面板配置为准。自动处理 `OPTIONS` 预检；管理后台接口不参与 CORS |
 
 > 两个超时也可在管理面板「设置 → 超时配置」中修改，保存后即时生效（无需重启）。响应超时只约束上游「开始响应」，不会截断已经建立的流。
 
@@ -141,6 +141,8 @@ scripts/service.sh update     # 重新构建二进制并重启
   "idle_timeout_seconds": 300,
   "log_retention_days": 90,
   "log_max_entries": 2000,
+  "cors_enabled": false,
+  "cors_origins": "",
   "api_keys": [
     {
       "id": "xxxxxxxx",

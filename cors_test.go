@@ -14,6 +14,10 @@ func recordingHandler(calls *int, status int) http.Handler {
 	})
 }
 
+func staticCORSSpec(spec string) func() string {
+	return func() string { return spec }
+}
+
 func TestParseCORSPolicy(t *testing.T) {
 	cases := []struct {
 		spec     string
@@ -53,7 +57,7 @@ func TestParseCORSPolicy(t *testing.T) {
 
 func TestCORSDisabledLeavesRequestsUntouched(t *testing.T) {
 	calls := 0
-	h := corsHandler("", recordingHandler(&calls, http.StatusOK))
+	h := corsHandler(staticCORSSpec(""), recordingHandler(&calls, http.StatusOK))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Origin", "https://any.example")
@@ -70,7 +74,7 @@ func TestCORSDisabledLeavesRequestsUntouched(t *testing.T) {
 
 func TestCORSAllowAllPreflight(t *testing.T) {
 	calls := 0
-	h := corsHandler("*", recordingHandler(&calls, http.StatusOK))
+	h := corsHandler(staticCORSSpec("*"), recordingHandler(&calls, http.StatusOK))
 
 	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
 	req.Header.Set("Origin", "https://app.example")
@@ -98,7 +102,7 @@ func TestCORSAllowAllPreflight(t *testing.T) {
 
 func TestCORSAllowlistReflectsOrigin(t *testing.T) {
 	calls := 0
-	h := corsHandler("https://app.example.com", recordingHandler(&calls, http.StatusUnauthorized))
+	h := corsHandler(staticCORSSpec("https://app.example.com"), recordingHandler(&calls, http.StatusUnauthorized))
 
 	allowed := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	allowed.Header.Set("Origin", "https://app.example.com")
@@ -134,7 +138,7 @@ func TestCORSAllowlistReflectsOrigin(t *testing.T) {
 
 func TestCORSIgnoresAdminRoutes(t *testing.T) {
 	calls := 0
-	h := corsHandler("*", recordingHandler(&calls, http.StatusOK))
+	h := corsHandler(staticCORSSpec("*"), recordingHandler(&calls, http.StatusOK))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/auth", nil)
 	req.Header.Set("Origin", "https://any.example")
@@ -151,7 +155,7 @@ func TestCORSIgnoresAdminRoutes(t *testing.T) {
 
 func TestCORSHealthAllowed(t *testing.T) {
 	calls := 0
-	h := corsHandler("*", recordingHandler(&calls, http.StatusOK))
+	h := corsHandler(staticCORSSpec("*"), recordingHandler(&calls, http.StatusOK))
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.Header.Set("Origin", "https://app.example")
@@ -163,5 +167,31 @@ func TestCORSHealthAllowed(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("Allow-Origin = %q, want *", got)
+	}
+}
+
+func TestCORSHotReload(t *testing.T) {
+	spec := ""
+	calls := 0
+	h := corsHandler(func() string { return spec }, recordingHandler(&calls, http.StatusOK))
+
+	allowOrigin := func(origin string) string {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Header().Get("Access-Control-Allow-Origin")
+	}
+
+	if got := allowOrigin("https://app.example"); got != "" {
+		t.Fatalf("disabled CORS emitted Allow-Origin %q", got)
+	}
+	spec = "https://app.example"
+	if got := allowOrigin("https://app.example"); got != "https://app.example" {
+		t.Fatalf("enabled CORS not applied, Allow-Origin = %q", got)
+	}
+	spec = ""
+	if got := allowOrigin("https://app.example"); got != "" {
+		t.Fatalf("disabled CORS after reload emitted Allow-Origin %q", got)
 	}
 }

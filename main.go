@@ -999,10 +999,22 @@ func main() {
 	// Timeouts: ReadHeaderTimeout/IdleTimeout harden against slowloris-style
 	// resource exhaustion. WriteTimeout is intentionally unset so that
 	// long-lived SSE streaming responses are not prematurely cancelled.
-	// CORS is opt-in via QODER_CORS_ORIGINS and covers only /v1/* and /health.
+	//
+	// CORS precedence matches the other settings: QODER_CORS_ORIGINS pins the
+	// policy when set, otherwise the admin panel's saved setting applies. The
+	// getter runs per request so panel changes take effect without a restart.
+	corsSpec := func() string {
+		if env := os.Getenv("QODER_CORS_ORIGINS"); env != "" {
+			return env
+		}
+		if enabled, origins := st.GetCORS(); enabled {
+			return origins
+		}
+		return ""
+	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           corsHandler(os.Getenv("QODER_CORS_ORIGINS"), mux),
+		Handler:           corsHandler(corsSpec, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
