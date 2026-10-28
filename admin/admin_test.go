@@ -1401,3 +1401,44 @@ func TestAccountViewsCheckinSupported(t *testing.T) {
 		t.Error("global account must be checkin_supported")
 	}
 }
+
+// A whitespace-only override used to make the panel report "enabled, managed by
+// env, origins: '   '" while the request path matched nothing. It must instead
+// read as not managed, so the panel shows the stored policy it actually uses.
+func TestConfigCORSBlankEnvFallsBackToPanel(t *testing.T) {
+	a, s := newAdmin(t)
+	if err := s.SetCORS(true, "https://panel.example"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Setenv("QODER_CORS_ORIGINS", "   ")
+
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_env_managed"] != false {
+		t.Errorf("blank env = managed:%v, want false", resp["cors_env_managed"])
+	}
+	if resp["cors_origins"] != "https://panel.example" || resp["cors_enabled"] != true {
+		t.Errorf("panel state = %v/%v, want true/https://panel.example",
+			resp["cors_enabled"], resp["cors_origins"])
+	}
+}
+
+// An unparseable override must not lock the panel either, or the fields become
+// permanently uneditable to enforce a policy that never applies.
+func TestConfigCORSInvalidEnvDoesNotLockPanel(t *testing.T) {
+	t.Setenv("QODER_CORS_ORIGINS", "app.example.com")
+	a, _ := newAdmin(t)
+
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_env_managed"] != false {
+		t.Errorf("invalid env = managed:%v, want false", resp["cors_env_managed"])
+	}
+	if w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"cors_enabled": true, "cors_origins": "https://ok.example",
+	}); w.Code != 200 {
+		t.Errorf("panel save under invalid env = %d, want 200", w.Code)
+	}
+}

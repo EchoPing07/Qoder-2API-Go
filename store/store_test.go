@@ -873,3 +873,49 @@ func TestValidateCheckinTimeStrict(t *testing.T) {
 		}
 	}
 }
+
+func TestSetCORSDisableSkipsValidation(t *testing.T) {
+	s := tempStore(t)
+	// A value that no longer validates must not block turning the policy off:
+	// the panel resends every field, so a hard rejection would freeze the form.
+	if err := s.SetCORS(false, "https://bad.example/path"); err != nil {
+		t.Fatalf("disabling with an unusable list: %v", err)
+	}
+	if enabled, origins := s.GetCORS(); enabled || origins != "https://bad.example/path" {
+		t.Errorf("CORS = %v/%q, want false with the value kept", enabled, origins)
+	}
+	if err := s.SetCORS(true, "https://bad.example/path"); err == nil {
+		t.Error("enabling with an unusable list must be rejected")
+	}
+}
+
+func TestValidateCORSOriginsRejectsWildcardHost(t *testing.T) {
+	// The matcher is a plain origin comparison: a wildcard host can never match,
+	// so accepting it would store a policy that silently does nothing.
+	if err := ValidateCORSOrigins("https://*.example.com"); err == nil {
+		t.Error("wildcard host must be rejected")
+	}
+	if err := ValidateCORSOrigins("*"); err != nil {
+		t.Errorf("bare wildcard must be accepted: %v", err)
+	}
+}
+
+// An override that parses to nothing ("   ", ",", or unparseable) must be
+// reported as unusable rather than as an active policy: otherwise the panel
+// claims CORS is on with a blank origin list while nothing matches.
+func TestUsableCORSSpec(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"", ""},
+		{"   ", ""},
+		{" , ,", ""},
+		{"app.example.com", ""},            // unparseable as an Origin
+		{"https://a.example.com/path", ""}, // path is never part of an Origin
+		{"*", "*"},
+		{" https://a.example.com ", "https://a.example.com"},
+		{"https://a.example.com,", "https://a.example.com,"},
+	} {
+		if got := UsableCORSSpec(c.in); got != c.want {
+			t.Errorf("UsableCORSSpec(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

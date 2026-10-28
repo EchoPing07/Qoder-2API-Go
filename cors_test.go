@@ -195,3 +195,25 @@ func TestCORSHotReload(t *testing.T) {
 		t.Fatalf("disabled CORS after reload emitted Allow-Origin %q", got)
 	}
 }
+
+// Browsers omit :80/:443 from Origin, so a spec carrying the default port must
+// still match. Normalizing both sides keeps this a plain map lookup.
+func TestCORSDefaultPortMatches(t *testing.T) {
+	calls := 0
+	h := corsHandler(staticCORSSpec("HTTPS://App.Example.COM:443, http://b.test:80"),
+		recordingHandler(&calls, http.StatusOK))
+	for origin, want := range map[string]bool{
+		"https://app.example.com":     true,
+		"https://app.example.com:443": true,
+		"http://b.test":               true,
+		"https://other.example":       false,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Access-Control-Allow-Origin") != ""; got != want {
+			t.Errorf("Origin %q allowed = %v, want %v", origin, got, want)
+		}
+	}
+}

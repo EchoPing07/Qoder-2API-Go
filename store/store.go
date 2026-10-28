@@ -462,14 +462,17 @@ func (s *Store) GetCORS() (bool, string) {
 }
 
 // SetCORS persists the panel CORS settings. A disabled policy may keep its
-// origin list for the next enable, but enabling requires at least one origin.
+// origin list (or even one that no longer validates) for the next enable,
+// since it cannot affect behavior while off; enabling requires a usable one.
 func (s *Store) SetCORS(enabled bool, origins string) error {
 	origins = strings.TrimSpace(origins)
-	if err := ValidateCORSOrigins(origins); err != nil {
-		return err
-	}
-	if enabled && origins == "" {
-		return fmt.Errorf("启用跨域时必须填写允许的来源")
+	if enabled {
+		if err := ValidateCORSOrigins(origins); err != nil {
+			return err
+		}
+		if origins == "" {
+			return fmt.Errorf("启用跨域时必须填写允许的来源")
+		}
 	}
 	s.mu.Lock()
 	s.config.CORSEnabled = enabled
@@ -489,12 +492,31 @@ func ValidateCORSOrigins(spec string) error {
 		}
 		u, err := url.Parse(origin)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			strings.Contains(u.Host, "*") ||
 			u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
 			(u.Path != "" && u.Path != "/") {
 			return fmt.Errorf("来源 %q 需为完整 Origin（http(s)://host[:port]）或 *", origin)
 		}
 	}
 	return nil
+}
+
+// UsableCORSSpec returns spec trimmed when it defines at least one origin that
+// can match, otherwise "". Callers use it to treat "set but unusable" exactly
+// like "not set": a whitespace-only or unparseable override must not be
+// advertised as the active policy while nothing matches, and must not lock the
+// panel fields either.
+func UsableCORSSpec(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" || ValidateCORSOrigins(spec) != nil {
+		return ""
+	}
+	for _, part := range strings.Split(spec, ",") {
+		if strings.TrimSpace(part) != "" {
+			return spec
+		}
+	}
+	return ""
 }
 
 // --- Stream Timeouts ---

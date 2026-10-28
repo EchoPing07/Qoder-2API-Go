@@ -489,9 +489,11 @@ func logLimitsEnvManaged() bool {
 
 // corsSettings returns the effective CORS policy shown in the panel. The env
 // var wins when present, mirroring the startup precedence of the other
-// overrides; envManaged tells the UI to lock the fields.
+// overrides; envManaged tells the UI to lock the fields. An override that cannot
+// match anything is reported as "not managed" rather than as an active policy
+// with a blank origin list, which would contradict the request path.
 func (a *Admin) corsSettings() (enabled bool, origins string, envManaged bool) {
-	if env := os.Getenv("QODER_CORS_ORIGINS"); env != "" {
+	if env := store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")); env != "" {
 		return true, env, true
 	}
 	enabled, origins = a.store.GetCORS()
@@ -597,10 +599,12 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// CORS fields are optional as well. Validation happens before any save so
-		// a bad origin cannot leave a partial update behind.
+		// CORS fields are optional as well. The origin list is only validated when
+		// the policy ends up enabled: a data.json holding a value that no longer
+		// validates must still be switchable off, otherwise the panel (which
+		// resends every field) could never save anything again.
 		wantsCORS := body.CORSEnabled != nil || body.CORSOrigins != nil
-		if wantsCORS && os.Getenv("QODER_CORS_ORIGINS") != "" {
+		if wantsCORS && store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")) != "" {
 			writeJSONError(w, 400, "跨域配置由环境变量 QODER_CORS_ORIGINS 管理，无法在面板中修改")
 			return
 		}
@@ -611,12 +615,12 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if body.CORSOrigins != nil {
 			corsOrigins = strings.TrimSpace(*body.CORSOrigins)
 		}
-		if wantsCORS {
+		if corsEnabled {
 			if err := store.ValidateCORSOrigins(corsOrigins); err != nil {
 				writeJSONError(w, 400, "跨域来源："+err.Error())
 				return
 			}
-			if corsEnabled && corsOrigins == "" {
+			if corsOrigins == "" {
 				writeJSONError(w, 400, "启用跨域时必须填写允许的来源")
 				return
 			}

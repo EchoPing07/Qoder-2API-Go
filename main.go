@@ -714,6 +714,15 @@ func main() {
 		}
 	}
 
+	// CORS: warn once if the env override defines nothing that can match,
+	// mirroring how the other env knobs report bad input. A whitespace-only or
+	// unparseable override is then treated as "unset" everywhere (here, in
+	// corsSpec below, and in the admin panel) so the panel cannot advertise a
+	// policy the request path never applies.
+	if v := os.Getenv("QODER_CORS_ORIGINS"); v != "" && store.UsableCORSSpec(v) == "" {
+		log.Printf("[cors] WARN QODER_CORS_ORIGINS=%q defines no usable origin; using panel setting", v)
+	}
+
 	provider := newBridgeProvider(st)
 	// Request statistics recorder with periodic persistence (30s cadence).
 	// The loop also drains a stop channel so graceful shutdown can trigger a
@@ -1003,9 +1012,13 @@ func main() {
 	// CORS precedence matches the other settings: QODER_CORS_ORIGINS pins the
 	// policy when set, otherwise the admin panel's saved setting applies. The
 	// getter runs per request so panel changes take effect without a restart.
+	// An override that defines no usable origin falls through to the panel,
+	// matching what the admin panel reports.
 	corsSpec := func() string {
 		if env := os.Getenv("QODER_CORS_ORIGINS"); env != "" {
-			return env
+			if usable := store.UsableCORSSpec(env); usable != "" {
+				return usable
+			}
 		}
 		if enabled, origins := st.GetCORS(); enabled {
 			return origins
