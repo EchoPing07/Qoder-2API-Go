@@ -64,6 +64,55 @@ func TestHostPortPersistence(t *testing.T) {
 	}
 }
 
+func TestCORSConfig(t *testing.T) {
+	s := tempStore(t)
+	if enabled, origins := s.GetCORS(); enabled || origins != "" {
+		t.Fatalf("default CORS = %v/%q, want disabled/empty", enabled, origins)
+	}
+	if err := s.SetCORS(true, " "); err == nil {
+		t.Error("enabling without origins must be rejected")
+	}
+
+	const spec = "https://app.example.com, https://b.test:8080"
+	if err := s.SetCORS(true, spec); err != nil {
+		t.Fatalf("SetCORS: %v", err)
+	}
+	if enabled, origins := s.GetCORS(); !enabled || origins != spec {
+		t.Errorf("GetCORS = %v/%q, want true/%q", enabled, origins, spec)
+	}
+
+	s2, err := New(s.filePath)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if enabled, origins := s2.GetCORS(); !enabled || origins != spec {
+		t.Errorf("persisted CORS = %v/%q, want true/%q", enabled, origins, spec)
+	}
+
+	// Disabling keeps the list so the panel can re-enable without retyping it.
+	if err := s.SetCORS(false, spec); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if enabled, origins := s.GetCORS(); enabled || origins != spec {
+		t.Errorf("disabled CORS = %v/%q, want false/%q", enabled, origins, spec)
+	}
+
+	for _, bad := range []string{
+		"app.example.com",
+		"https://app.example.com/path",
+		"https://app.example.com/?q=1",
+		"ftp://app.example.com",
+		"https://user@app.example.com",
+	} {
+		if err := s.SetCORS(true, bad); err == nil {
+			t.Errorf("invalid origin %q must be rejected", bad)
+		}
+	}
+	if err := s.SetCORS(true, "*"); err != nil {
+		t.Errorf("wildcard origin must be accepted: %v", err)
+	}
+}
+
 func TestPAT(t *testing.T) {
 	s := tempStore(t)
 	if s.GetPAT() != "" {
@@ -821,6 +870,52 @@ func TestValidateCheckinTimeStrict(t *testing.T) {
 	for _, bad := range []string{"9:04", "24:00", "9:4", "10:15:00", "", "ab:cd"} {
 		if err := ValidateCheckinTime(bad); err == nil {
 			t.Errorf("ValidateCheckinTime(%q) = nil, want an error", bad)
+		}
+	}
+}
+
+func TestSetCORSDisableSkipsValidation(t *testing.T) {
+	s := tempStore(t)
+	// A value that no longer validates must not block turning the policy off:
+	// the panel resends every field, so a hard rejection would freeze the form.
+	if err := s.SetCORS(false, "https://bad.example/path"); err != nil {
+		t.Fatalf("disabling with an unusable list: %v", err)
+	}
+	if enabled, origins := s.GetCORS(); enabled || origins != "https://bad.example/path" {
+		t.Errorf("CORS = %v/%q, want false with the value kept", enabled, origins)
+	}
+	if err := s.SetCORS(true, "https://bad.example/path"); err == nil {
+		t.Error("enabling with an unusable list must be rejected")
+	}
+}
+
+func TestValidateCORSOriginsRejectsWildcardHost(t *testing.T) {
+	// The matcher is a plain origin comparison: a wildcard host can never match,
+	// so accepting it would store a policy that silently does nothing.
+	if err := ValidateCORSOrigins("https://*.example.com"); err == nil {
+		t.Error("wildcard host must be rejected")
+	}
+	if err := ValidateCORSOrigins("*"); err != nil {
+		t.Errorf("bare wildcard must be accepted: %v", err)
+	}
+}
+
+// An override that parses to nothing ("   ", ",", or unparseable) must be
+// reported as unusable rather than as an active policy: otherwise the panel
+// claims CORS is on with a blank origin list while nothing matches.
+func TestUsableCORSSpec(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"", ""},
+		{"   ", ""},
+		{" , ,", ""},
+		{"app.example.com", ""},            // unparseable as an Origin
+		{"https://a.example.com/path", ""}, // path is never part of an Origin
+		{"*", "*"},
+		{" https://a.example.com ", "https://a.example.com"},
+		{"https://a.example.com,", "https://a.example.com,"},
+	} {
+		if got := UsableCORSSpec(c.in); got != c.want {
+			t.Errorf("UsableCORSSpec(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

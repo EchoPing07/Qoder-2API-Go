@@ -58,6 +58,24 @@
           </div>
 
           <div class="card">
+            <div class="card-head"><h3>跨域（CORS）</h3></div>
+            <div class="switch-row">
+              <span class="sw-label">允许浏览器跨域调用 API</span>
+              <button type="button" class="switch" :class="config.cors_enabled ? 'on' : ''"
+                      :style="config.cors_env_managed ? 'opacity:.5;cursor:not-allowed' : ''"
+                      @click="config.cors_enabled = !config.cors_enabled"
+                      :disabled="config.cors_env_managed" aria-label="启用跨域"></button>
+            </div>
+            <div class="form-row">
+              <label class="label">允许的来源</label>
+              <input class="input" x-model="config.cors_origins" placeholder="https://app.example.com 或 *"
+                     autocomplete="off" :disabled="config.cors_env_managed">
+            </div>
+            <p class="field-hint">仅作用于 /v1/* 与 /health，管理后台接口不参与跨域；多个完整 Origin 用逗号分隔，填 * 允许任意来源。保存后立即生效。</p>
+            <p class="field-hint" style="color:var(--warn-fg)" x-show="config.cors_env_managed">由环境变量 QODER_CORS_ORIGINS 管理，面板中不可修改。</p>
+          </div>
+
+          <div class="card">
             <div class="card-head"><h3>签到配置</h3></div>
             <div class="form-row">
               <label class="label">默认签到时间</label>

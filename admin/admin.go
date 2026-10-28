@@ -487,6 +487,19 @@ func logLimitsEnvManaged() bool {
 		os.Getenv("QODER_LOG_MAX_ENTRIES") != ""
 }
 
+// corsSettings returns the effective CORS policy shown in the panel. The env
+// var wins when present, mirroring the startup precedence of the other
+// overrides; envManaged tells the UI to lock the fields. An override that cannot
+// match anything is reported as "not managed" rather than as an active policy
+// with a blank origin list, which would contradict the request path.
+func (a *Admin) corsSettings() (enabled bool, origins string, envManaged bool) {
+	if env := store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")); env != "" {
+		return true, env, true
+	}
+	enabled, origins = a.store.GetCORS()
+	return enabled, origins, false
+}
+
 func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -498,6 +511,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if a.logRec != nil {
 			retentionDays, maxEntries = a.logRec.Limits()
 		}
+		corsEnabled, corsOrigins, corsEnvManaged := a.corsSettings()
 		writeJSON(w, 200, map[string]interface{}{
 			"host":                 a.store.GetHost(),
 			"port":                 a.store.GetPort(),
@@ -506,6 +520,9 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"log_retention_days":   retentionDays,
 			"log_max_entries":      maxEntries,
 			"checkin_time":         a.store.GetCheckinTime(),
+			"cors_enabled":         corsEnabled,
+			"cors_origins":         corsOrigins,
+			"cors_env_managed":     corsEnvManaged,
 		})
 	case http.MethodPost:
 		var body struct {
@@ -516,6 +533,9 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			LogRetentionDays   int    `json:"log_retention_days"`
 			LogMaxEntries      int    `json:"log_max_entries"`
 			CheckinTime        string `json:"checkin_time"`
+			// Pointers distinguish "not sent" from an intentional false/empty.
+			CORSEnabled *bool   `json:"cors_enabled"`
+			CORSOrigins *string `json:"cors_origins"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -579,6 +599,32 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// CORS fields are optional as well. The origin list is only validated when
+		// the policy ends up enabled: a data.json holding a value that no longer
+		// validates must still be switchable off, otherwise the panel (which
+		// resends every field) could never save anything again.
+		wantsCORS := body.CORSEnabled != nil || body.CORSOrigins != nil
+		if wantsCORS && store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")) != "" {
+			writeJSONError(w, 400, "跨域配置由环境变量 QODER_CORS_ORIGINS 管理，无法在面板中修改")
+			return
+		}
+		corsEnabled, corsOrigins := a.store.GetCORS()
+		if body.CORSEnabled != nil {
+			corsEnabled = *body.CORSEnabled
+		}
+		if body.CORSOrigins != nil {
+			corsOrigins = strings.TrimSpace(*body.CORSOrigins)
+		}
+		if corsEnabled {
+			if err := store.ValidateCORSOrigins(corsOrigins); err != nil {
+				writeJSONError(w, 400, "跨域来源："+err.Error())
+				return
+			}
+			if corsOrigins == "" {
+				writeJSONError(w, 400, "启用跨域时必须填写允许的来源")
+				return
+			}
+		}
 		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
@@ -613,6 +659,12 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if wantsCORS {
+			if err := a.store.SetCORS(corsEnabled, corsOrigins); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
 		// Hot-apply the log limits so a lowered cap prunes the live recorder at
 		// once, not at the next request or flush.
 		if wantsLogLimits && a.logRec != nil {
@@ -632,6 +684,7 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if a.logRec != nil {
 			retentionDays, maxEntries = a.logRec.Limits()
 		}
+		effectiveCORSEnabled, effectiveCORSOrigins, corsEnvManaged := a.corsSettings()
 		writeJSON(w, 200, map[string]interface{}{
 			"host":                 body.Host,
 			"port":                 body.Port,
@@ -640,7 +693,10 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"log_retention_days":   retentionDays,
 			"log_max_entries":      maxEntries,
 			"checkin_time":         a.store.GetCheckinTime(),
-			"restart":              "修改主机或端口后需要重启服务才能生效（超时与日志配置已即时生效）",
+			"cors_enabled":         effectiveCORSEnabled,
+			"cors_origins":         effectiveCORSOrigins,
+			"cors_env_managed":     corsEnvManaged,
+			"restart":              "修改主机或端口后需要重启服务才能生效（超时、日志与跨域配置已即时生效）",
 		})
 	default:
 		writeJSONError(w, 405, "方法不允许")

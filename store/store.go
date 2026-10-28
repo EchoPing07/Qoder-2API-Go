@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -54,6 +55,10 @@ type Config struct {
 	// bounds how long an established SSE stream may stay silent.
 	ChatTimeoutSeconds int `json:"chat_timeout_seconds"`
 	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+	// CORSEnabled/CORSOrigins control cross-origin access to the API surface
+	// (/v1/* and /health). QODER_CORS_ORIGINS overrides both when set.
+	CORSEnabled bool   `json:"cors_enabled,omitempty"`
+	CORSOrigins string `json:"cors_origins,omitempty"`
 	// Multi-account pool. A legacy config carrying a bare PAT migrates into a
 	// one-entry pool on load (see load).
 	Accounts        []Account  `json:"accounts,omitempty"`
@@ -445,6 +450,73 @@ func (s *Store) SetHostPort(host string, port int) error {
 	s.config.Port = port
 	s.mu.Unlock()
 	return s.save()
+}
+
+// --- CORS ---
+
+// GetCORS returns the persisted admin-panel CORS settings.
+func (s *Store) GetCORS() (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.CORSEnabled, s.config.CORSOrigins
+}
+
+// SetCORS persists the panel CORS settings. A disabled policy may keep its
+// origin list (or even one that no longer validates) for the next enable,
+// since it cannot affect behavior while off; enabling requires a usable one.
+func (s *Store) SetCORS(enabled bool, origins string) error {
+	origins = strings.TrimSpace(origins)
+	if enabled {
+		if err := ValidateCORSOrigins(origins); err != nil {
+			return err
+		}
+		if origins == "" {
+			return fmt.Errorf("启用跨域时必须填写允许的来源")
+		}
+	}
+	s.mu.Lock()
+	s.config.CORSEnabled = enabled
+	s.config.CORSOrigins = origins
+	s.mu.Unlock()
+	return s.save()
+}
+
+// ValidateCORSOrigins rejects entries that can never match a browser Origin:
+// each item must be "*" or a scheme://host[:port] origin without a path,
+// query or fragment.
+func ValidateCORSOrigins(spec string) error {
+	for _, part := range strings.Split(spec, ",") {
+		origin := strings.TrimSpace(part)
+		if origin == "" || origin == "*" {
+			continue
+		}
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			strings.Contains(u.Host, "*") ||
+			u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+			(u.Path != "" && u.Path != "/") {
+			return fmt.Errorf("来源 %q 需为完整 Origin（http(s)://host[:port]）或 *", origin)
+		}
+	}
+	return nil
+}
+
+// UsableCORSSpec returns spec trimmed when it defines at least one origin that
+// can match, otherwise "". Callers use it to treat "set but unusable" exactly
+// like "not set": a whitespace-only or unparseable override must not be
+// advertised as the active policy while nothing matches, and must not lock the
+// panel fields either.
+func UsableCORSSpec(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" || ValidateCORSOrigins(spec) != nil {
+		return ""
+	}
+	for _, part := range strings.Split(spec, ",") {
+		if strings.TrimSpace(part) != "" {
+			return spec
+		}
+	}
+	return ""
 }
 
 // --- Stream Timeouts ---

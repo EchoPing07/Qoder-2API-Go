@@ -14,6 +14,9 @@ PAGE('settings', {
         log_retention_days: r.log_retention_days || '',
         log_max_entries: r.log_max_entries || '',
         checkin_time: r.checkin_time || '',
+        cors_enabled: !!r.cors_enabled,
+        cors_origins: r.cors_origins || '',
+        cors_env_managed: !!r.cors_env_managed,
       };
     }catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadModels 一致：加载失败必须有提示
   },
@@ -61,8 +64,16 @@ PAGE('settings', {
         if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(ck)){ this.toast('签到时间格式应为 HH:MM','err'); return; }
         body.checkin_time = ck;
       }
+      /* 跨域配置：开关必须显式下发（false 也是有效值）；来源为空且启用时拒绝。
+       * 由 QODER_CORS_ORIGINS 管理时不下发，避免服务端按环境变量锁定报错。 */
+      if(!c.cors_env_managed){
+        const corsOrigins = String(c.cors_origins==null?'':c.cors_origins).trim();
+        if(c.cors_enabled && !corsOrigins){ this.toast('启用跨域时必须填写允许的来源','err'); return; }
+        body.cors_enabled = !!c.cors_enabled;
+        body.cors_origins = corsOrigins;
+      }
       const r = await this.api('/admin/api/config',{method:'POST',body:JSON.stringify(body)});
-      this.toast('配置已保存（超时配置即时生效）');
+      this.toast('配置已保存（超时与跨域配置即时生效）');
       this.loadConfig();
       this.configHint = r.restart || '修改主机或端口后需要重启服务才能生效。';
     })();

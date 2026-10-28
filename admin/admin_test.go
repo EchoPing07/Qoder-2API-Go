@@ -213,6 +213,94 @@ func TestConfigSetDefaults(t *testing.T) {
 	}
 }
 
+func TestConfigCORS(t *testing.T) {
+	t.Setenv("QODER_CORS_ORIGINS", "")
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"host": store.DefaultHost, "port": store.DefaultPort,
+		"cors_enabled": true,
+		"cors_origins": " https://app.example.com,https://b.test:8080 ",
+	})
+	if w.Code != 200 {
+		t.Fatalf("save CORS: %d %s", w.Code, w.Body.String())
+	}
+	const wantOrigins = "https://app.example.com,https://b.test:8080"
+	if enabled, origins := s.GetCORS(); !enabled || origins != wantOrigins {
+		t.Fatalf("stored CORS = %v/%q, want true/%q", enabled, origins, wantOrigins)
+	}
+
+	var resp map[string]interface{}
+	w = doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_enabled"] != true || resp["cors_origins"] != wantOrigins {
+		t.Errorf("GET CORS = %v/%v, want true/%q", resp["cors_enabled"], resp["cors_origins"], wantOrigins)
+	}
+	if resp["cors_env_managed"] != false {
+		t.Errorf("cors_env_managed = %v, want false", resp["cors_env_managed"])
+	}
+
+	// Turning the switch off keeps the saved origins for the next enable.
+	w = doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{"cors_enabled": false})
+	if w.Code != 200 {
+		t.Fatalf("disable CORS: %d %s", w.Code, w.Body.String())
+	}
+	if enabled, origins := s.GetCORS(); enabled || origins != wantOrigins {
+		t.Errorf("disabled CORS = %v/%q, want false/%q", enabled, origins, wantOrigins)
+	}
+}
+
+func TestConfigCORSValidation(t *testing.T) {
+	t.Setenv("QODER_CORS_ORIGINS", "")
+	a, s := newAdmin(t)
+	for _, body := range []map[string]interface{}{
+		{"cors_enabled": true, "cors_origins": ""},
+		{"cors_enabled": true, "cors_origins": "app.example.com"},
+		{"cors_enabled": true, "cors_origins": "https://app.example.com/path"},
+	} {
+		if w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", body); w.Code != 400 {
+			t.Errorf("body %v: status = %d, want 400", body, w.Code)
+		}
+	}
+	if enabled, origins := s.GetCORS(); enabled || origins != "" {
+		t.Errorf("rejected updates persisted: %v/%q", enabled, origins)
+	}
+
+	if w := doRequest(t, a.handleConfig, "POST", "/admin/api/config",
+		map[string]interface{}{"cors_enabled": true, "cors_origins": "*"}); w.Code != 200 {
+		t.Errorf("wildcard origin rejected: %d %s", w.Code, w.Body.String())
+	}
+	if enabled, origins := s.GetCORS(); !enabled || origins != "*" {
+		t.Errorf("wildcard CORS = %v/%q, want true/*", enabled, origins)
+	}
+}
+
+func TestConfigCORSEnvManaged(t *testing.T) {
+	a, s := newAdmin(t)
+	if err := s.SetCORS(true, "https://panel.example"); err != nil {
+		t.Fatalf("seed CORS: %v", err)
+	}
+	t.Setenv("QODER_CORS_ORIGINS", "https://env.example")
+
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_enabled"] != true || resp["cors_origins"] != "https://env.example" {
+		t.Errorf("env CORS not reflected: %v/%v", resp["cors_enabled"], resp["cors_origins"])
+	}
+	if resp["cors_env_managed"] != true {
+		t.Errorf("cors_env_managed = %v, want true", resp["cors_env_managed"])
+	}
+
+	w = doRequest(t, a.handleConfig, "POST", "/admin/api/config",
+		map[string]interface{}{"cors_enabled": false, "cors_origins": "*"})
+	if w.Code != 400 {
+		t.Errorf("panel update under env override = %d, want 400", w.Code)
+	}
+	if enabled, origins := s.GetCORS(); !enabled || origins != "https://panel.example" {
+		t.Errorf("env-managed save changed store: %v/%q", enabled, origins)
+	}
+}
+
 // -- Stats --
 
 func TestStatsEndpoint(t *testing.T) {
@@ -1311,5 +1399,46 @@ func TestAccountViewsCheckinSupported(t *testing.T) {
 	}
 	if !byID[gl.ID].CheckinSupported {
 		t.Error("global account must be checkin_supported")
+	}
+}
+
+// A whitespace-only override used to make the panel report "enabled, managed by
+// env, origins: '   '" while the request path matched nothing. It must instead
+// read as not managed, so the panel shows the stored policy it actually uses.
+func TestConfigCORSBlankEnvFallsBackToPanel(t *testing.T) {
+	a, s := newAdmin(t)
+	if err := s.SetCORS(true, "https://panel.example"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	t.Setenv("QODER_CORS_ORIGINS", "   ")
+
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_env_managed"] != false {
+		t.Errorf("blank env = managed:%v, want false", resp["cors_env_managed"])
+	}
+	if resp["cors_origins"] != "https://panel.example" || resp["cors_enabled"] != true {
+		t.Errorf("panel state = %v/%v, want true/https://panel.example",
+			resp["cors_enabled"], resp["cors_origins"])
+	}
+}
+
+// An unparseable override must not lock the panel either, or the fields become
+// permanently uneditable to enforce a policy that never applies.
+func TestConfigCORSInvalidEnvDoesNotLockPanel(t *testing.T) {
+	t.Setenv("QODER_CORS_ORIGINS", "app.example.com")
+	a, _ := newAdmin(t)
+
+	w := doRequest(t, a.handleConfig, "GET", "/admin/api/config", nil)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["cors_env_managed"] != false {
+		t.Errorf("invalid env = managed:%v, want false", resp["cors_env_managed"])
+	}
+	if w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
+		"cors_enabled": true, "cors_origins": "https://ok.example",
+	}); w.Code != 200 {
+		t.Errorf("panel save under invalid env = %d, want 200", w.Code)
 	}
 }
