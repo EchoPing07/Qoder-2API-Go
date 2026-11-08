@@ -67,8 +67,15 @@ var DefaultVisionModels = map[string]bool{
 // PreferredDefaultKey is the default model key when model param is None/empty.
 const PreferredDefaultKey = "qmodel_latest"
 
-// DefaultScene is the catalog scene to extract.
+// DefaultScene is the primary catalog scene to extract.
 const DefaultScene = "chat"
+
+// CatalogScenes lists every scene whose entries are merged into the catalog, in
+// precedence order. Reading only "chat" silently dropped models the gateway
+// exposes exclusively in another scene (QoDuck / lmodel ships only in "app"),
+// which made them unusable rather than merely hidden. "chat" stays first so a
+// key present in several scenes keeps the chat entry's metadata.
+var CatalogScenes = []string{DefaultScene, "app"}
 
 // DefaultMaxOutputTokens is the completion-token cap the official client falls
 // back to whenever a catalog entry carries no usable max_output_tokens. It
@@ -218,17 +225,31 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 	if raw == nil {
 		return nil
 	}
-	sceneRaw, ok := raw[DefaultScene]
-	if !ok {
-		return nil
-	}
-	sceneList, ok := sceneRaw.([]interface{})
-	if !ok {
-		return nil
-	}
 	modelMap := map[string]string{}
 	vision := map[string]bool{}
 	caps := map[string]*ModelCaps{}
+	for _, scene := range CatalogScenes {
+		sceneList, ok := raw[scene].([]interface{})
+		if !ok {
+			continue
+		}
+		mergeSceneEntries(sceneList, modelMap, vision, caps)
+	}
+	if len(modelMap) == 0 {
+		return nil
+	}
+	return &ModelCatalog{
+		ModelMap:     modelMap,
+		VisionModels: vision,
+		Caps:         caps,
+		DefaultName:  nameForKey(modelMap, PreferredDefaultKey),
+	}
+}
+
+// mergeSceneEntries folds one scene's entries into the accumulated tables.
+// Entries already contributed by an earlier scene win, so the primary scene's
+// metadata is authoritative.
+func mergeSceneEntries(sceneList []interface{}, modelMap map[string]string, vision map[string]bool, caps map[string]*ModelCaps) {
 	for _, item := range sceneList {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -244,6 +265,9 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 		if key == "" || name == "" || key == "auto" {
 			continue
 		}
+		if _, seen := modelMap[name]; seen {
+			continue
+		}
 		modelMap[name] = key
 		if isVL, ok := m["is_vl"].(bool); ok && isVL {
 			vision[name] = true
@@ -256,15 +280,6 @@ func ExtractCatalog(raw map[string]interface{}) *ModelCatalog {
 			IsReasoning:     reasoningCapability(m),
 			MaxOutputTokens: maxOut,
 		}
-	}
-	if len(modelMap) == 0 {
-		return nil
-	}
-	return &ModelCatalog{
-		ModelMap:     modelMap,
-		VisionModels: vision,
-		Caps:         caps,
-		DefaultName:  nameForKey(modelMap, PreferredDefaultKey),
 	}
 }
 

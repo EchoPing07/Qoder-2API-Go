@@ -79,6 +79,51 @@ func TestExtractCatalog(t *testing.T) {
 	}
 }
 
+// The gateway scopes some models to a single scene: QoDuck (lmodel) ships only
+// in "app" while every long-standing model also appears in "chat". Reading
+// just one scene silently dropped it, so /v1/models hid it and ResolveModel
+// rejected it. Entries must now be merged across scenes, with the primary
+// scene's metadata winning when a key appears in both.
+func TestExtractCatalogMergesScenes(t *testing.T) {
+	raw := map[string]interface{}{
+		"chat": []interface{}{
+			map[string]interface{}{"key": "qmodel_latest", "display_name": "Qwen3.7-Max", "enable": true, "max_output_tokens": 32000},
+		},
+		"app": []interface{}{
+			map[string]interface{}{"key": "qmodel_latest", "display_name": "Qwen3.7-Max", "enable": true, "max_output_tokens": 8000},
+			map[string]interface{}{"key": "lmodel", "display_name": "QoDuck", "enable": true, "is_vl": true},
+			map[string]interface{}{"key": "auto", "display_name": "Auto", "enable": true},
+		},
+	}
+	cat := ExtractCatalog(raw)
+	if cat == nil {
+		t.Fatal("expected non-nil catalog")
+	}
+	if cat.ModelMap["QoDuck"] != "lmodel" {
+		t.Error("QoDuck from the app scene should be in the catalog")
+	}
+	if !cat.VisionModels["QoDuck"] {
+		t.Error("QoDuck should support vision")
+	}
+	if _, ok := cat.ModelMap["Auto"]; ok {
+		t.Error("auto should be skipped in every scene")
+	}
+	// chat comes first, so its cap survives the app duplicate.
+	if got := cat.MaxOutputTokens("qmodel_latest"); got != 32000 {
+		t.Errorf("MaxOutputTokens(qmodel_latest) = %d, want 32000 from the chat scene", got)
+	}
+}
+
+// A response with no known scene is unusable: the caller must fall back.
+func TestExtractCatalogUnknownScenes(t *testing.T) {
+	if cat := ExtractCatalog(map[string]interface{}{"byok_teams": []interface{}{}}); cat != nil {
+		t.Errorf("expected nil catalog for unrelated scenes, got %d models", len(cat.ModelMap))
+	}
+	if cat := ExtractCatalog(map[string]interface{}{}); cat != nil {
+		t.Error("expected nil catalog for an empty response")
+	}
+}
+
 func TestDefaultCatalogVisionModels(t *testing.T) {
 	cat := DefaultCatalog()
 	if cat.VisionModels["MiniMax-M2.7"] {
