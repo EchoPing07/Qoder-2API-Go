@@ -1864,6 +1864,42 @@ func TestHandleChatToolChoiceRidesInParameters(t *testing.T) {
 	}
 }
 
+// Issue #20: the account that served the response owns the counters. This is
+// what makes /admin/api/stats?account_id=… meaningful with a multi-account pool.
+func TestHandleChatRecordsServingAccount(t *testing.T) {
+	gw := &fakeGateway{chatLines: []string{
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": "ok"}}}}),
+		sseFrame(t, map[string]interface{}{"choices": []interface{}{}, "usage": map[string]interface{}{
+			"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10, "credits": 0.5}}),
+		"data: [DONE]",
+	}}
+	b := newFakeBridge(t, gw)
+	rec := stats.NewRecorder(nil)
+
+	handler := MakeChatHandler(func(ResolveRequest) *ResolvedBridge {
+		return &ResolvedBridge{Bridge: b, AccountID: "acc-a"}
+	}, rec, nil, nil, nil)
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+	all := rec.Report()
+	if all.Total != 1 || all.PromptTokens != 4 || all.Credits != 0.5 {
+		t.Errorf("aggregate view incorrect: %+v", all)
+	}
+	one := rec.ReportFor("acc-a")
+	if one.Total != 1 || one.PromptTokens != 4 || one.Credits != 0.5 {
+		t.Errorf("serving account partition incorrect: %+v", one)
+	}
+	if other := rec.ReportFor("acc-b"); other.Total != 0 {
+		t.Errorf("another account must stay empty: %+v", other)
+	}
+}
+
 // §28: a usage frame the gateway flags billable=false must reach the recorder
 // as NonBillable, so its credits never inflate cycle accounting. Tokens are
 // still counted either way.

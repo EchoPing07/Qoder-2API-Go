@@ -169,14 +169,41 @@ func (r *router) supportsModel(candidates []store.Account, bareModel string) []s
 // pick selects an account for one chat request. It returns the chosen account,
 // the sticky key (for the success binding) and whether a route exists at all.
 func (r *router) pick(apiKeyID, bareModel, seed string, filter models.RegionFilter, exclude map[string]bool) (store.Account, string, bool) {
+	return r.pickWithConfig(apiKeyID, bareModel, seed, filter, exclude, r.deps.config(), false)
+}
+
+// pickWithConfig is pick with an explicit routing config. pinFallbackDone
+// guards the one retry that falls back to the balanced pool when the pinned
+// account is hard-exhausted or cooling down.
+func (r *router) pickWithConfig(apiKeyID, bareModel, seed string, filter models.RegionFilter, exclude map[string]bool, cfg store.AutoSwitch, pinFallbackDone bool) (store.Account, string, bool) {
 	accounts := r.deps.accounts()
 	if len(accounts) == 0 {
 		return store.Account{}, "", false
 	}
-	cfg := r.deps.config()
 	stickyKey := stickyKeyFor(apiKeyID, seed)
 
 	base := regionBase(accounts, filter)
+	// A manual pin overrides both region preference and load balancing: the
+	// user explicitly asked for this account to serve requests. A failover that
+	// already tried it (exclude) still falls through to the healthy pool.
+	pinned := false
+	if cfg.PinnedAccountID != "" {
+		if acc, ok := accountByID(accounts, cfg.PinnedAccountID); ok && !exclude[acc.ID] {
+			// An explicit region prefix still wins: pinning a CN account must
+			// not silently answer a request the caller forced onto gl/.
+			regionOK := true
+			switch filter {
+			case models.RegionCN:
+				regionOK = accountRegion(acc) == "cn"
+			case models.RegionGlobal:
+				regionOK = accountRegion(acc) == "global"
+			}
+			if regionOK {
+				base = []store.Account{acc}
+				pinned = true
+			}
+		}
+	}
 	now := time.Now()
 
 	candidates := make([]store.Account, 0, len(base))
@@ -221,6 +248,14 @@ func (r *router) pick(apiKeyID, bareModel, seed string, filter models.RegionFilt
 		pickFrom = candidates
 	}
 	if len(pickFrom) == 0 {
+		// Keep the service available when the pinned account is exhausted,
+		// cooling down, or does not support the requested model: retry once
+		// against the normal balanced pool instead of failing every request.
+		if pinned && !pinFallbackDone {
+			relaxed := cfg
+			relaxed.PinnedAccountID = ""
+			return r.pickWithConfig(apiKeyID, bareModel, seed, filter, exclude, relaxed, true)
+		}
 		return store.Account{}, "", false
 	}
 

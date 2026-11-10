@@ -11,6 +11,16 @@ PAGE('token', {
     try{ const r = await this.api('/admin/api/accounts'); this.accounts = r.accounts||[]; }
     catch(e){ this.toast(e.message,'err'); }  // 与 loadStats/loadKeys 一致：加载失败必须有提示
   },
+  /* 手动切换：同时把该账号设为「激活账号」（面板快照）并固定请求路由。
+   * 固定后可在下方「负载均衡 / 自动切换」里解除，恢复自动分流。 */
+  async switchAccount(acc){
+    if(!acc || acc.id === this.autoSwitch.pinned_account_id) return;
+    this.busy(async()=>{
+      await this.api('/admin/api/accounts/switch',{method:'POST',body:JSON.stringify({id:acc.id})});
+      this.toast('已切换到该账号，请求将固定由它处理','ok');
+      this.loadAccounts(); this.loadAutoSwitch(); this.loadStats();
+    })();
+  },
   /* 添加：服务端对相同 PAT 幂等（视为切换），此处不做本地去重判断 */
   async createAccount(){
     const pat = (this.accountForm.pat||'').trim();
@@ -165,6 +175,7 @@ PAGE('token', {
         strategy: r.strategy || 'sticky',
         sticky_limit: r.sticky_limit || 30,
         max_retry_accounts: r.max_retry_accounts || 3,
+        pinned_account_id: r.pinned_account_id || '',
       };
     }catch(e){ this.toast(e.message,'err'); }
   },
@@ -179,9 +190,34 @@ PAGE('token', {
     this.busy(async()=>{
       await this.api('/admin/api/accounts/auto',{method:'POST',body:JSON.stringify({
         enabled: !!as.enabled, threshold: t, strategy: as.strategy,
-        sticky_limit: sticky, max_retry_accounts: retry })});
+        sticky_limit: sticky, max_retry_accounts: retry,
+        pinned_account_id: as.pinned_account_id || '' })});
       this.toast('负载均衡设置已保存','ok');
+      this.loadAutoSwitch(); this.loadAccounts();
     })();
+  },
+
+  /* 解除固定：恢复多账号自动分流，同时保留其它负载均衡设置 */
+  async unpinAccount(){
+    if(!this.autoSwitch.pinned_account_id) return;
+    this.busy(async()=>{
+      await this.api('/admin/api/accounts/auto',{method:'POST',body:JSON.stringify({
+        enabled: !!this.autoSwitch.enabled,
+        threshold: Number(this.autoSwitch.threshold),
+        strategy: this.autoSwitch.strategy,
+        sticky_limit: Number(this.autoSwitch.sticky_limit),
+        max_retry_accounts: Number(this.autoSwitch.max_retry_accounts),
+        pinned_account_id: '-'
+      })});
+      this.toast('已恢复多账号自动分流','ok');
+      this.loadAutoSwitch(); this.loadAccounts();
+    })();
+  },
+  pinnedAccountLabel(){
+    const id = this.autoSwitch.pinned_account_id;
+    if(!id) return '';
+    const acc = this.accounts.find(a=>a.id===id);
+    return acc ? (acc.note || acc.pat_masked || id) : id;
   },
 
   /* 默认签到时间：用于「留空 = 使用默认」的提示占位 */
@@ -194,5 +230,6 @@ PAGE('token', {
 
   /* ── 进场：本页所需数据（账号等级徽标取自 stats 快照，故一并拉统计；本页不驻留，
    * 不参与统计页的定时刷新） ── */
-  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadStats(); this.loadCheckinDefaults(); },
+  /* 账号页等级徽标取当前「统计」选择器对应账号的快照；未选账号时是聚合视图。 */
+  load(){ this.loadAccounts(); this.loadAutoSwitch(); this.loadStatsAccounts(); this.loadStats(); this.loadCheckinDefaults(); },
 });

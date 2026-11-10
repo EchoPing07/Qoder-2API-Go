@@ -9,11 +9,11 @@
 - **OpenAI API 兼容** —— 支持 `/v1/chat/completions` 和 `/v1/models` 端点，可无缝替换 OpenAI API
 - **流式响应** —— 支持 SSE 流式输出；`stream_options.include_usage: true` 时末尾附带 usage 帧（含输入 / 输出 / 缓存命中 / 思考 token 与实际扣费额度）
 - **参数完全透传** —— `reasoning_effort`、`max_tokens`、`temperature` 等参数原样转发网关，不做本地校验/钳制/映射；网关拒绝时按真实状态码与原文回传客户端
-- **真实用量统计** —— `/v1/chat/completions` 响应携带网关真实 token 用量：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`，以及 Qoder 扩展字段 `credits`（实际扣费额度）/ `original_credits`（折扣前额度）
+- **真实用量统计（可按账号切换）** —— `/v1/chat/completions` 响应携带网关真实 token 用量：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`，以及 Qoder 扩展字段 `credits`（实际扣费额度）/ `original_credits`（折扣前额度）；管理面板「统计」页可选择「全部账号」或单个账号，分别查看该账号的请求量、token、扣费与官方额度池
 - **多模态支持** —— 支持图片输入
 - **Tool Calls** —— 支持函数调用
 - **模型动态加载** —— 自动从网关获取可用模型列表
-- **多账号池 + 请求负载均衡** —— 支持多个 Qoder PAT 池化管理（国内版 / 国际版可按账号分别指定区域）：请求按策略（粘性轮换 / 纯轮询 / 最少在途）分散到不同账号，避免全部压在一个账号上；剩余积分低于阈值（默认 20，面板可调）的账号自动停止接新请求，硬耗尽的账号冷却到下次重置点；请求撞上游 401/403 时冷却失败号并自动改投其它账号重试（客户端无感）；模型名可用 `cn/`、`gl/`、`auto/` 前缀指定区域；旧版单 PAT 配置自动迁移为池中的「默认账号」
+- **多账号池 + 请求负载均衡 / 手动切换** —— 支持多个 Qoder PAT 池化管理（国内版 / 国际版可按账号分别指定区域）：默认请求按策略（粘性轮换 / 纯轮询 / 最少在途）分散到不同账号，避免全部压在一个账号上；在账号页点「切换」可把请求固定到指定账号，点「解除固定」恢复自动分流（固定账号耗尽 / 冷却时仍会自动回退到健康账号）；剩余积分低于阈值（默认 20，面板可调）的账号自动停止接新请求，硬耗尽的账号冷却到下次重置点；请求撞上游 401/403 时冷却失败号并自动改投其它账号重试（客户端无感）；模型名可用 `cn/`、`gl/`、`auto/` 前缀指定区域；旧版单 PAT 配置自动迁移为池中的「默认账号」
 - **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、多账号池（多 PAT 添加 / 额度检测 / 权重 / 每日签到 / 负载均衡设置）、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
 - **请求日志** —— 记录每次调用的元信息（时间、模型、密钥、流式与否、token 用量、扣费额度、耗时、状态码与错误摘要，不保存对话内容），面板「日志」页支持按模型 / 密钥 / 状态筛选与分页，保留天数与条数上限可配置、自动清理最旧条目
 - **订阅周期感知** —— 从网关 `/algo/api/v3/user/status` 读取真实订阅信息（套餐、组织、`nextResetAt` 重置时间、`isQuotaExceeded` 超额标记），使面板额度按计费周期统计而非终身累计
@@ -175,7 +175,7 @@ scripts/service.sh update     # 重新构建二进制并重启
 
 ### 1. 配置 PAT
 
-启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。添加时需选择令牌所属**区域**：国内版（`qoder.com.cn`）或国际版（`qoder.sh`），区域与令牌不匹配时上游会返回 `personal token is invalid`。重复提交相同 PAT 视为把该账号设为激活账号。
+启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。添加时需选择令牌所属**区域**：国内版（`qoder.com.cn`）或国际版（`qoder.sh`），区域与令牌不匹配时上游会返回 `personal token is invalid`。重复提交相同 PAT 视为把该账号设为激活账号；在账号池点「切换」会同时把请求固定到该账号。
 
 > 🌍 **国际版支持**：国际版账号的聊天/状态走 `api1.qoder.sh`，额度查询走 `openapi.qoder.sh`。国际版额度接口不接受 COSY 会话令牌，程序会用 PAT 单独换取 OpenAPI 令牌（并自动刷新）后再查询余额；国内版账号则沿用原链路，无需额外配置。
 
@@ -207,7 +207,7 @@ curl http://localhost:10081/v1/models \
 
 ### 4.1 多账号负载均衡与区域前缀
 
-池中有多个账号时，请求会按策略**分散到不同账号**，而不是全部压在一个账号上（单个账号的积分通常不会快速下降，只靠「积分阈值」很难触发切换，容易被上游限流）。策略在管理面板「账号 → 负载均衡 / 自动切换」中配置：
+池中有多个账号时，默认请求会按策略**分散到不同账号**，而不是全部压在一个账号上（单个账号的积分通常不会快速下降，只靠「积分阈值」很难触发切换，容易被上游限流）。策略在管理面板「账号 → 负载均衡 / 自动切换」中配置。若想手动指定账号，在账号池点对应行的「切换」：该账号会成为激活账号并固定承接请求；「负载均衡 / 自动切换」卡片会出现「解除固定」按钮，点击后恢复自动分流。固定账号被耗尽、冷却或不适合当前区域前缀时，请求仍会自动回退到其它健康账号。
 
 | 策略 | 说明 |
 | ------ | ------ |
@@ -337,7 +337,7 @@ curl http://localhost:10081/v1/chat/completions \
 | `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
 | `/admin/api/pat` | GET/POST | PAT 令牌管理（写入自动同步账号池） |
 | `/admin/api/accounts` | GET/POST/DELETE | 账号池管理（相同 PAT 重复提交视为切到该账号；删除激活中的账号会把激活顺延到第一个剩余账号，账号不存在才返回 `404`） |
-| `/admin/api/accounts/switch` | POST | 手动切换激活账号 |
+| `/admin/api/accounts/switch` | POST | 手动切换激活账号并固定请求路由 |
 | `/admin/api/accounts/note` | POST | 修改账号备注 |
 | `/admin/api/accounts/weight` | POST | 设置账号权重（1..100，按权重分配请求） |
 | `/admin/api/accounts/checkin` | POST | 立即执行一次该账号的每日签到 |
@@ -345,7 +345,7 @@ curl http://localhost:10081/v1/chat/completions \
 | `/admin/api/accounts/check` | POST | 检测账号真实额度（临时会话查询一次并落快照） |
 | `/admin/api/accounts/auto` | GET/POST | 负载均衡 / 自动切换设置（开关 + 策略 + 粘性次数 + 最大重试账号数 + 剩余积分阈值） |
 | `/admin/api/models` | GET | 获取模型列表 |
-| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 实际扣费额度与均值 / 计费周期与套餐信息） |
+| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 实际扣费额度与均值 / 计费周期与套餐信息）；可用 `?account_id=<id>` 选择单个账号，缺省或 `all` 为全部账号聚合 |
 | `/admin/api/config` | GET/POST | 服务器配置 |
 | `/admin/api/password` | POST | 修改管理密码 |
 
@@ -386,6 +386,7 @@ curl http://localhost:10081/v1/chat/completions \
 ### 统计与降级口径
 
 - **官方额度优先**：面板的套餐用量来自账号级 OpenAPI，包含 IDE、CLI 和本服务产生的全部消耗，也能覆盖服务启动前的当期用量。
+- **按账号切换**：统计页顶部的账号选择器可读「全部账号」聚合，或读取某个账号自己的请求计数、token、扣费、周期边界与官方额度快照；`data.json` 的 `stats.by_account` 按账号 ID 分桶持久化，旧文件没有该字段时仍按全量聚合展示。删除账号只清除该账号的分区，历史聚合值保留。
 - **额度来源分别展示**：套餐额度、加购额度和组织资源包在额度明细卡中分别成行展示，并汇总各额度来源返回的剩余 Credits；组织资源包的“可用/不可用”状态以 OpenAPI 返回值为准。
 - **本服务实际消耗单独成卡**：官方额度池是账号级数字，无法回答“本服务花了多少”。统计页的「实际消耗 Credits」卡直接累加网关 usage 帧里的 `credits`（实际扣费额度，已含折扣），因此可核对到每一次请求：
 

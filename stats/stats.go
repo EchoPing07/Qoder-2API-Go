@@ -136,6 +136,12 @@ type Data struct {
 	Account      *Account              `json:"account,omitempty"`
 	ByModel      map[string]*ModelStat `json:"by_model,omitempty"`
 	Hourly       map[string]*HourStat  `json:"hourly,omitempty"`
+	// ByAccount holds the same counters partitioned by the Qoder account that
+	// served each request. The global fields above stay the all-account
+	// aggregate so older readers and the default panel view keep working; the
+	// admin panel asks for one partition with /admin/api/stats?account_id=….
+	// Child entries never nest another ByAccount map.
+	ByAccount map[string]*Data `json:"by_account,omitempty"`
 }
 
 // ModelRow is a per-model report row served to the admin UI.
@@ -194,6 +200,10 @@ type Report struct {
 }
 
 // Persister persists the stats data (implemented by store.Store).
+// AllAccountID is the account_id value for the aggregate (all-account) view.
+// An empty account_id is accepted as the same thing for backwards compatibility.
+const AllAccountID = "all"
+
 type Persister interface {
 	LoadStats() *Data
 	SaveStats(*Data) error
@@ -226,8 +236,9 @@ func NewRecorder(p Persister) *Recorder {
 
 func newData() *Data {
 	return &Data{
-		ByModel: map[string]*ModelStat{},
-		Hourly:  map[string]*HourStat{},
+		ByModel:   map[string]*ModelStat{},
+		Hourly:    map[string]*HourStat{},
+		ByAccount: map[string]*Data{},
 	}
 }
 
@@ -238,12 +249,47 @@ func normalize(d *Data) *Data {
 	if d.Hourly == nil {
 		d.Hourly = map[string]*HourStat{}
 	}
+	if d.ByAccount == nil {
+		d.ByAccount = map[string]*Data{}
+	}
+	for id, child := range d.ByAccount {
+		if child == nil {
+			child = &Data{}
+		}
+		if child.ByModel == nil {
+			child.ByModel = map[string]*ModelStat{}
+		}
+		if child.Hourly == nil {
+			child.Hourly = map[string]*HourStat{}
+		}
+		// Partitions are leaf nodes: drop any nested map a hand-edited file or
+		// an older build may have persisted instead of recursing into it.
+		child.ByAccount = nil
+		d.ByAccount[id] = child
+	}
 	return d
 }
 
 // Clone returns a deep copy of d. Callers must not hold the recorder mutex
 // when the copy is needed for concurrent use.
 func (d *Data) Clone() *Data {
+	cp := d.cloneCore()
+	if len(d.ByAccount) > 0 {
+		cp.ByAccount = make(map[string]*Data, len(d.ByAccount))
+		for id, child := range d.ByAccount {
+			if child == nil {
+				cp.ByAccount[id] = &Data{ByModel: map[string]*ModelStat{}, Hourly: map[string]*HourStat{}}
+				continue
+			}
+			cp.ByAccount[id] = child.cloneCore()
+		}
+	}
+	return cp
+}
+
+// cloneCore copies the flat counters without recursing into ByAccount. It is
+// shared by Clone (for the aggregate) and by the per-account partitions.
+func (d *Data) cloneCore() *Data {
 	cp := &Data{
 		Total:            d.Total,
 		Success:          d.Success,
@@ -275,23 +321,52 @@ func (d *Data) Clone() *Data {
 	return cp
 }
 
-// Record counts one completed request.
+// accountDataLocked returns the partition for accountID, creating it on first
+// use. Caller must hold the recorder mutex.
+func (r *Recorder) accountDataLocked(accountID string) *Data {
+	if r.data.ByAccount == nil {
+		r.data.ByAccount = map[string]*Data{}
+	}
+	d := r.data.ByAccount[accountID]
+	if d == nil {
+		d = newData()
+		r.data.ByAccount[accountID] = d
+	}
+	return d
+}
+
+// Record counts one completed request in the aggregate view.
+// RecordAccount is the account-aware form used by the chat handler.
 func (r *Recorder) Record(model string, ok bool) {
+	r.RecordAccount("", model, ok)
+}
+
+// RecordAccount counts one request in the aggregate AND in the serving
+// account's partition. An empty accountID (legacy callers, /v1/models probes)
+// only touches the aggregate.
+func (r *Recorder) RecordAccount(accountID, model string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.dirty = true
-	r.data.Total++
+	recordInto(r.data, model, ok)
+	if accountID != "" {
+		recordInto(r.accountDataLocked(accountID), model, ok)
+	}
+}
+
+func recordInto(d *Data, model string, ok bool) {
+	d.Total++
 	if ok {
-		r.data.Success++
+		d.Success++
 	} else {
-		r.data.Failed++
+		d.Failed++
 	}
 
-	m := r.data.ByModel[model]
+	m := d.ByModel[model]
 	if m == nil {
 		m = &ModelStat{Model: model}
-		r.data.ByModel[model] = m
+		d.ByModel[model] = m
 	}
 	m.Total++
 	if ok {
@@ -301,10 +376,10 @@ func (r *Recorder) Record(model string, ok bool) {
 	}
 
 	key := time.Now().Format(HourKeyFormat)
-	h := r.data.Hourly[key]
+	h := d.Hourly[key]
 	if h == nil {
 		h = &HourStat{Hour: key}
-		r.data.Hourly[key] = h
+		d.Hourly[key] = h
 	}
 	h.Total++
 	if ok {
@@ -326,31 +401,43 @@ func (r *Recorder) Record(model string, ok bool) {
 // rather than looked up from the request counter because the sink fires before
 // the handler's Record call, so the model's row may not exist yet.
 func (r *Recorder) RecordUsage(model string, u *Usage) {
+	r.RecordUsageAccount("", model, u)
+}
+
+// RecordUsageAccount attributes a usage frame to the serving account as well
+// as to the aggregate. Each partition carries its own billing cycle, so a pool
+// whose accounts reset on different days does not mix cycle-relative credits.
+func (r *Recorder) RecordUsageAccount(accountID, model string, u *Usage) {
 	if u == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dirty = true
-	r.data.PromptTokens += int64(u.PromptTokens)
-	r.data.CompletionTokens += int64(u.CompletionTokens)
-	r.data.CachedTokens += int64(u.CachedTokens)
+	nowMs := time.Now().UnixMilli()
+	recordUsageInto(r.data, model, u, nowMs)
+	if accountID != "" {
+		recordUsageInto(r.accountDataLocked(accountID), model, u, nowMs)
+	}
+}
+
+func recordUsageInto(d *Data, model string, u *Usage, nowMs int64) {
+	d.PromptTokens += int64(u.PromptTokens)
+	d.CompletionTokens += int64(u.CompletionTokens)
+	d.CachedTokens += int64(u.CachedTokens)
 	if u.NonBillable {
 		return
 	}
-	r.data.Credits += u.Credits
-	r.data.BilledRequests++
-	nowMs := time.Now().UnixMilli()
-	r.rollCycleLocked(nowMs)
-	r.data.CycleCredits += u.Credits
+	rollCycle(d, nowMs)
+	d.Credits += u.Credits
+	d.BilledRequests++
+	d.CycleCredits += u.Credits
 
-	// Attribute credits to the model and hour; the token totals above stay
-	// account-wide, because credits are what the panel weighs against an
-	// allowance and an unattributed spend total names no culprit.
-	m := r.data.ByModel[model]
+	// Attribute credits to the model and hour within this view.
+	m := d.ByModel[model]
 	if m == nil {
 		m = &ModelStat{Model: model}
-		r.data.ByModel[model] = m
+		d.ByModel[model] = m
 	}
 	m.Billed++
 	m.Credits += u.Credits
@@ -358,10 +445,10 @@ func (r *Recorder) RecordUsage(model string, u *Usage) {
 	// Reuse the timestamp from the cycle roll above, so a request landing on an
 	// hour boundary is attributed to the hour it was charged in.
 	key := time.UnixMilli(nowMs).Format(HourKeyFormat)
-	h := r.data.Hourly[key]
+	h := d.Hourly[key]
 	if h == nil {
 		h = &HourStat{Hour: key}
-		r.data.Hourly[key] = h
+		d.Hourly[key] = h
 	}
 	h.Billed++
 	h.Credits += u.Credits
@@ -402,6 +489,27 @@ func (r *Recorder) SetBillingCycle(nextResetMs int64) {
 	r.setBillingCycleAt(nextResetMs, time.Now().UnixMilli())
 }
 
+// SetBillingCycleFor stores the subscription boundary for one account. An
+// empty or AllAccountID id updates the aggregate view instead.
+func (r *Recorder) SetBillingCycleFor(accountID string, nextResetMs int64) {
+	r.setBillingCycleForAt(accountID, nextResetMs, time.Now().UnixMilli())
+}
+
+func (r *Recorder) setBillingCycleForAt(accountID string, nextResetMs, nowMs int64) {
+	if accountID == "" || accountID == AllAccountID {
+		r.setBillingCycleAt(nextResetMs, nowMs)
+		return
+	}
+	if nextResetMs <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if setBillingCycleInto(r.accountDataLocked(accountID), nextResetMs, nowMs) {
+		r.dirty = true
+	}
+}
+
 // setBillingCycleAt is SetBillingCycle with an explicit clock, so tests can use
 // fixed calendar instants (month-end anchors, leap years) instead of values
 // derived from the wall clock. Callers must pass the real clock otherwise.
@@ -411,58 +519,75 @@ func (r *Recorder) setBillingCycleAt(nextResetMs, nowMs int64) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if setBillingCycleInto(r.data, nextResetMs, nowMs) {
+		r.dirty = true
+	}
+}
+
+// setBillingCycleInto applies one reported boundary to a stats view. It returns
+// true when the view changed. The caller owns the recorder mutex (or is working
+// on a detached Data).
+//
+// Acceptance is forward-only with a drift tolerance; see SetBillingCycle's
+// comment for the full rationale.
+func setBillingCycleInto(d *Data, nextResetMs, nowMs int64) bool {
+	changed := false
 	// Advance past any boundary that has already passed: otherwise a stale
 	// boundary still visible in the cached /user/status response would be
 	// treated as a move backwards (or as a refresh) below. The roll is itself a
 	// state change, so it must be persisted even when the reported boundary
 	// then matches the rolled-forward one exactly.
-	if r.rollCycleLocked(nowMs) {
-		r.dirty = true
+	if rollCycle(d, nowMs) {
+		changed = true
 	}
-	if r.data.NextResetMs == nextResetMs {
-		return
+	if d.NextResetMs == nextResetMs {
+		return changed
 	}
-	if plausibleResetMs(r.data.NextResetMs) && nextResetMs <= r.data.NextResetMs {
-		// Stale report: the tracked boundary is already at or beyond it. Keep
-		// tracking the newer one so this cannot discard the live cycle.
-		//
-		// An implausible tracked boundary (a sentinel persisted by an earlier
-		// build) is deliberately excluded from this comparison: it lies beyond
-		// every genuine report, so treating it as "newer" would reject real
-		// boundaries forever and leave the rollover dead (the credits comparison
-		// below then also stays negative, so no credits are discarded either).
-		return
+	if plausibleResetMs(d.NextResetMs) && nextResetMs <= d.NextResetMs {
+		// Stale report: ignore it. An implausible tracked boundary (a sentinel
+		// persisted by an earlier build) is deliberately excluded so real
+		// boundaries can still be adopted.
+		return changed
 	}
-	if r.data.NextResetMs != 0 && nextResetMs-r.data.NextResetMs >= cycleDriftToleranceMs {
-		// A genuinely different cycle: the allowance has been refreshed, so
-		// the previous cycle's credits are stale.
-		r.data.CycleCredits = 0
+	if d.NextResetMs != 0 && nextResetMs-d.NextResetMs >= cycleDriftToleranceMs {
+		d.CycleCredits = 0
 	}
-	r.data.NextResetMs = nextResetMs
-	r.data.CycleStartMs = addMonthsMs(nextResetMs, -1)
-	r.dirty = true
+	d.NextResetMs = nextResetMs
+	d.CycleStartMs = addMonthsMs(nextResetMs, -1)
+	return true
 }
 
-// SetAccount records the subscription metadata reported by /user/status.
-//
-// The panel reads this from memory, so storing it here (rather than fetching
-// on demand) keeps the 15s admin poll free of upstream calls. A nil account is
-// ignored so a transient status outage cannot wipe a previously known plan; use
-// ClearAccount to drop it on purpose.
+// SetAccount records the subscription metadata reported by /user/status into
+// the aggregate view. The panel reads this from memory, so storing it here
+// (rather than fetching on demand) keeps the 15s admin poll free of upstream
+// calls. A nil account is ignored so a transient status outage cannot wipe a
+// previously known plan; use ClearAccount to drop it on purpose.
 func (r *Recorder) SetAccount(a *Account) {
+	r.SetAccountFor("", a)
+}
+
+// SetAccountFor stores the subscription snapshot of one account. An empty or
+// AllAccountID id writes the aggregate view; other ids write that account's
+// partition, so the panel can switch between accounts without refetching.
+func (r *Recorder) SetAccountFor(accountID string, a *Account) {
 	if a == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	target := r.data
+	if accountID != "" && accountID != AllAccountID {
+		target = r.accountDataLocked(accountID)
+	}
 	// Deep-copy nested quota objects so later caller mutations cannot change
 	// the persisted snapshot behind the recorder's back.
-	r.data.Account = cloneAccount(a)
+	target.Account = cloneAccount(a)
 	r.dirty = true
 }
 
-// ClearAccount drops the cached account snapshot, e.g. after the configured PAT
-// changed and the previous account's plan and allowance no longer apply.
+// ClearAccount drops the cached aggregate account snapshot, e.g. after the
+// configured PAT changed and the previous account's plan no longer applies.
+// Per-account snapshots stay available for their own partition.
 func (r *Recorder) ClearAccount() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -471,6 +596,17 @@ func (r *Recorder) ClearAccount() {
 	}
 	r.data.Account = nil
 	r.dirty = true
+}
+
+// ForgetAccount removes a deleted account's counter partition from memory and
+// persistence. Its already-counted traffic stays part of the aggregate.
+func (r *Recorder) ForgetAccount(accountID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.data.ByAccount[accountID]; ok {
+		delete(r.data.ByAccount, accountID)
+		r.dirty = true
+	}
 }
 
 func cloneAccount(a *Account) *Account {
@@ -544,18 +680,17 @@ func advanceBoundaryMs(nextMs int64, loc *time.Location) int64 {
 	return adv
 }
 
-// projectCycleLocked returns the cycle values that apply at nowMs without
-// mutating the recorder: a read must never roll the billing cycle, otherwise an
-// admin poll landing just after a boundary would persist a rollover and discard
-// the previous cycle's credits.
+// projectCycle returns the cycle values of d at nowMs without mutating it: a
+// read must never roll the billing cycle, otherwise an admin poll landing just
+// after a boundary would persist a rollover and discard the previous cycle's
+// credits.
 //
-// It runs the same advance loop as rollCycleLocked on local copies, so a
-// projection across several missed cycles matches what the next write would
-// persist. Caller must hold the mutex.
-func (r *Recorder) projectCycleLocked(nowMs int64) (cycleCredits float64, startMs, nextMs int64) {
-	cycleCredits = r.data.CycleCredits
-	startMs = r.data.CycleStartMs
-	nextMs = r.data.NextResetMs
+// It runs the same advance loop as rollCycle on local copies, so a projection
+// across several missed cycles matches what the next write would persist.
+func projectCycle(d *Data, nowMs int64) (cycleCredits float64, startMs, nextMs int64) {
+	cycleCredits = d.CycleCredits
+	startMs = d.CycleStartMs
+	nextMs = d.NextResetMs
 	for i := 0; nextMs > 0 && nowMs >= nextMs && i < maxCycleCatchUps; i++ {
 		startMs = nextMs
 		cycleCredits = 0
@@ -578,10 +713,9 @@ func (r *Recorder) projectCycleLocked(nowMs int64) (cycleCredits float64, startM
 	return cycleCredits, startMs, nextMs
 }
 
-// rollCycleLocked zeroes the cycle credits once the known reset boundary has
+// rollCycle zeroes the cycle credits of d once its known reset boundary has
 // passed, then advances the boundary locally. It reports whether any state
-// changed, so the caller can mark the recorder dirty. Caller must hold the
-// mutex.
+// changed, so the caller can mark the recorder dirty.
 //
 // The advance is what makes the rollover happen exactly once: without it,
 // every subsequent request would still see nowMs >= NextResetMs and wipe the
@@ -591,28 +725,28 @@ func (r *Recorder) projectCycleLocked(nowMs int64) (cycleCredits float64, startM
 // A loop rather than a single step covers a service that stayed down across
 // several cycles; see nextCycleBoundary and maxCycleCatchUps for the two guards
 // that keep it from spinning or doing unbounded work under the lock.
-func (r *Recorder) rollCycleLocked(nowMs int64) bool {
+func rollCycle(d *Data, nowMs int64) bool {
 	rolled := false
-	for i := 0; r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs && i < maxCycleCatchUps; i++ {
-		current := r.data.NextResetMs
-		r.data.CycleStartMs = current
-		r.data.CycleCredits = 0
+	for i := 0; d.NextResetMs > 0 && nowMs >= d.NextResetMs && i < maxCycleCatchUps; i++ {
+		current := d.NextResetMs
+		d.CycleStartMs = current
+		d.CycleCredits = 0
 		rolled = true
 		adv := nextCycleBoundary(current)
 		if adv == 0 {
 			// No later boundary can be derived for this instant. Drop the
 			// boundary instead of leaving it in the past, where every later
 			// request would re-zero the new cycle's credits.
-			r.data.NextResetMs = 0
+			d.NextResetMs = 0
 			return true
 		}
-		r.data.NextResetMs = adv
+		d.NextResetMs = adv
 	}
-	if r.data.NextResetMs > 0 && nowMs >= r.data.NextResetMs {
+	if d.NextResetMs > 0 && nowMs >= d.NextResetMs {
 		// The cap was exhausted: the boundary is a corrupt or centuries-old
 		// value that can never be advanced into the future. Drop it so the next
 		// request starts a fresh cycle instead of being zeroed on every write.
-		r.data.NextResetMs = 0
+		d.NextResetMs = 0
 		return true
 	}
 	return rolled
@@ -662,58 +796,84 @@ func (r *Recorder) Flush() error {
 // Caller must hold the mutex.
 func (r *Recorder) pruneLocked() {
 	cutoff := time.Now().Add(-BucketRetention).Format(HourKeyFormat)
-	for k := range r.data.Hourly {
-		if k < cutoff {
-			delete(r.data.Hourly, k)
+	pruneHourly(r.data.Hourly, cutoff)
+	for _, d := range r.data.ByAccount {
+		if d != nil {
+			pruneHourly(d.Hourly, cutoff)
 		}
 	}
 }
 
-// Report returns a snapshot for the admin UI: totals, per-model rows sorted by
-// total (descending), and the last 24 hourly buckets in ascending order.
+func pruneHourly(hourly map[string]*HourStat, cutoff string) {
+	for k := range hourly {
+		if k < cutoff {
+			delete(hourly, k)
+		}
+	}
+}
+
+// Report returns the all-account snapshot for the admin UI: totals, per-model
+// rows sorted by total (descending), and the last 24 hourly buckets.
 func (r *Recorder) Report() *Report {
 	return r.reportAt(time.Now().UnixMilli())
 }
 
+// ReportFor returns a snapshot for one account. An empty id or AllAccountID
+// selects the all-account aggregate; an unknown id yields an empty report so
+// the panel cannot silently show another account's numbers.
+func (r *Recorder) ReportFor(accountID string) *Report {
+	return r.reportForAt(accountID, time.Now().UnixMilli())
+}
+
 // reportAt is Report with the billing-cycle projection evaluated at nowMs
-// instead of the wall clock, so tests can pin fixed calendar instants (month-end
-// anchors, leap years) rather than depend on the day the suite runs. Only the
-// cycle view is pinned; the hourly buckets still follow the wall clock.
+// instead of the wall clock, so tests can pin fixed calendar instants.
 func (r *Recorder) reportAt(nowMs int64) *Report {
+	return r.reportForAt("", nowMs)
+}
+
+func (r *Recorder) reportForAt(accountID string, nowMs int64) *Report {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	d := r.data
+	if accountID != "" && accountID != AllAccountID {
+		d = r.data.ByAccount[accountID]
+		if d == nil {
+			d = newData()
+		}
+	}
 
 	// Project the cycle for the report without mutating the recorder: the
 	// panel polls every 15s, so a poll landing just after a boundary would
 	// otherwise roll the cycle and persist a rollover that discarded the
 	// previous cycle's credits. A read is a pure projection; the write path
 	// (RecordUsage) is what advances the tracked boundary.
-	cycleCredits, cycleStartMs, nextResetMs := r.projectCycleLocked(nowMs)
+	cycleCredits, cycleStartMs, nextResetMs := projectCycle(d, nowMs)
 
 	rep := &Report{
-		Total:            r.data.Total,
-		Success:          r.data.Success,
-		Failed:           r.data.Failed,
-		PromptTokens:     r.data.PromptTokens,
-		CompletionTokens: r.data.CompletionTokens,
-		CachedTokens:     r.data.CachedTokens,
-		Credits:          r.data.Credits,
-		BilledRequests:   r.data.BilledRequests,
+		Total:            d.Total,
+		Success:          d.Success,
+		Failed:           d.Failed,
+		PromptTokens:     d.PromptTokens,
+		CompletionTokens: d.CompletionTokens,
+		CachedTokens:     d.CachedTokens,
+		Credits:          d.Credits,
+		BilledRequests:   d.BilledRequests,
 		CycleCredits:     cycleCredits,
 		CycleStartMs:     cycleStartMs,
 		NextResetMs:      nextResetMs,
 		ByModel:          []ModelRow{},
 		Hourly:           []HourRow{},
 	}
-	if r.data.BilledRequests > 0 {
-		rep.AvgCredits = r.data.Credits / float64(r.data.BilledRequests)
+	if d.BilledRequests > 0 {
+		rep.AvgCredits = d.Credits / float64(d.BilledRequests)
 	}
-	rep.Account = cloneAccount(r.data.Account)
-	if r.data.Total > 0 {
-		rep.SuccessRate = float64(r.data.Success) / float64(r.data.Total)
+	rep.Account = cloneAccount(d.Account)
+	if d.Total > 0 {
+		rep.SuccessRate = float64(d.Success) / float64(d.Total)
 	}
 
-	for _, m := range r.data.ByModel {
+	for _, m := range d.ByModel {
 		rate := 0.0
 		if m.Total > 0 {
 			rate = float64(m.Success) / float64(m.Total)
@@ -745,7 +905,7 @@ func (r *Recorder) reportAt(nowMs int64) *Report {
 		ts := start.Add(time.Duration(i) * time.Hour)
 		key := ts.Format(HourKeyFormat)
 		row := HourRow{Hour: key, Label: ts.Format("15:04")}
-		if h := r.data.Hourly[key]; h != nil {
+		if h := d.Hourly[key]; h != nil {
 			row.Total = h.Total
 			row.Success = h.Success
 			row.Failed = h.Failed

@@ -37,8 +37,12 @@ PAGE('stats', {
   get shownCredits(){
     return this.hasCycle ? this.cycleCredits : this.totalCredits;
   },
+  get isAllAccounts(){
+    return !this.statsAccountId || this.statsAccountId === 'all';
+  },
+  /* 周期边界是账号级数据；「全部账号」聚合视图不采用任何一个账号的周期。 */
   get hasCycle(){
-    return Number((this.stats||{}).next_reset_ms || 0) > 0;
+    return !this.isAllAccounts && Number((this.stats||{}).next_reset_ms || 0) > 0;
   },
   /* 卡片副行：只陈述与主体数字同一口径的事实，不混入另一个范围的计数 */
   get creditsDetail(){
@@ -59,6 +63,9 @@ PAGE('stats', {
    * plus a bogus out-of-quota verdict for an account that still has credits.
    */
   get quotaPoolsList(){
+    /* 官方额度池属于具体账号。聚合视图没有「一个账号的额度」，
+     * 不能用激活账号的快照冒充全部账号，故整卡隐藏。 */
+    if(this.isAllAccounts) return [];
     const acct = (this.stats||{}).account || {};
     const pools = [];
     if (acct.user_quota && Number(acct.user_quota.total || 0) > 0) {
@@ -108,9 +115,12 @@ PAGE('stats', {
    */
   get creditsHeadline(){
     const d = this.stats||{};
-    const resetMs = Number(d.next_reset_ms || 0);
+    const resetMs = this.hasCycle ? Number(d.next_reset_ms || 0) : 0;
     const pools = this.quotaPoolsList;
     let text;
+    if (this.isAllAccounts) {
+      return '本服务累计 ' + this.fmtCredits(this.totalCredits);
+    }
     if (pools.length > 0) {
       // The headline describes the pool that actually carries the allowance.
       // Naming it explicitly keeps a free account (whose budget lives in the
@@ -133,10 +143,14 @@ PAGE('stats', {
   /* 完整分池明细（悬停 tooltip）：先给本服务自算的消耗口径，再逐池列出官方额度。 */
   get creditsTitle(){
     const d = this.stats||{};
-    const resetMs = Number(d.next_reset_ms || 0);
+    const resetMs = this.hasCycle ? Number(d.next_reset_ms || 0) : 0;
     const self = this;
     const title = ['本服务累计实际消耗 ' + this.fmtCredits(this.totalCredits) +
       '（计费请求 ' + this.fmt(this.billedCount) + ' 次 · 平均 ' + this.fmtCredits(this.avgCredits) + ' / 次）'];
+    if (this.isAllAccounts) {
+      title.push('当前为全部账号汇总；选择具体账号可查看该账号的官方额度池与订阅周期');
+      return title.join('\n');
+    }
     if (resetMs > 0) {
       title.push('本服务本周期消耗 ' + this.fmtCredits(this.cycleCredits) +
         (this.cycleStartLabel ? '（周期自 ' + this.cycleStartLabel + '）' : ''));
@@ -165,6 +179,7 @@ PAGE('stats', {
     return ms > 0 ? this.fmtMonthDay(ms) : '';
   },
   get accountExceeded(){
+    if(this.isAllAccounts) return false;
     const acct = (this.stats||{}).account;
     return !!(acct && acct.is_quota_exceeded);
   },
@@ -174,9 +189,36 @@ PAGE('stats', {
     return (acct && acct.tag) ? acct.tag : '';
   },
 
+  /* 账号维度：可选「全部账号」聚合，或某个账号自己的请求 / 额度快照。
+   * 服务端的 stats.account 随所选分区返回，因此额度明细、等级徽标与
+   * credits 概要行都会跟着选择器切换，不再是固定显示一个账号。 */
+  async loadStatsAccounts(){
+    try{
+      const r = await this.api('/admin/api/accounts');
+      this.statsAccounts = r.accounts||[];
+      if(this.statsAccountId !== 'all' &&
+         !this.statsAccounts.some(a=>a.id === this.statsAccountId)){
+        this.statsAccountId = 'all';
+        this.loadStats();
+      }
+    }catch(e){ this.toast(e.message,'err'); }
+  },
+  statsAccountQuery(){
+    return this.statsAccountId && this.statsAccountId !== 'all'
+      ? '?account_id=' + encodeURIComponent(this.statsAccountId) : '';
+  },
+  statsAccountLabel(){
+    if(this.statsAccountId === 'all') return '全部账号';
+    const acc = this.statsAccounts.find(a=>a.id===this.statsAccountId);
+    return acc ? (acc.note || acc.pat_masked || '未命名账号') : '全部账号';
+  },
+  selectStatsAccount(id){
+    this.statsAccountId = id || 'all';
+    this.loadStats();
+  },
   async loadStats(){
     try{
-      this.stats = await this.api('/admin/api/stats');
+      this.stats = await this.api('/admin/api/stats' + this.statsAccountQuery());
       this.$nextTick(()=>requestAnimationFrame(()=>this.renderHourly()));
     }catch(e){ this.toast(e.message,'err'); }
   },
@@ -299,5 +341,5 @@ PAGE('stats', {
   },
 
   /* ── 进场：本页所需数据 ── */
-  load(){ this.loadStats(); this.loadModels(); },
+  load(){ this.loadStatsAccounts(); this.loadStats(); this.loadModels(); },
 });

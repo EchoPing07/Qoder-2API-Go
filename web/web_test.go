@@ -573,6 +573,8 @@ func TestMovedModelsAndTier(t *testing.T) {
 		`<h3>账号池</h3>`,
 		`x-text="acc.pat_masked"`,
 		`x-text="fmt(acc.requests||0)"`,
+		`@click="switchAccount(acc)"`,
+		`@click="unpinAccount()"`,
 		`@click="checkAccount(acc)"`,
 		`@click="editAccountNote(acc)"`,
 		`@click="deleteAccount(acc)"`,
@@ -609,13 +611,30 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 	// 账号 API 调用路径须走 /admin/api/accounts*（与 admin 路由的契约由
 	// TestFrontendAPIPathsMatchAdminRoutes 守住，这里只守语义入口）。
-	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/weight'", "'/admin/api/accounts/check'", "'/admin/api/accounts/auto'"} {
+	for _, want := range []string{"'/admin/api/accounts'", "'/admin/api/accounts/weight'", "'/admin/api/accounts/check'", "'/admin/api/accounts/auto'", "'/admin/api/accounts/switch'"} {
 		if !strings.Contains(tokenJS, want) {
 			t.Errorf("账号页缺少 API 调用 %s", want)
 		}
 	}
-	// 模型列表迁入统计页后，其加载动作随之迁到 stats 页面层
+	// 统计页必须能按账号切换（Issue #20）：选择器 + account_id 查询参数。
+	statsHTML := read(pageFS, "pages/stats.html")
+	for _, want := range []string{`aria-label="统计账号"`, `x-for="acc in statsAccounts"`, `@change="selectStatsAccount($event.target.value)"`} {
+		if !strings.Contains(statsHTML, want) {
+			t.Errorf("统计页缺少账号选择器 %s", want)
+		}
+	}
 	statsJS := read(assetFS, "assets/pages/stats.js")
+	if !strings.Contains(statsJS, "'?account_id=' + encodeURIComponent(this.statsAccountId)") {
+		t.Error("统计页必须按所选账号请求 /admin/api/stats?account_id=…")
+	}
+	// 「全部账号」是聚合视图：不能把某一个账号的额度池 / 周期冒充为汇总。
+	if !strings.Contains(statsJS, "if(this.isAllAccounts) return [];") {
+		t.Error("全部账号视图不得展示单一账号的官方额度池")
+	}
+	if !strings.Contains(statsJS, "return !this.isAllAccounts && Number((this.stats||{}).next_reset_ms || 0) > 0;") {
+		t.Error("全部账号视图不得借用单一账号的订阅周期")
+	}
+	// 模型列表迁入统计页后，其加载动作随之迁到 stats 页面层
 	if !strings.Contains(statsJS, "this.loadModels()") {
 		t.Error("统计页 load() 必须加载模型列表（模型页已移除）")
 	}
@@ -860,7 +879,7 @@ Object.keys(PAGES).forEach(function (k) {
   const orig = PAGES[k].load;
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
-['loadStats', 'loadKeys', 'loadAccounts', 'loadAutoSwitch', 'loadModels', 'loadConfig'].forEach(function (m) {
+['loadStats', 'loadStatsAccounts', 'loadKeys', 'loadAccounts', 'loadAutoSwitch', 'loadModels', 'loadConfig'].forEach(function (m) {
   if (typeof inst[m] === 'function') inst[m] = function () { loads.push(m); };
 });
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）

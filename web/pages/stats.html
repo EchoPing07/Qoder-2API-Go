@@ -3,6 +3,15 @@
           <h1>统计</h1>
           <div class="page-actions">
             <span class="muted-xs">统计自服务启动以来记录的请求，每 30 秒持久化一次 · 每 15 秒自动刷新</span>
+            <select class="input select select-offset stats-account-select"
+                    aria-label="统计账号"
+                    :value="statsAccountId"
+                    @change="selectStatsAccount($event.target.value)">
+              <option value="all">全部账号</option>
+              <template x-for="acc in statsAccounts" :key="'stats-acc-'+acc.id">
+                <option :value="acc.id" x-text="acc.note || acc.pat_masked || '未命名账号'"></option>
+              </template>
+            </select>
             <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
               <span class="ic" x-html="ic('refresh')"></span>刷新统计
             </button>
@@ -13,7 +22,7 @@
           <article class="metric">
             <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total)"></div>
-            <p class="metric-detail" x-text="'成功率 ' + pctStr(stats.success_rate)"></p>
+            <p class="metric-detail" x-text="statsAccountLabel() + ' · 成功率 ' + pctStr(stats.success_rate)"></p>
           </article>
           <article class="metric">
             <header class="metric-head">
@@ -48,7 +57,7 @@
         <div class="card" x-show="quotaPoolsList.length">
           <div class="card-head">
             <h3>额度明细</h3>
-            <span class="muted-xs">Qoder 官方账号级额度，每分钟刷新</span>
+            <span class="muted-xs" x-text="statsAccountLabel() + ' · Qoder 官方账号级额度，每分钟刷新'"></span>
             <div class="spacer"></div>
             <span class="muted-xs" x-text="quotaSummary"></span>
           </div>
@@ -79,7 +88,7 @@
         <div class="grid charts">
           <div class="card">
             <div class="card-head">
-              <h3>近 24 小时请求量</h3>
+              <h3 x-text="statsAccountLabel() + ' · 近 24 小时请求量'"></h3>
               <div class="spacer"></div>
               <div class="legend">
                 <span class="lg lg-bar"><i style="background:var(--chart-bar-hl)"></i>成功</span>
@@ -138,7 +147,7 @@
 
         <div class="card">
           <div class="card-head">
-            <h3>按模型统计</h3>
+            <h3 x-text="statsAccountLabel() + ' · 按模型统计'"></h3>
             <span class="muted-xs">消耗为本服务实际扣费（仅计费帧），平均为每次计费请求</span>
           </div>
           <div class="table-wrap" x-show="(stats.by_model||[]).length">

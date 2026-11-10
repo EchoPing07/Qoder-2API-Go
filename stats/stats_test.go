@@ -49,6 +49,72 @@ func TestRecordAndReport(t *testing.T) {
 	}
 }
 
+// Issue #20: traffic and subscription snapshots must be selectable per
+// account, while the default Report() stays the all-account aggregate.
+func TestPerAccountStatsPartition(t *testing.T) {
+	p := &memoryPersister{}
+	r := NewRecorder(p)
+	r.RecordAccount("acc-a", "M", true)
+	r.RecordAccount("acc-b", "M", false)
+	r.RecordAccount("acc-a", "M", true)
+	r.RecordUsageAccount("acc-a", "M", &Usage{PromptTokens: 10, Credits: 2})
+	r.RecordUsageAccount("acc-b", "M", &Usage{PromptTokens: 3, Credits: 1})
+	r.SetBillingCycleFor("acc-a", time.Now().Add(72*time.Hour).UnixMilli())
+	r.SetAccountFor("acc-a", &Account{Tag: "Teams"})
+	r.SetAccountFor("acc-b", &Account{Tag: "Free"})
+
+	all := r.Report()
+	if all.Total != 3 || all.PromptTokens != 13 || all.Credits != 3 {
+		t.Fatalf("aggregate must include every account: %+v", all)
+	}
+	a := r.ReportFor("acc-a")
+	if a.Total != 2 || a.Failed != 0 || a.PromptTokens != 10 || a.Credits != 2 {
+		t.Errorf("account A partition incorrect: %+v", a)
+	}
+	if a.Account == nil || a.Account.Tag != "Teams" || a.NextResetMs == 0 {
+		t.Errorf("account A subscription snapshot missing: %+v", a.Account)
+	}
+	b := r.ReportFor("acc-b")
+	if b.Total != 1 || b.Failed != 1 || b.PromptTokens != 3 || b.Credits != 1 {
+		t.Errorf("account B partition incorrect: %+v", b)
+	}
+	if b.Account == nil || b.Account.Tag != "Free" {
+		t.Errorf("account B subscription snapshot missing: %+v", b.Account)
+	}
+	if empty := r.ReportFor("unknown"); empty.Total != 0 || empty.Account != nil {
+		t.Errorf("unknown account must not leak another account's data: %+v", empty)
+	}
+	if r.ReportFor(AllAccountID).Total != all.Total {
+		t.Error("account_id=all must equal the aggregate view")
+	}
+
+	// Partitions survive a restart and must not recursively nest themselves.
+	if err := r.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewRecorder(p)
+	if got := restarted.ReportFor("acc-a"); got.Total != 2 || got.Account == nil || got.Account.Tag != "Teams" {
+		t.Errorf("per-account stats were not persisted: %+v", got)
+	}
+	if len(p.data.ByAccount["acc-a"].ByAccount) != 0 {
+		t.Error("a partition must not nest another by_account map")
+	}
+}
+
+// Deleting an account drops its partition but keeps the historical aggregate.
+func TestForgetAccountKeepsAggregate(t *testing.T) {
+	r := NewRecorder(nil)
+	r.RecordAccount("acc-a", "M", true)
+	r.SetAccountFor("acc-a", &Account{Tag: "Teams"})
+	r.ForgetAccount("acc-a")
+	if got := r.ReportFor("acc-a"); got.Total != 0 || got.Account != nil {
+		t.Errorf("deleted account still has a selectable snapshot: %+v", got)
+	}
+	if got := r.Report(); got.Total != 1 {
+		t.Errorf("aggregate history must survive account deletion: %+v", got)
+	}
+}
+
 func TestFlushPersists(t *testing.T) {
 	var saved *Data
 	p := &fakePersister{

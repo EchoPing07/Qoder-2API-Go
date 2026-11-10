@@ -357,6 +357,71 @@ func TestPatSwitchDoesNotShowPreviousAccountWhenNewRefreshFails(t *testing.T) {
 	}
 }
 
+// Issue #20: pinned routing must send every request to the chosen account,
+// but a hard-exhausted pin must not take the whole service offline.
+func TestRouterPinnedAccount(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	if err := s.SetPinnedAccount(acc2); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		if id := pickWith(p, "m", models.RegionDefault, nil); id != acc2 {
+			t.Fatalf("pinned routing picked %q, want %q", id, acc2)
+		}
+	}
+	// A stale pin is cleared on load, and deleting the pinned account clears it.
+	if err := s.DeleteAccount(acc2); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.GetAutoSwitch().PinnedAccountID; got != "" {
+		t.Errorf("deleting the pinned account left pin = %q", got)
+	}
+	if id := pickWith(p, "m", models.RegionDefault, nil); id != acc1 {
+		t.Errorf("after unpinning expected the sole survivor %q, got %q", acc1, id)
+	}
+}
+
+func TestRouterPinnedAccountFallsBackWhenExhausted(t *testing.T) {
+	p, s, acc1, acc2 := newRouteTestPool(t)
+	if err := s.SetPinnedAccount(acc1); err != nil {
+		t.Fatal(err)
+	}
+	p.markAccountFailure(acc1, time.Now().Add(time.Hour).Unix())
+	if id := pickWith(p, "m", models.RegionDefault, nil); id != acc2 {
+		t.Errorf("exhausted pin must fall back to a healthy account, got %q", id)
+	}
+}
+
+// The account loop must refresh every pool entry's stats partition, not just
+// the active account's aggregate snapshot.
+func TestApplyAccountWriteForEveryPoolEntry(t *testing.T) {
+	s, err := store.New(t.TempDir() + "/data.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accA, _ := s.AddAccount("pt-a", "一号")
+	accB, _ := s.AddAccount("pt-b", "二号")
+	p := newBridgeProvider(s)
+	rec := stats.NewRecorder(nil)
+
+	// The loop probes every pool entry in rotation, guarded by that entry's
+	// own PAT; an inactive account must still get its own snapshot.
+	if !applyAccountWriteFor(rec, p, accB.ID, accB.PAT, 0, &stats.Account{Tag: "Free"}) {
+		t.Fatal("an inactive account refresh was rejected")
+	}
+	if got := rec.ReportFor(accB.ID).Account; got == nil || got.Tag != "Free" {
+		t.Errorf("inactive account B missing its subscription snapshot: %+v", got)
+	}
+	if got := rec.ReportFor(accA.ID).Account; got != nil {
+		t.Errorf("account A must not inherit B's snapshot: %+v", got)
+	}
+	// A is the active account, so the legacy aggregate must stay empty until
+	// its own probe runs rather than showing B's plan.
+	if got := rec.Report().Account; got != nil {
+		t.Errorf("aggregate must not show B as the active account's plan: %+v", got)
+	}
+}
+
 // ═══ Multi-account routing ═══
 
 // newRouteTestPool builds a provider + store with a two-account pool:

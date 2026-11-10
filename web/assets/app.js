@@ -56,14 +56,14 @@ function appShell(){
     ready:false, loggedIn:false, loading:false, password:'',
     mobileNav:false, toasts:[], _toastSeq:0,
     theme: localStorage.getItem('qoder2api:theme') || 'system',
-    stats:{}, keys:[],
+    stats:{}, keys:[], statsAccounts:[], statsAccountId:'all',
 
     logs:[], logTotal:0, logPage:1, logPageSize:20,
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
     accounts:[], accountModal:false, accountForm:{pat:'',note:'',region:'cn'},
     noteModal:false, noteForm:{id:'',note:''}, checkingId:'',
-    autoSwitch:{enabled:false, threshold:20, strategy:'sticky', sticky_limit:30, max_retry_accounts:3},
+    autoSwitch:{enabled:false, threshold:20, strategy:'sticky', sticky_limit:30, max_retry_accounts:3, pinned_account_id:''},
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
@@ -96,11 +96,11 @@ function appShell(){
       window.addEventListener('resize', ()=>{ clearTimeout(rto); rto=setTimeout(()=>{ if(this.view==='stats') this.renderHourly(); }, 200); });
       // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发；
       // 后台标签页跳过（visibilityState），回到前台时立即补一次，避免展示陈旧数据。
-      setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible') this.loadStats(); }, 15000);
+      setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible'){ this.loadStats(); this.loadStatsAccounts(); } }, 15000);
       // 账号页驻留时每 5 秒刷新一次账号池（在途/额度是动态的），后台标签页跳过。
-      setInterval(()=>{ if(this.loggedIn && this.view==='token' && document.visibilityState==='visible') this.loadAccounts(); }, 5000);
+      setInterval(()=>{ if(this.loggedIn && this.view==='token' && document.visibilityState==='visible'){ this.loadAccounts(); this.loadAutoSwitch(); } }, 5000);
       document.addEventListener('visibilitychange', ()=>{
-        if(!document.hidden && this.loggedIn && this.view==='stats') this.loadStats();
+        if(!document.hidden && this.loggedIn && this.view==='stats'){ this.loadStats(); this.loadStatsAccounts(); }
         if(!document.hidden && this.loggedIn && this.view==='token') this.loadAccounts();
       });
       try{

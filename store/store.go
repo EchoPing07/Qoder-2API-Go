@@ -179,6 +179,10 @@ type AutoSwitch struct {
 	// MaxRetryAccounts caps how many accounts one chat request may try when it
 	// hits an upstream auth failure (1..16).
 	MaxRetryAccounts int `json:"max_retry_accounts"`
+	// PinnedAccountID forces every chat request onto one pool entry. Empty
+	// means normal load balancing. The panel's manual「切换」sets this so the
+	// user can choose which account actually serves requests.
+	PinnedAccountID string `json:"pinned_account_id,omitempty"`
 }
 
 // Routing strategy identifiers.
@@ -385,6 +389,21 @@ func (s *Store) load() error {
 	if cfg.AutoSwitch.StickyLimit <= 0 {
 		cfg.AutoSwitch.StickyLimit = DefaultStickyLimit
 		needsSave = true
+	}
+	// A stale pin (account deleted behind our back, or a hand-edited file)
+	// must never leave the router with no usable candidates.
+	if cfg.AutoSwitch.PinnedAccountID != "" {
+		valid := false
+		for _, acc := range cfg.Accounts {
+			if acc.ID == cfg.AutoSwitch.PinnedAccountID {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			cfg.AutoSwitch.PinnedAccountID = ""
+			needsSave = true
+		}
 	}
 	s.config = &cfg
 	// Persist migrated defaults so the file stays in sync
@@ -728,7 +747,7 @@ func (s *Store) AccountRegionByPAT(pat string) string {
 // DeleteAccount removes an account. Deleting the active one is allowed: the
 // active marker then moves to the first remaining account (and the PAT mirror
 // follows), so the pool always names an active account while it is non-empty.
-// This lets the panel drop the manual "switch" action entirely.
+// A routing pin on the deleted account is cleared so requests keep flowing.
 func (s *Store) DeleteAccount(id string) error {
 	s.mu.Lock()
 	wasActive := s.config.ActiveAccountID == id
@@ -755,6 +774,32 @@ func (s *Store) DeleteAccount(id string) error {
 			s.config.PAT = ""
 		}
 	}
+	if s.config.AutoSwitch.PinnedAccountID == id {
+		s.config.AutoSwitch.PinnedAccountID = ""
+	}
+	s.mu.Unlock()
+	return s.save()
+}
+
+// SetPinnedAccount pins (id != "") or unpins (id == "") request routing to a
+// single account. The pin is validated against the live pool and persisted in
+// the same locked section as the rest of the routing configuration.
+func (s *Store) SetPinnedAccount(id string) error {
+	s.mu.Lock()
+	if id != "" {
+		found := false
+		for _, acc := range s.config.Accounts {
+			if acc.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.mu.Unlock()
+			return fmt.Errorf("账号不存在: %s", id)
+		}
+	}
+	s.config.AutoSwitch.PinnedAccountID = id
 	s.mu.Unlock()
 	return s.save()
 }

@@ -186,16 +186,19 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		model := statsModelLabel(reqBody, b, r.Context())
 		entry.Model = model
 		entry.Stream, _ = reqBody["stream"].(bool)
+		// rb may be replaced by a failover account mid-request; read it at
+		// record time so every counter lands on the account that actually
+		// served the response.
 		record := func(ok bool) {
 			if rec != nil {
-				rec.Record(model, ok)
+				rec.RecordAccount(rb.AccountID, model, ok)
 			}
 		}
 		var usageSink UsageSink
 		if rec != nil || lr != nil || usageHook != nil {
 			usageSink = func(u *transform.Usage) {
 				if rec != nil {
-					rec.RecordUsage(model, &stats.Usage{
+					rec.RecordUsageAccount(rb.AccountID, model, &stats.Usage{
 						PromptTokens:     u.PromptTokens,
 						CompletionTokens: u.CompletionTokens,
 						CachedTokens:     u.CachedPromptTokens(),

@@ -673,6 +673,48 @@ func TestAccountSnapshotAndNote(t *testing.T) {
 }
 
 // TestAutoSwitchDefaults 默认阈值 20 积分、未开启；SetAutoSwitch 校验下限并持久化。
+// A manual routing pin survives config saves, reloads and is cleared when the
+// pinned account disappears (Issue #20).
+func TestPinnedAccountPersistenceAndCleanup(t *testing.T) {
+	path := t.TempDir() + "/data.json"
+	s, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.AddAccount("pt-a", "一号")
+	b, _ := s.AddAccount("pt-b", "二号")
+	if err := s.SetPinnedAccount(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	cfg := s.GetAutoSwitch()
+	cfg.Threshold = 33
+	if err := s.SetAutoSwitchConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.GetAutoSwitch().PinnedAccountID; got != b.ID {
+		t.Errorf("a routing config save dropped the pin: %q", got)
+	}
+	reloaded, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetAutoSwitch().PinnedAccountID; got != b.ID {
+		t.Errorf("pin not persisted across restart: %q", got)
+	}
+	if err := reloaded.DeleteAccount(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetAutoSwitch().PinnedAccountID; got != "" {
+		t.Errorf("deleting the pinned account left pin = %q", got)
+	}
+	if err := reloaded.SetPinnedAccount("missing"); err == nil {
+		t.Error("pinning an unknown account must fail")
+	}
+	if reloaded.GetActiveAccountID() != a.ID {
+		t.Error("deleting the active account must advance to the survivor")
+	}
+}
+
 func TestAutoSwitchDefaults(t *testing.T) {
 	s := tempStore(t)
 	as := s.GetAutoSwitch()

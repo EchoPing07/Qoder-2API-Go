@@ -46,15 +46,21 @@ type AccountRuntime func(accountID string) (inFlight, capacity int, requests int
 // bridge wiring. May be nil.
 type AccountCheckiner func(ctx context.Context, accountID string) (auth.CheckinResult, error)
 
+// StatsAccountCleanup is called after an account is removed from the pool, so
+// the recorder can drop its per-account counters and cached subscription
+// snapshot instead of leaving them selectable forever.
+type StatsAccountCleanup func(accountID string)
+
 // Admin manages the web UI and admin API endpoints.
 type Admin struct {
 	store            *store.Store
 	modelFetcher     ModelFetcher
 	stats            *stats.Recorder
 	logRec           *logs.Recorder
-	accountChecker   AccountChecker
-	accountRuntime   AccountRuntime
-	accountCheckiner AccountCheckiner
+	accountChecker      AccountChecker
+	accountRuntime      AccountRuntime
+	accountCheckiner    AccountCheckiner
+	statsAccountCleanup StatsAccountCleanup
 	sessions         map[string]time.Time
 	sessionMu        sync.Mutex
 	limiter          *loginLimiter
@@ -91,6 +97,12 @@ func (a *Admin) SetAccountRuntime(fn AccountRuntime) {
 // the manual check-in endpoint. Wiring happens before the server starts serving.
 func (a *Admin) SetAccountCheckiner(fn AccountCheckiner) {
 	a.accountCheckiner = fn
+}
+
+// SetStatsAccountCleanup installs the recorder callback invoked after an
+// account is deleted. Wiring happens before the server starts serving.
+func (a *Admin) SetStatsAccountCleanup(fn StatsAccountCleanup) {
+	a.statsAccountCleanup = fn
 }
 
 // RegisterRoutes registers all admin API routes on the given mux.
@@ -848,6 +860,9 @@ func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, 404, err.Error())
 			return
 		}
+		if a.statsAccountCleanup != nil {
+			a.statsAccountCleanup(id)
+		}
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
 		writeJSONError(w, 405, "方法不允许")
@@ -895,6 +910,13 @@ func (a *Admin) handleAccountSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.ActivateAccount(body.ID); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	// A manual switch also pins request routing to that account, so the panel
+	// action means what it says rather than only changing which subscription
+	// snapshot the stats page shows.
+	if err := a.store.SetPinnedAccount(body.ID); err != nil {
 		writeJSONError(w, 404, err.Error())
 		return
 	}
@@ -1069,6 +1091,7 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 			"strategy":           as.Strategy,
 			"sticky_limit":       as.StickyLimit,
 			"max_retry_accounts": as.MaxRetryAccounts,
+			"pinned_account_id":  as.PinnedAccountID,
 		})
 	case http.MethodPost:
 		var body struct {
@@ -1077,6 +1100,9 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 			Strategy         string  `json:"strategy"`
 			StickyLimit      int     `json:"sticky_limit"`
 			MaxRetryAccounts int     `json:"max_retry_accounts"`
+			// PinnedAccountID is optional: "" leaves the current pin untouched,
+			// "-" clears it, any other value pins routing to that account.
+			PinnedAccountID string `json:"pinned_account_id,omitempty"`
 		}
 		if err := readJSON(w, r, &body); err != nil {
 			writeJSONError(w, 400, "请求格式错误")
@@ -1094,9 +1120,35 @@ func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 		if body.MaxRetryAccounts > 0 {
 			cfg.MaxRetryAccounts = body.MaxRetryAccounts
 		}
+		if body.PinnedAccountID != "" && body.PinnedAccountID != "-" {
+			valid := false
+			for _, acc := range a.store.ListAccounts() {
+				if acc.ID == body.PinnedAccountID {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				writeJSONError(w, 400, "固定账号不存在")
+				return
+			}
+		}
+		// Carry the stored pin through the config write; the optional pin
+		// change is then applied as a separate validated write below.
+		cfg.PinnedAccountID = a.store.GetAutoSwitch().PinnedAccountID
 		if err := a.store.SetAutoSwitchConfig(cfg); err != nil {
 			writeJSONError(w, 400, err.Error())
 			return
+		}
+		if body.PinnedAccountID != "" {
+			pin := body.PinnedAccountID
+			if pin == "-" {
+				pin = ""
+			}
+			if err := a.store.SetPinnedAccount(pin); err != nil {
+				writeJSONError(w, 400, err.Error())
+				return
+			}
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	default:
@@ -1133,7 +1185,23 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, stats.Report{})
 		return
 	}
-	writeJSON(w, 200, a.stats.Report())
+	// account_id selects one account's counters and subscription snapshot.
+	// "all" / empty keeps the historical aggregate response.
+	id := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	if id != "" {
+		valid := id == stats.AllAccountID
+		for _, acc := range a.store.ListAccounts() {
+			if acc.ID == id {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			writeJSONError(w, 404, "账号不存在")
+			return
+		}
+	}
+	writeJSON(w, 200, a.stats.ReportFor(id))
 }
 
 // --- Logs endpoint ---

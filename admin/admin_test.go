@@ -303,6 +303,105 @@ func TestConfigCORSEnvManaged(t *testing.T) {
 
 // -- Stats --
 
+// Issue #20: switching accounts is a real manual action that pins routing,
+// and /admin/api/stats can select each account's own counters and snapshot.
+func TestAccountSwitchAndPerAccountStats(t *testing.T) {
+	a, s := newAdmin(t)
+	rec := stats.NewRecorder(nil)
+	a.stats = rec
+	cleaned := ""
+	a.SetStatsAccountCleanup(func(id string) { cleaned = id; rec.ForgetAccount(id) })
+	accA, _ := s.AddAccount("pt-a", "一号")
+	accB, _ := s.AddAccount("pt-b", "二号")
+
+	rec.RecordAccount(accA.ID, "M", true)
+	rec.RecordAccount(accB.ID, "M", false)
+	rec.SetAccountFor(accA.ID, &stats.Account{Tag: "Teams"})
+	rec.SetAccountFor(accB.ID, &stats.Account{Tag: "Free"})
+
+	w := doRequest(t, a.handleAccountSwitch, "POST", "/admin/api/accounts/switch", map[string]string{"id": accB.ID})
+	if w.Code != 200 {
+		t.Fatalf("switch failed: %d %s", w.Code, w.Body.String())
+	}
+	if s.GetActiveAccountID() != accB.ID || s.GetAutoSwitch().PinnedAccountID != accB.ID {
+		t.Errorf("switch must activate AND pin the account: active=%q pin=%q",
+			s.GetActiveAccountID(), s.GetAutoSwitch().PinnedAccountID)
+	}
+
+	w = doRequest(t, a.handleStats, "GET", "/admin/api/stats?account_id="+accA.ID, nil)
+	var resp struct {
+		Total   int64          `json:"total"`
+		Failed  int64          `json:"failed"`
+		Account *stats.Account `json:"account"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Total != 1 || resp.Failed != 0 || resp.Account == nil || resp.Account.Tag != "Teams" {
+		t.Errorf("account A stats incorrect: %+v", resp)
+	}
+	w = doRequest(t, a.handleStats, "GET", "/admin/api/stats?account_id="+accB.ID, nil)
+	resp = struct {
+		Total   int64          `json:"total"`
+		Failed  int64          `json:"failed"`
+		Account *stats.Account `json:"account"`
+	}{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Total != 1 || resp.Failed != 1 || resp.Account == nil || resp.Account.Tag != "Free" {
+		t.Errorf("account B stats incorrect: %+v", resp)
+	}
+	w = doRequest(t, a.handleStats, "GET", "/admin/api/stats?account_id=all", nil)
+	var all struct {
+		Total int64 `json:"total"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &all)
+	if all.Total != 2 {
+		t.Errorf("all-account view must aggregate both accounts: %+v", all)
+	}
+	w = doRequest(t, a.handleStats, "GET", "/admin/api/stats?account_id=nope", nil)
+	if w.Code != 404 {
+		t.Errorf("unknown account must 404, got %d", w.Code)
+	}
+
+	// Deleting an account clears its pin and its stats partition.
+	w = doRequest(t, a.handleAccounts, "DELETE", "/admin/api/accounts?id="+accB.ID, nil)
+	if w.Code != 200 || cleaned != accB.ID {
+		t.Errorf("delete must invoke stats cleanup: status=%d cleaned=%q", w.Code, cleaned)
+	}
+	if got := s.GetAutoSwitch().PinnedAccountID; got != "" {
+		t.Errorf("pin must be cleared after deleting the pinned account, got %q", got)
+	}
+	if got := rec.ReportFor(accB.ID); got.Total != 0 || got.Account != nil {
+		t.Errorf("deleted account still has selectable stats: %+v", got)
+	}
+}
+
+func TestAutoSwitchPinRoundTrip(t *testing.T) {
+	a, s := newAdmin(t)
+	acc, _ := s.AddAccount("pt-a", "一号")
+	w := doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto", map[string]interface{}{
+		"enabled": true, "threshold": 20, "strategy": "sticky",
+		"sticky_limit": 30, "max_retry_accounts": 3, "pinned_account_id": acc.ID,
+	})
+	if w.Code != 200 {
+		t.Fatalf("pin save failed: %d %s", w.Code, w.Body.String())
+	}
+	if got := s.GetAutoSwitch().PinnedAccountID; got != acc.ID {
+		t.Fatalf("pin = %q, want %q", got, acc.ID)
+	}
+	w = doRequest(t, a.handleAutoSwitch, "GET", "/admin/api/accounts/auto", nil)
+	if !strings.Contains(w.Body.String(), acc.ID) {
+		t.Errorf("auto endpoint must expose the pin: %s", w.Body.String())
+	}
+	w = doRequest(t, a.handleAutoSwitch, "POST", "/admin/api/accounts/auto", map[string]interface{}{
+		"enabled": true, "threshold": 20, "strategy": "sticky",
+		"sticky_limit": 30, "max_retry_accounts": 3, "pinned_account_id": "-",
+	})
+	if w.Code != 200 || s.GetAutoSwitch().PinnedAccountID != "" {
+		t.Errorf("unpin failed: status=%d pin=%q", w.Code, s.GetAutoSwitch().PinnedAccountID)
+	}
+}
+
 func TestStatsEndpoint(t *testing.T) {
 	s := tempStore(t)
 	mf := func(ctx context.Context) []string {

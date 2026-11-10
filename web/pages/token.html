@@ -15,7 +15,8 @@
             <!-- 账号等级徽标（Free / Teams…）：自「统计」页迁入，数据源仍是 stats 快照 -->
             <span class="badge badge-muted" x-show="accountTag" x-text="accountTag"></span>
             <div class="spacer"></div>
-            <span class="muted-xs">请求按负载均衡策略（含权重）分散到各账号；「请求数」为本次运行以来的累计路由次数（含 /v1/models 探测）</span>
+            <span class="muted-xs" x-show="!autoSwitch.pinned_account_id">请求按负载均衡策略（含权重）分散到各账号；「请求数」为本次运行以来的累计路由次数（含 /v1/models 探测）</span>
+            <span class="muted-xs" x-show="autoSwitch.pinned_account_id" x-text="'已固定由 ' + pinnedAccountLabel() + ' 处理请求，可点「切换」改到其它账号'"></span>
           </div>
           <div class="table-wrap" x-show="accounts.length">
             <table>
@@ -24,7 +25,11 @@
                 <template x-for="acc in accounts" :key="acc.id">
                   <tr>
                     <td>
-                      <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <code class="key-chip" :title="acc.pat_masked" x-text="acc.pat_masked"></code>
+                        <span class="badge badge-ok" x-show="autoSwitch.pinned_account_id===acc.id">固定</span>
+                        <span class="badge badge-muted" x-show="acc.active">激活</span>
+                      </div>
                     </td>
                     <td><span class="badge badge-muted" x-text="accountRegion(acc)"></span></td>
                     <td x-text="acc.note || '—'"></td>
@@ -42,6 +47,7 @@
                     <td class="muted-xs" x-text="acc.snapshot && acc.snapshot.checked_at ? ts(acc.snapshot.checked_at) : '—'"></td>
                     <td>
                       <div class="row" style="gap:2px;flex-wrap:nowrap;justify-content:flex-end">
+                        <button class="btn btn-ghost btn-sm" @click="switchAccount(acc)" :disabled="autoSwitch.pinned_account_id===acc.id">切换</button>
                         <button class="btn btn-ghost btn-sm" @click="checkAccount(acc)" :disabled="checkingId===acc.id">
                           <span class="spin" x-show="checkingId===acc.id"></span>
                           <span x-show="checkingId!==acc.id">检测</span>
@@ -109,7 +115,12 @@
           <div class="card-head">
             <h3>负载均衡 / 自动切换</h3>
             <div class="spacer"></div>
-            <span class="muted-xs">多账号时请求按策略分散（可按账号权重倾斜），避免都打在一个账号上</span>
+            <span class="muted-xs" x-show="!autoSwitch.pinned_account_id">多账号时请求按策略分散（可按账号权重倾斜），避免都打在一个账号上</span>
+            <span class="muted-xs" x-show="autoSwitch.pinned_account_id" x-text="'当前固定：' + pinnedAccountLabel() + '；解除固定后恢复自动分流'"></span>
+          </div>
+          <div class="switch-row" x-show="autoSwitch.pinned_account_id">
+            <span class="sw-label">手动固定账号（在账号池点「切换」可改选其它账号）</span>
+            <button type="button" class="btn btn-secondary btn-sm" @click="unpinAccount()" :disabled="loading">解除固定</button>
           </div>
           <div class="switch-row">
             <span class="sw-label">启用（低于阈值的账号停止接新请求）</span>

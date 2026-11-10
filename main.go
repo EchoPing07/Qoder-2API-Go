@@ -422,9 +422,47 @@ func applyAccountWrite(rec *stats.Recorder, provider *bridgeProvider, pat string
 	return true
 }
 
+// applyAccountWriteFor stores a refreshed subscription snapshot in the
+// serving account's stats partition. It also refreshes the legacy aggregate
+// snapshot when this is the active account, so older panel views stay valid.
+func applyAccountWriteFor(rec *stats.Recorder, provider *bridgeProvider, accountID, pat string, nextResetMs int64, account *stats.Account) bool {
+	patWriteMu.Lock()
+	defer patWriteMu.Unlock()
+	activeID := provider.store.GetActiveAccountID()
+	if accountID == "" {
+		// Legacy bare PAT: only the aggregate view exists.
+		if provider.store.GetPAT() != pat {
+			return false
+		}
+		rec.SetBillingCycle(nextResetMs)
+		rec.SetAccount(account)
+		return true
+	}
+	// Each account partition is guarded by its OWN PAT: the loop probes
+	// inactive entries too, so checking only the active PAT mirror would reject
+	// every non-active account. Re-validating the entry under the same lock
+	// also stops a refresh for a deleted/replaced account from resurrecting a
+	// stale partition.
+	acc, ok := provider.store.GetAccount(accountID)
+	if !ok || acc.PAT != pat {
+		return false
+	}
+	rec.SetBillingCycleFor(accountID, nextResetMs)
+	rec.SetAccountFor(accountID, account)
+	// The legacy aggregate snapshot belongs to the active account only.
+	if accountID == activeID {
+		if provider.store.GetPAT() != pat {
+			return false
+		}
+		rec.SetBillingCycle(nextResetMs)
+		rec.SetAccount(account)
+	}
+	return true
+}
+
 // clearAccountOnPatChange drops the cached account snapshot when the configured
-// PAT changed. It shares patWriteMu with applyAccountWrite so the clear and the
-// writes are mutually exclusive.
+// PAT changed. It shares patWriteMu with applyAccountWriteFor so the clear and
+// the writes are mutually exclusive.
 func clearAccountOnPatChange(rec *stats.Recorder) {
 	patWriteMu.Lock()
 	defer patWriteMu.Unlock()
@@ -732,8 +770,8 @@ func main() {
 	// request path, flushed out of band). Entries are metadata only.
 	logRec := logs.NewRecorder(st, logRetention, logMaxEntries)
 	// A PAT change invalidates the previous account's plan and allowance; drop
-	// the cached snapshot so the panel cannot keep showing it. The clear shares
-	// patWriteMu with the account loop's writes.
+	// the cached aggregate snapshot so the panel cannot keep showing it. The
+	// clear shares patWriteMu with the account loop's writes.
 	provider.setOnPatChange(func() { clearAccountOnPatChange(rec) })
 	// The snapshot is persisted, so a restart with a different or cleared PAT
 	// would otherwise keep showing the previous account (the hook only fires on
@@ -778,8 +816,8 @@ func main() {
 	// (/user/status) and authoritative allowance (OpenAPI quota/usage) out of
 	// band. It probes ONE account per tick in rotation, so N accounts are all
 	// refreshed within N minutes while upstream load stays at ~1 call/minute.
-	// The stats recorder (panel headline) is only updated when the probed
-	// account is the active one.
+	// Every probe updates that account's own stats partition; the legacy
+	// aggregate headline is refreshed when the probed account is active.
 	//
 	// The loop has its own stop/done pair so shutdown can join it before the
 	// final stats flush: its last SetAccount/SetBillingCycle would otherwise
@@ -788,9 +826,10 @@ func main() {
 	accountDone := make(chan struct{})
 
 	// applyAccountFor probes one account and folds the result into its pool
-	// snapshot. When it is the active account, the panel recorder is updated
-	// too. Returns true when a status was obtained.
-	applyAccountFor := func(ctx context.Context, acc store.Account, activeID string) bool {
+	// snapshot and its own stats partition. The aggregate panel snapshot is
+	// refreshed when it is the active account. Returns true when a status was
+	// obtained.
+	applyAccountFor := func(ctx context.Context, acc store.Account) bool {
 		b := provider.bridgeForAccount(acc)
 		if b == nil {
 			return false
@@ -802,9 +841,6 @@ func main() {
 		// Authoritative correction: merge into that account's snapshot and arm
 		// the hard-exhaustion cooldown.
 		provider.applyQuotaToSnapshot(acc.ID, st)
-		if acc.ID != activeID {
-			return true
-		}
 		account := &stats.Account{
 			Plan:                 st.Plan,
 			Tag:                  st.UserTag,
@@ -833,11 +869,12 @@ func main() {
 				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
 			}
 		}
-		// The write section runs under patWriteMu and re-checks the PAT inside
-		// it: the PAT-change hook clears the recorder under the same lock, so a
-		// snapshot fetched for the previous PAT can no longer land after that
-		// clear. The fetch above stays outside the lock (it can take 30s).
-		applyAccountWrite(rec, provider, provider.store.GetPAT(), st.NextResetAtMs, account)
+		// The write section runs under patWriteMu and re-validates the pool
+		// entry and its PAT inside it: the PAT-change hook clears the aggregate
+		// recorder under the same lock, so a snapshot fetched for a replaced
+		// account can no longer land after that clear. The fetch above stays
+		// outside the lock (it can take 30s).
+		applyAccountWriteFor(rec, provider, acc.ID, acc.PAT, st.NextResetAtMs, account)
 		return true
 	}
 
@@ -875,7 +912,7 @@ func main() {
 		for _, acc := range probeAccounts() {
 			if acc.ID == activeID || activeID == "" {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				applyAccountFor(ctx, acc, activeID)
+				applyAccountFor(ctx, acc)
 				cancel()
 				break
 			}
@@ -900,7 +937,7 @@ func main() {
 				acc := list[cursor%len(list)]
 				cursor++
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				applyAccountFor(ctx, acc, provider.store.GetActiveAccountID())
+				applyAccountFor(ctx, acc)
 				cancel()
 			case <-accountStop:
 				return
@@ -912,6 +949,11 @@ func main() {
 	adminInst := admin.New(st, modelFetcher, rec, logRec)
 	// Per-account runtime for the panel: in-flight, capacity and cumulative
 	// request count (shows how the router spreads load).
+	// Deleting an account drops its per-account stats partition and cached
+	// subscription snapshot; the aggregate totals remain as history.
+	adminInst.SetStatsAccountCleanup(func(accountID string) {
+		rec.ForgetAccount(accountID)
+	})
 	adminInst.SetAccountRuntime(func(accountID string) (int, int, int64) {
 		inflight, capacity := 0, 0
 		if acc, ok := st.GetAccount(accountID); ok {
